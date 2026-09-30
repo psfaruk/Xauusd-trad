@@ -1,0 +1,60 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+/// User-created chart drawings, persisted per symbol + timeframe.
+model Drawing {
+  id        String   @id @default(uuid())
+  symbol    String
+  timeframe String
+  kind      String // trendline | ray | hline | vline | rect | fib | text | measure
+  points    String // JSON [{t,p}]
+  style     String // JSON {color?, width?, text?}
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([symbol, timeframe])
+}
+
+/// Every signal the engine fires — full history for the Signals panel.
+model SignalRecord {
+  id         String    @id @default(uuid())
+  symbol     String
+  timeframe  String
+  direction  String // BUY | SELL
+  trigger    String // sfp | zone | pullback
+  entryType  String // market | limit
+  entry      Float
+  sl         Float
+  tp         Float
+  rr         Float
+  confidence Float
+  status     String // active | pending | won | lost | expired
+  resultR    Float?
+  trace      String // JSON: checks + factors
+  barTime    Int
+  createdAt  DateTime  @default(now())
+  closedAt   DateTime?
+
+  @@unique([symbol, timeframe, barTime, direction])
+  @@index([symbol, createdAt])
+}
+
+/// Pinned watchlist symbols (order survives restarts / deploys).
+model WatchItem {
+  id        String  @id @default(uuid())
+  symbol    String  @unique
+  label     String
+  sortOrder Int     @default(0)
+}
+
+/// Generic key/value app settings (locale, theme, defaults).
+model AppSetting {
+  key   String @id
+  value String
+}

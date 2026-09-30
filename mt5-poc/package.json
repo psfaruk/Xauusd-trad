@@ -1,0 +1,9 @@
+{
+  "name": "mt5-poc",
+  "version": "1.0.0",
+  "description": "Direct MT5 WebSocket-protocol client PoC (Exness-MT5Trial6) — no MetaTrader terminal required",
+  "type": "module",
+  "scripts": {
+    "start": "bun run index.ts"
+  }
+}

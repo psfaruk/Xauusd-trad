@@ -1,0 +1,225 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar: var(--sidebar);
+  --color-chart-5: var(--chart-5);
+  --color-chart-4: var(--chart-4);
+  --color-chart-3: var(--chart-3);
+  --color-chart-2: var(--chart-2);
+  --color-chart-1: var(--chart-1);
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent: var(--accent);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+  --color-up: var(--up);
+  --color-down: var(--down);
+  --color-gold: var(--gold);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+}
+
+/* ── BINANCE light theme ── */
+:root {
+  --radius: 0.5rem;
+  --background: #ffffff;
+  --foreground: #1e2329;
+  --card: #fafafa;
+  --card-foreground: #1e2329;
+  --popover: #ffffff;
+  --popover-foreground: #1e2329;
+  --primary: #f0b90b;
+  --primary-foreground: #1e2329;
+  --secondary: #f5f5f5;
+  --secondary-foreground: #1e2329;
+  --muted: #f5f5f5;
+  --muted-foreground: #707a8a;
+  --accent: #f0f0f0;
+  --accent-foreground: #1e2329;
+  --destructive: #cf304a;
+  --border: #eaecef;
+  --input: #eaecef;
+  --ring: #f0b90b;
+  --up: #03a66d;
+  --down: #cf304a;
+  --gold: #c99400;
+  --chart-1: #f0b90b;
+  --chart-2: #03a66d;
+  --chart-3: #707a8a;
+  --chart-4: #cf304a;
+  --chart-5: #7e8ff5;
+  --sidebar: #fafafa;
+  --sidebar-foreground: #1e2329;
+  --sidebar-primary: #f0b90b;
+  --sidebar-primary-foreground: #1e2329;
+  --sidebar-accent: #f0f0f0;
+  --sidebar-accent-foreground: #1e2329;
+  --sidebar-border: #eaecef;
+  --sidebar-ring: #f0b90b;
+}
+
+/* ── BINANCE dark theme (default) ── */
+.dark {
+  --background: #0b0e11;
+  --foreground: #eaecef;
+  --card: #181a20;
+  --card-foreground: #eaecef;
+  --popover: #1e2329;
+  --popover-foreground: #eaecef;
+  --primary: #fcd535;
+  --primary-foreground: #202630;
+  --secondary: #2b3139;
+  --secondary-foreground: #eaecef;
+  --muted: #1e2329;
+  --muted-foreground: #848e9c;
+  --accent: #2b3139;
+  --accent-foreground: #eaecef;
+  --destructive: #f6465d;
+  --border: #2b3139;
+  --input: #2b3139;
+  --ring: #fcd535;
+  --up: #0ecb81;
+  --down: #f6465d;
+  --gold: #fcd535;
+  --chart-1: #fcd535;
+  --chart-2: #0ecb81;
+  --chart-3: #848e9c;
+  --chart-4: #f6465d;
+  --chart-5: #7e8ff5;
+  --sidebar: #0e1116;
+  --sidebar-foreground: #eaecef;
+  --sidebar-primary: #fcd535;
+  --sidebar-primary-foreground: #202630;
+  --sidebar-accent: #2b3139;
+  --sidebar-accent-foreground: #eaecef;
+  --sidebar-border: #2b3139;
+  --sidebar-ring: #fcd535;
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  html {
+    color-scheme: dark;
+  }
+  html:not(.dark) {
+    color-scheme: light;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+  /* prevent chart canvas selection while dragging */
+  .no-select {
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-touch-callout: none;
+  }
+}
+
+/* ── slim custom scrollbars for long lists ── */
+.slim-scroll::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+.slim-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+.slim-scroll::-webkit-scrollbar-thumb {
+  background: color-mix(in oklch, var(--muted-foreground) 30%, transparent);
+  border-radius: 999px;
+}
+.slim-scroll::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in oklch, var(--muted-foreground) 50%, transparent);
+}
+.slim-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in oklch, var(--muted-foreground) 30%, transparent) transparent;
+}
+
+/* pulsing live dot */
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.45; transform: scale(0.82); }
+}
+.live-dot {
+  animation: pulse-dot 1.6s ease-in-out infinite;
+}
+
+/* tabular numbers everywhere numeric */
+.tnum {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum";
+}
+
+/* order-flow: new-tick flash on tape rows */
+@keyframes flow-flash {
+  0% { background-color: color-mix(in oklch, var(--foreground) 12%, transparent); }
+  100% { background-color: transparent; }
+}
+.flow-flash {
+  animation: flow-flash 700ms ease-out 1;
+}
+
+/* ── signal lamp — the glowing BUY/SELL light ──
+   A breathing halo: the lamp must be readable across the room. */
+@keyframes lamp-glow-up {
+  0%, 100% { box-shadow: 0 0 0 1px color-mix(in oklch, var(--up) 55%, transparent), 0 0 18px color-mix(in oklch, var(--up) 42%, transparent), inset 0 0 14px color-mix(in oklch, var(--up) 14%, transparent); }
+  50%      { box-shadow: 0 0 0 1px color-mix(in oklch, var(--up) 80%, transparent), 0 0 34px color-mix(in oklch, var(--up) 62%, transparent), inset 0 0 22px color-mix(in oklch, var(--up) 22%, transparent); }
+}
+@keyframes lamp-glow-down {
+  0%, 100% { box-shadow: 0 0 0 1px color-mix(in oklch, var(--down) 55%, transparent), 0 0 18px color-mix(in oklch, var(--down) 42%, transparent), inset 0 0 14px color-mix(in oklch, var(--down) 14%, transparent); }
+  50%      { box-shadow: 0 0 0 1px color-mix(in oklch, var(--down) 80%, transparent), 0 0 34px color-mix(in oklch, var(--down) 62%, transparent), inset 0 0 22px color-mix(in oklch, var(--down) 22%, transparent); }
+}
+.lamp-up   { animation: lamp-glow-up 2.2s ease-in-out infinite; }
+.lamp-down { animation: lamp-glow-down 2.2s ease-in-out infinite; }
+
+/* small lamp dot for the mobile strip */
+@keyframes lamp-dot-up {
+  0%, 100% { box-shadow: 0 0 6px 1px color-mix(in oklch, var(--up) 55%, transparent); }
+  50%      { box-shadow: 0 0 14px 3px color-mix(in oklch, var(--up) 80%, transparent); }
+}
+@keyframes lamp-dot-down {
+  0%, 100% { box-shadow: 0 0 6px 1px color-mix(in oklch, var(--down) 55%, transparent); }
+  50%      { box-shadow: 0 0 14px 3px color-mix(in oklch, var(--down) 80%, transparent); }
+}
+.lamp-dot-up   { animation: lamp-dot-up 2.2s ease-in-out infinite; }
+.lamp-dot-down { animation: lamp-dot-down 2.2s ease-in-out infinite; }
+
+/* delta-micro strip: the pulsing dot on the latest sparkline sample */
+@keyframes micro-dot-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); box-shadow: 0 0 6px 1px color-mix(in oklch, currentColor 55%, transparent); }
+  50%      { opacity: 0.55; transform: scale(0.8); box-shadow: 0 0 12px 2px color-mix(in oklch, currentColor 80%, transparent); }
+}
+.micro-dot {
+  width: 6px;
+  height: 6px;
+  animation: micro-dot-pulse 1.6s ease-in-out infinite;
+}

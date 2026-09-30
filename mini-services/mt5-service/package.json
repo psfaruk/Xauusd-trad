@@ -1,0 +1,14 @@
+{
+  "name": "mt5-service",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Direct MT5 market-data service (Exness-MT5Trial6) \u2014 no terminal required",
+  "scripts": {
+    "dev": "bun --hot index.ts",
+    "start": "bun index.ts"
+  },
+  "dependencies": {
+    "socket.io": "^4.8.1",
+    "z-ai-web-dev-sdk": "latest"
+  }
+}

@@ -1,0 +1,52 @@
+# dependencies
+node_modules/
+**/node_modules/
+
+# next.js
+/.next/
+/out/
+next-env.d.ts
+*.tsbuildinfo
+
+# env files — credentials NEVER enter the repo
+.env
+.env.*
+**/.env
+**/.env.*
+
+# databases (generated at build / runtime, never committed)
+db/*.db
+db/*.db-journal
+*.sqlite
+*.sqlite-journal
+
+# mt5-service live runtime state
+mini-services/mt5-service/data/
+
+# logs
+*.log
+dev.out.log
+server.log
+mt5-service.log
+
+# sandbox / agent artifacts (not part of the product)
+tool-results/
+agent-ctx/
+.agent-shots/
+.zscripts/
+download/
+skills/
+examples/
+tests/
+upload/
+worklog.md
+verify*.png
+Caddyfile
+.DS_Store
+
+# misc
+.DS_Store
+*.pem
+/coverage
+.vercel
+.claude
