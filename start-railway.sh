@@ -17,7 +17,11 @@ export NODE_ENV=production
 
 echo "┌──────────────────────────────────────────────────────"
 echo "│ AURUM Terminal — Railway boot"
-echo "│ PORT(gateway)=${PORT}  next=:3000  mt5-io=:3030  mt5-rest=:3031"
+echo "│ public gateway (Caddy)  = :${PORT}  <- Railway \$PORT"
+echo "│   next.js (loopback)    = 127.0.0.1:3000"
+echo "│   mt5 io/rest (loopback)= 127.0.0.1:3030 / :3031"
+echo "│ Generate Domain: keep the AUTO-DETECTED port (${PORT})"
+echo "│   - it is the ONLY public listener (80 = nothing there)"
 echo "└──────────────────────────────────────────────────────"
 
 # ── MT5 credentials (v13) — ZERO Railway variables required ──
@@ -107,7 +111,12 @@ PIDS+=($!)
 
 echo "[start] next.js…"
 cd /app
-PORT=3000 HOSTNAME=0.0.0.0 NODE_ENV=production DATABASE_URL="$DATABASE_URL" \
+# v13.1: HOSTNAME=127.0.0.1 — Next must bind loopback only. Binding
+# 0.0.0.0 made Railway's port detection see TWO public ports ($PORT
+# gateway + 3000), so "Generate Domain" could target the wrong one and
+# the XTransformPort gateway routing silently broke. Caddy (the only
+# 0.0.0.0 listener) proxies to it at localhost:3000.
+PORT=3000 HOSTNAME=127.0.0.1 NODE_ENV=production DATABASE_URL="$DATABASE_URL" \
   MT5_SERVICE_URL="$MT5_SERVICE_URL" bun server.js &
 PIDS+=($!)
 

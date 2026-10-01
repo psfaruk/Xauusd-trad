@@ -17,9 +17,13 @@ RUN bun install
 COPY . .
 # Prisma client + a PRISTINE SQLite database generated from the schema
 # (no database file ships in the repo/build-context — created here).
+# mkdir -p db: a fresh git clone has NO db/ directory (db/*.db is
+# gitignored) — create it explicitly so db:push always has a parent dir,
+# regardless of Prisma version behavior.
 # DATABASE_URL is also exported for `next build`: PrismaClient resolves
 # its datasource at import time, so the build would fail without it.
-RUN bun run db:generate \
+RUN mkdir -p db \
+  && bun run db:generate \
   && DATABASE_URL="file:/app/db/custom.db" bun run db:push \
   && DATABASE_URL="file:/app/db/custom.db" bunx next build
 
@@ -62,5 +66,9 @@ COPY Caddyfile.railway ./Caddyfile.railway
 COPY start-railway.sh ./start-railway.sh
 RUN chmod +x ./start-railway.sh
 
-EXPOSE 80
+# NOTE: deliberately NO EXPOSE directive. On Railway the public port is the
+# platform-injected $PORT (Caddy binds it); publishing a fixed number here
+# previously misled operators into typing "80" as the domain target port —
+# nothing listens on 80, so the domain 502'd. The ONLY public listener is
+# Caddy; Next.js + mt5-service bind 127.0.0.1 (see start-railway.sh).
 CMD ["bash", "./start-railway.sh"]
