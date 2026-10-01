@@ -69,6 +69,17 @@ export function SignalsPanel({ analysis }: { analysis: AnalysisResponse | null }
           {t("signalAnalysis")}
         </span>
         <span className="flex items-center gap-2">
+          {/* v16.4 (audit §2.2/§8): the feed's honesty chip — the last closed
+              candle is old (weekend / stalled service) → say so instead of
+              presenting frozen data as live. */}
+          {analysis?.dataFreshness && !analysis.dataFreshness.fresh && (
+            <span
+              title={`${t("staleFeed")} — ${Math.round(analysis.dataFreshness.ageSec / 60)}m`}
+              className="rounded border border-gold/40 bg-gold/10 px-1 py-px font-mono text-[9px] font-bold uppercase tracking-wider text-gold"
+            >
+              {t("staleFeed")}
+            </span>
+          )}
           <UpdatedAgo at={analysis?.generatedAt} />
           <span className="tnum font-mono text-[10px] text-muted-foreground">
             {won}W / {lost}L · {totalR >= 0 ? "+" : ""}{totalR.toFixed(1)}R
@@ -287,8 +298,10 @@ function SignalCard({
       </div>
       <div className="mt-2.5">
         <div className="mb-1 flex justify-between text-[10px] text-muted-foreground">
-          <span>{t("confidence")}</span>
-          <span className="tnum font-mono">{(sig.confidence * 100).toFixed(0)}%</span>
+          {/* v16.4 (audit §10): the engine's number is a confluence SCORE, not
+              a calibrated win probability — label it honestly. */}
+          <span>{t("score")}</span>
+          <span className="tnum font-mono">{(sig.confidence * 100).toFixed(0)}</span>
         </div>
         <div className="h-1.5 overflow-hidden rounded-full bg-muted">
           <div

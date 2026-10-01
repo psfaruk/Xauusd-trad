@@ -194,6 +194,11 @@ export default function TradingChart(props: Props) {
   useEffect(() => {
     let stop = false;
     let timer: ReturnType<typeof setTimeout>;
+    // v16.4 (audit §4): a symbol/tf switch must not keep the PREVIOUS
+    // market's AI drawings on the new chart while the fetch is in flight —
+    // clear the layer immediately; the fresh read repopulates it.
+    aiRef.current = [];
+    scheduleRedraw();
     const load = async () => {
       try {
         const res = await fetch(restUrl(`/api/ai-chart?symbol=${encodeURIComponent(symbol)}&tf=${timeframe}`));

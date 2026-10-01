@@ -93,7 +93,10 @@ export function buildDrawings(
       kind: "zone",
       side: z.side as any,
       lo: z.lo, hi: z.hi, t: z.t,
-      source_tf: higherTfZones.includes(z) ? `${tf}·HTF` : tf,
+      // v16.4 (audit §2.6/§6): HTF zones carry their TRUE source timeframe
+      // (H1 supply/demand computed from bars.H1 in the analysis route) — the
+      // old `${tf}·HTF` label implied the ACTIVE timeframe owned them.
+      source_tf: higherTfZones.includes(z) ? "H1" : tf,
       state: z.mitT ? "faded" : "active",
     });
   }

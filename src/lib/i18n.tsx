@@ -129,6 +129,14 @@ const DICT: Record<Locale, Record<string, string>> = {
     takeProfit: "Target",
     riskReward: "R:R",
     confidence: "Confidence",
+    // v16.4 (audit §10): the engine's 0–1 number is a heuristic confluence
+    // SCORE, not a calibrated win probability — the UI must say "score".
+    score: "Score",
+    scoreHint: "Confluence score — not a calibrated win probability",
+    tickVol: "tick volume",
+    dataUnavailable: "Market data unavailable",
+    dataUnavailableHint: "MT5 service is not answering — this is a data outage, not a no-signal state.",
+    staleFeed: "stale feed",
     trigger: "Trigger",
     status: "Status",
     history: "History",
@@ -508,6 +516,13 @@ const DICT: Record<Locale, Record<string, string>> = {
     takeProfit: "টার্গেট",
     riskReward: "রিস্ক:রিওয়ার্ড",
     confidence: "কনফিডেন্স",
+    // v16.4 (audit §10): স্কোর — এটি ক্যালিব্রেটেড জেতার সম্ভাবনা নয়
+    score: "স্কোর",
+    scoreHint: "কনফ্লুয়েন্স স্কোর — এটি ক্যালিব্রেটেড উইন-প্রবাবিলিটি নয়",
+    tickVol: "টিক ভলিউম",
+    dataUnavailable: "মার্কেট ডেটা পাওয়া যাচ্ছে না",
+    dataUnavailableHint: "MT5 সার্ভিস সাড়া দিচ্ছে না — এটি ডেটা সমস্যা, নো-সিগন্যাল নয়।",
+    staleFeed: "স্টেল ফিড",
     trigger: "ট্রিগার",
     status: "স্ট্যাটাস",
     history: "হিস্ট্রি",

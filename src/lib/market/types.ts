@@ -398,6 +398,12 @@ export interface AnalysisResponse {
   timeframe: string;
   price: number;
   digits: number;
+  /** v16.4 (audit §10): explicit engine verdict for THIS symbol+tf —
+   *  "OK" = data good, a live/pending signal exists;
+   *  "NO_SETUP" = data good, no signal right now (see nearMiss);
+   *  data failures never reach this shape — they are HTTP 503 + code
+   *  DATA_UNAVAILABLE so the UI can tell outage from quiet market. */
+  status: "OK" | "NO_SETUP";
   signal: SignalPayload | null;
   /** planned next entry when no live signal exists (entry/SL/TP projection) */
   nextSetup: {
@@ -413,5 +419,13 @@ export interface AnalysisResponse {
   drawings: AutoDrawing[];
   roadmap: RoadmapData;
   snapshot: IndicatorSnapshot;
+  /** v16.4 (audit §4/§10): timeframe/data identity — candle open time of
+   *  the last CLOSED bar the engine evaluated, plus an age/freshness read
+   *  so the UI can flag a stale feed instead of showing it as live. */
+  lastCandleTime: number;
+  dataFreshness: { lastCandleTime: number; ageSec: number; fresh: boolean };
+  /** v16.4 (audit §10): the strategy build that produced this payload —
+   *  cache keys and consumers can compare across deploys. */
+  strategyVersion: string;
   generatedAt: number;
 }

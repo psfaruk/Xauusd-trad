@@ -618,7 +618,9 @@ export class AiTrader {
         this.cfg.maxDailyTrades = Math.max(1, Math.min(MAX_DAILY_TRADES_CAP, this.cfg.maxDailyTrades || 12));
         this.cfg.symbols = this.cfg.symbols.map((s) => ({
           ...s,
-          lots: Math.max(0.01, Math.min(MAX_LOT, s.lots ?? 0.01)),
+          // v16.4: step-snapped lots (0.01) — legacy persisted states with
+          // 0.015-style volumes can't reach the broker as 10014s either
+          lots: Math.max(0.01, Math.min(MAX_LOT, Math.round((s.lots ?? 0.01) * 100) / 100)),
           maxPositions: Math.max(1, Math.min(MAX_POSITIONS_PER_SYMBOL, s.maxPositions ?? 1)),
         }));
         this.journalLog({
@@ -1047,7 +1049,10 @@ export class AiTrader {
           symbol: s.symbol,
           enabled: !!s.enabled,
           // v12: hard caps — 100-lot / 500-position inputs are now impossible
-          lots: Math.max(0.01, Math.min(MAX_LOT, Number(s.lots) || 0.01)),
+          // v16.4 (audit §7): snap to the 0.01 lot STEP too — 0.015 used to
+          // pass the min/max clamp and die at the broker as retcode 10014
+          // (invalid volume); it never trades now.
+          lots: Math.max(0.01, Math.min(MAX_LOT, Math.round((Number(s.lots) || 0.01) * 100) / 100)),
           maxPositions: Math.max(1, Math.min(MAX_POSITIONS_PER_SYMBOL, Math.round(Number(s.maxPositions) || 1))),
         }));
       for (const s of this.cfg.symbols) this.tracker(s.symbol);
@@ -2042,6 +2047,19 @@ export class AiTrader {
       // serialize trade ops — and a brain that was stopped mid-thought
       // (hot-reload) must NOT fire its order (duplicate-entry armor)
       if (gen !== this.generation) return;
+      // v16.4 (audit §7 pre-submit #8): final volume sanity at the door —
+      // positive, ≥ broker min 0.01, and an exact 0.01-step multiple. The
+      // config clamps should have made this impossible; this guard makes
+      // it CERTAIN (a legacy persisted rule can't 10014 at the broker).
+      const stepSnapped = Math.round(rule.lots * 100) / 100;
+      if (!(rule.lots > 0) || rule.lots < 0.01 || stepSnapped !== rule.lots) {
+        this.journalLog({
+          action: "skip", symbol: rule.symbol,
+          reason: `invalid lots ${rule.lots} (min 0.01, step 0.01) — rejected before broker call`,
+        });
+        this.lastEntryAt.set(rule.symbol, Date.now());
+        continue;
+      }
       const res = await this.host.marketOrderAt(rule.symbol, side, rule.lots, entry, {
         sl: Number(sl.toFixed(digits + 1)),
         tp: Number(tp.toFixed(digits + 1)),
@@ -2208,8 +2226,45 @@ export class AiTrader {
         } else {
           this.vanish.delete(p.ticket);
         }
+        // ── v16.4 (audit §7 + §13): SL/TP ATTACH VERIFICATION — an accepted
+        //    order (10009) is not proof the stops live on the broker. A rare
+        //    broker race can land the position with sl=0/tp=0; that trade
+        //    would then run NAKED until the next manage pass noticed. Ask
+        //    the broker's own position record; if the stop is missing or
+        //    materially different from what we requested, RE-ATTACH it now
+        //    via the same modify path breakeven uses. ──
+        this.verifyStopsAttached(p, match).catch(() => {});
       }
     } catch { /* broker briefly away — sync will retry */ }
+  }
+
+  /** v16.4: broker-truth SL/TP check — re-attach when the broker disagrees. */
+  private async verifyStopsAttached(p: TraderPosition, brokerPos: { sl: number; tp: number }) {
+    const digits = this.host.digits(p.symbol);
+    const tol = Math.max(p.slDist * 0.35, 3 * Math.pow(10, -digits));
+    const slMissing = p.sl > 0 && (brokerPos.sl <= 0 || Math.abs(brokerPos.sl - p.sl) > tol);
+    const tpMissing = p.tp > 0 && (brokerPos.tp <= 0 || Math.abs(brokerPos.tp - p.tp) > tol);
+    if (!slMissing && !tpMissing) return;
+    this.journalLog({
+      action: "manage", symbol: p.symbol,
+      reason: `stops attach check: broker sl=${brokerPos.sl.toFixed(digits)} tp=${brokerPos.tp.toFixed(digits)} vs requested sl=${p.sl.toFixed(digits)} tp=${p.tp.toFixed(digits)} — re-attaching`,
+    });
+    try {
+      const q = this.host.getQuote(p.symbol);
+      const r = await this.host.modifyPosition(
+        p.symbol, p.side, p.lots, q?.mid ?? p.entry, p.ticket,
+        p.sl, p.tp, { digits },
+      );
+      if (r.retcode === 10009) {
+        this.think(`${p.symbol}: ব্রোকারে SL/TP আবার বসিয়ে দিলাম (attach নিশ্চিত) 🛡️`, "good");
+        this.emit(true);
+      } else {
+        // don't spam: monitor()'s manage passes keep retrying organically
+        this.journalLog({ action: "error", symbol: p.symbol, reason: `stop re-attach rejected: ${r.retcode} ${r.comment}` });
+      }
+    } catch (e) {
+      this.journalLog({ action: "error", symbol: p.symbol, reason: `stop re-attach threw: ${(e as Error).message}` });
+    }
   }
 
   // ── MONITORING: watch every position like a human, every beat ──

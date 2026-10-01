@@ -136,6 +136,7 @@ export default function Home() {
   return (
     <TerminalShell
       analysis={analysisQ.data ?? null}
+      analysisError={analysisQ.isError}
       userDrawings={userDrawings}
       onCreateDrawing={onCreateDrawing}
       onUpdateDrawing={onUpdateDrawing}

@@ -12,6 +12,13 @@ import { svcHeaders, getBrokerOffsetSec, spreadFor } from "@/lib/svc";
 
 const MT5_URL = process.env.MT5_SERVICE_URL ?? "http://127.0.0.1:3031";
 const CACHE_TTL = 8_000;
+/** v16.4 (audit §10): the strategy build identity carried in every
+ *  response so consumers/caches can compare across deploys. */
+const STRATEGY_VERSION = "v16.4";
+/** v16.4 (audit §10): a candle older than 3× its timeframe (plus a
+ *  market-closed weekend allowance) means the FEED is stale — surfaced
+ *  via dataFreshness.fresh=false instead of passing silently. */
+const FRESHNESS_TF_MULT = 3;
 
 const cache = new Map<string, { at: number; data: AnalysisResponse }>();
 /** in-flight backtest seeds (symbol|tf) — never seed the same market twice */
@@ -176,8 +183,25 @@ async function ensureSeeded(symbol: string, tf: string, bars: Candle[], digits: 
 
 export async function GET(req: Request) {
   const url = new URL(req.url);
-  const symbol = url.searchParams.get("symbol") ?? "XAUUSDm";
+  const symbol = (url.searchParams.get("symbol") ?? "XAUUSDm").trim().slice(0, 24);
   const tf = url.searchParams.get("tf") ?? "M15";
+
+  // v16.4 (audit §10): validate the request contract — an unsupported
+  // timeframe is a CLIENT error (400), not a data outage (503). The old
+  // code fell through to the 503 "no candle data" branch and mislabeled a
+  // bad request as a service failure.
+  if (!ENGINE_TFS.includes(tf)) {
+    return NextResponse.json(
+      { error: `unsupported timeframe "${tf}" (supported: ${ENGINE_TFS.join(", ")})`, code: "UNSUPPORTED_TIMEFRAME" },
+      { status: 400 },
+    );
+  }
+  if (!/^[A-Za-z0-9_/+.-]{1,24}$/.test(symbol)) {
+    return NextResponse.json(
+      { error: "invalid symbol", code: "INVALID_SYMBOL" },
+      { status: 400 },
+    );
+  }
 
   const limits: Record<string, number> = {
     M1: 900, M5: 700, M15: 600, M30: 400, H1: 400, H4: 300,
@@ -189,8 +213,11 @@ export async function GET(req: Request) {
     }),
   );
   if (!bars[tf]?.length) {
+    // v16.4 (audit §2.5/§10): a structured DATA_UNAVAILABLE — the UI can now
+    // tell "MT5 service offline / market closed / symbol unknown" apart from
+    // "engine looked, found no setup" (status NO_SETUP below).
     return NextResponse.json(
-      { error: "no candle data from MT5 service" },
+      { error: "no candle data from MT5 service", code: "DATA_UNAVAILABLE", symbol, timeframe: tf },
       { status: 503 },
     );
   }
@@ -356,17 +383,30 @@ export async function GET(req: Request) {
   if (pathD) drawings.push(pathD);
 
   const price = bars[tf][bars[tf].length - 1].c;
+  // v16.4 (audit §4/§10): data identity + freshness on every payload
+  const lastCandleTime = lastClosedT;
+  const tfSecMap: Record<string, number> = { M1: 60, M5: 300, M15: 900, M30: 1800, H1: 3600, H4: 14400 };
+  const ageSec = Math.max(0, Math.round(Date.now() / 1000 - lastCandleTime) - (tfSecMap[tf] ?? 900));
+  const dataFreshness = {
+    lastCandleTime,
+    ageSec,
+    fresh: ageSec <= FRESHNESS_TF_MULT * (tfSecMap[tf] ?? 900),
+  };
   const payload: AnalysisResponse = {
     symbol,
     timeframe: tf,
     price,
     digits,
+    status: liveSignal ? "OK" : "NO_SETUP",
     signal: liveSignal,
     nextSetup: projection,
     nearMiss: result.nearMiss,
     drawings,
     roadmap,
     snapshot: result.snapshot,
+    lastCandleTime,
+    dataFreshness,
+    strategyVersion: STRATEGY_VERSION,
     generatedAt: Date.now(),
   };
   (payload as any).signals = signals;

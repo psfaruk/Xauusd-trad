@@ -106,7 +106,9 @@ export function AnalysisPanel({ analysis }: { analysis: AnalysisResponse | null 
           <motion.div variants={itemVariants} className="rounded-lg border border-border bg-card/50 p-2.5">
             <div className="mb-1.5 flex items-center justify-between">
               <span className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground/70">
-                CANDLE BATTLE
+                {/* v16.4 (audit §2.4): MT5 gives TICK volume — label it so the
+                    buy/sell split is never read as exchange consolidated flow. */}
+                CANDLE BATTLE · {t("tickVol")}
               </span>
               <span className="font-mono text-[9px] uppercase text-muted-foreground">{s.battle.state}</span>
             </div>
