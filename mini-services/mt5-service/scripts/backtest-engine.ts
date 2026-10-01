@@ -23,6 +23,15 @@ import { AiTrader } from "../src/trader";
 import type { TraderHost, TraderPosition } from "../src/trader";
 import type { Mt5Position, Mt5Deal, TradeResult, TradeSide, AccountInfo } from "../src/mt5-client";
 
+// v14 STATE-ISOLATION (the 13-B incident): the trader resolves its state
+// file from process.cwd()/data/trader-state.json — running this script from
+// the service directory made loadState() read the LIVE state (and briefly
+// overwrote it with backtest residue). Force an isolated cwd BEFORE any
+// AiTrader is constructed. This must be the first statement of the module.
+if (!process.cwd().startsWith("/tmp")) {
+  process.chdir("/tmp");
+}
+
 // ── the mock broker + host ─────────────────────────────────────────────────
 class MockHost implements TraderHost {
   connected = true;

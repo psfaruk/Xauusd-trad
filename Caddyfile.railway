@@ -1,42 +1,32 @@
 {$PORT} {
-	# ══════════════════════════════════════════════════════════════════
-	# v12 SECURITY: the XTransformPort reverse-proxy is now a WHITELIST.
-	# The old config forwarded to localhost:{arbitrary port} — an open
-	# SSRF/port-scan proxy into the container. Only the two services the
-	# app actually needs may be reached through the public door:
-	#   3030  mt5-service socket.io   (live ticks / bars / flow)
-	#   3031  mt5-service REST        (candles / quotes / trader API)
-	# Everything else (SQLite, internal tooling, anything that ever binds a
-	# port later) is unreachable from the internet.
-	# ══════════════════════════════════════════════════════════════════
+        # ══════════════════════════════════════════════════════════════════
+        # v14 SECURITY: the public door is now SINGLE-PURPOSE.
+        #   ?XTransformPort=3030 → mt5-service socket.io (live ticks/bars/flow)
+        # Everything else → the Next.js app. The mt5-service REST (:3031)
+        # is NO LONGER reachable from the internet at all — the app's own
+        # browser reaches it exclusively through the Next.js same-origin
+        # proxy /api/mt5/* (localhost:3031 + x-trader-key server-side).
+        # The service additionally guards every market endpoint with the
+        # session/key (defense in depth); only /health stays open (local).
+        # ══════════════════════════════════════════════════════════════════
 
-	@io_port query XTransformPort=3030
-	handle @io_port {
-		reverse_proxy localhost:3030 {
-			header_up Host {host}
-			header_up X-Forwarded-For {remote_host}
-			header_up X-Forwarded-Proto {scheme}
-			header_up X-Real-IP {remote_host}
-		}
-	}
+        @io_port query XTransformPort=3030
+        handle @io_port {
+                reverse_proxy localhost:3030 {
+                        header_up Host {host}
+                        header_up X-Forwarded-For {remote_host}
+                        header_up X-Forwarded-Proto {scheme}
+                        header_up X-Real-IP {remote_host}
+                }
+        }
 
-	@rest_port query XTransformPort=3031
-	handle @rest_port {
-		reverse_proxy localhost:3031 {
-			header_up Host {host}
-			header_up X-Forwarded-For {remote_host}
-			header_up X-Forwarded-Proto {scheme}
-			header_up X-Real-IP {remote_host}
-		}
-	}
-
-	# any OTHER XTransformPort value (or none) → the Next.js app only
-	handle {
-		reverse_proxy localhost:3000 {
-			header_up Host {host}
-			header_up X-Forwarded-For {remote_host}
-			header_up X-Forwarded-Proto {scheme}
-			header_up X-Real-IP {remote_host}
-		}
-	}
+        # any OTHER XTransformPort value (or none) → the Next.js app only
+        handle {
+                reverse_proxy localhost:3000 {
+                        header_up Host {host}
+                        header_up X-Forwarded-For {remote_host}
+                        header_up X-Forwarded-Proto {scheme}
+                        header_up X-Real-IP {remote_host}
+                }
+        }
 }

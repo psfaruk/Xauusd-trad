@@ -29,6 +29,9 @@ export interface SeedInput {
   digits: number;
   spread: number;
   bars: Candle[]; // closed bars of `tf`, oldest→newest
+  /** v14: broker server clock − UTC — PDH/PDL day cut at server-local
+   *  midnight (= NY 17:00). 0 = unknown. */
+  brokerOffsetSec?: number;
 }
 
 export interface SeedResult {
@@ -74,7 +77,7 @@ export function seedSignals(input: SeedInput): SeedResult {
     ...detectOrderBlocks(bars),
     ...detectFvg(bars),
   ];
-  const allPools = detectLiquidity(bars);
+  const allPools = detectLiquidity(bars, 0.15, 3, input.brokerOffsetSec ?? 0);
 
   const closesAll = bars.map((b) => b.c);
   const atrAll = atr(bars, 14);

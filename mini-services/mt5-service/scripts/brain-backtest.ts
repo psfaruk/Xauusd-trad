@@ -5,7 +5,7 @@
  * SAME FlowTracker the service uses (lamp + deepRead), then simulates the
  * deterministic rails of the CURRENT brain (v12, R-multiple mode):
  *
- *   · candidate floor per symbol class (priority 0.26 / standard 0.42)
+ *   · candidate floor per symbol class (priority 0.34 / standard 0.42)
  *   · offline-strict conviction gate: sig.strength ≥ profile.minStrength
  *     (adaptive multiplier replayed at its neutral 1.0 — live range 0.85–1.25)
  *   · 3-chart confluence (M15 structure + cross-candle delta + 30s tick path)
@@ -85,8 +85,8 @@ const RISK: Record<RiskMode, RiskProfile> = {
 };
 
 // ── shared brain constants (trader.ts) ──
-const PRIORITY_SYMBOLS = new Set(["XAUUSDm", "USOILm", "USTEC_x100m"]); // lamp floor 0.26, cooldown ×0.5
-const CAND_FLOOR_PRIO = 0.26;
+const PRIORITY_SYMBOLS = new Set(["XAUUSDm", "USOILm", "USTEC_x100m"]); // lamp floor 0.34 (v14), cooldown ×0.5
+const CAND_FLOOR_PRIO = 0.34; // v14: mirrors trader.ts (0.26 → 0.34, the weak-tape audit fix)
 const CAND_FLOOR_STD = 0.42;
 const EXT_MAX_ATR = 1.75;             // never chase further than this many ATR past EMA20
 const SPREAD_BUDGET = 3.5;            // SL ≥ spread × 3.5

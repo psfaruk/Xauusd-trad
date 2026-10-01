@@ -15,7 +15,7 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { feed, useSymbolList, useTrader } from "@/hooks/useFeed";
+import { feed, useSymbolList, useTrader, useTraderLocked } from "@/hooks/useFeed";
 import { useI18n } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
 import type { AiFeel, SymbolEdgeStat, TraderHistoryEntry, TraderJournalEntry, TraderLesson, TraderPendingOrder, TraderRiskMode, TraderState, TraderSymbolRule } from "@/lib/market/types";
@@ -35,8 +35,8 @@ import {
 } from "@/components/ui/alert-dialog";
 import {
   Brain, Bot, TrendingUp, TrendingDown, Gauge, ShieldAlert, ShieldCheck, Wallet, X,
-  FlaskConical, Sparkles, RefreshCw, Plus, Trash2, Clock, Activity, User,
-  BookOpenText, Zap, GraduationCap, CalendarDays, Infinity as InfinityIcon, Landmark,
+  FlaskConical, Sparkles, RefreshCw, Plus, Trash2, Clock, Activity, User, Lock,
+  BookOpenText, Zap, GraduationCap, CalendarDays, Landmark,
 } from "lucide-react";
 
 // ── helpers ──
@@ -424,7 +424,7 @@ function RealAiCard({ state }: { state: TraderState }) {
         </div>
       )}
       <p className="mt-1 text-[9.5px] leading-snug text-muted-foreground/80">
-        {locale === "bn" ? "ভেতরের AI মডেল (GLM) প্রতিটি এন্ট্রি যাচাই করে আর খোলা ট্রেড রিভিউ করে — নিচে তার সিদ্ধান্ত লাইভ:" : "The AI model inside (GLM) verifies every entry and reviews open trades — its live decisions below:"}
+        {t("traderRealAiNote")}
       </p>
       {verdicts.length ? (
         <div className="mt-2 max-h-44 space-y-1.5 overflow-y-auto pr-1">
@@ -490,17 +490,46 @@ export function AutoTradePanel() {
     return post("/api/trader/config", patch);
   }, [post]);
 
-  // TP$ — fixed-dollar profit target draft (commits on blur/Enter, clamped 0.1..50)
+  // TP$ — fixed-dollar profit target draft (commits on blur/Enter).
+  // v14 backend contract: tpUsd 0 = R-multiple mode; $-mode needs ≥ $3
+  // (server clamps 3–50). The old 0.1–50 clamp sent $0.10-ish values the
+  // server silently rejected.
   const [tpDraft, setTpDraft] = useState<string | null>(null);
+  const [tpErr, setTpErr] = useState(false);
   const commitTp = useCallback((raw: string | null) => {
+    if (raw === null) { setTpDraft(null); return; } // untouched — nothing to commit
+    const trimmed = raw.trim();
+    // empty / 0 / negative → R-mode (tpUsd: 0)
+    if (trimmed === "") {
+      setTpDraft(null);
+      setTpErr(false);
+      if (state && (state.tpUsd ?? 0) !== 0) patchConfig({ tpUsd: 0 });
+      return;
+    }
+    const n = parseFloat(trimmed);
+    if (!Number.isFinite(n)) { setTpErr(true); return; } // junk — nothing sent
+    if (n <= 0) {
+      setTpDraft(null);
+      setTpErr(false);
+      if (state && (state.tpUsd ?? 0) !== 0) patchConfig({ tpUsd: 0 });
+      return;
+    }
+    // dead zone 0 < n < 3 — the server rejects it; do NOT send, show why
+    if (n < 3) {
+      setTpErr(true); // keep the draft so the user can fix it inline
+      return;
+    }
     setTpDraft(null);
-    if (raw === null) return; // untouched — nothing to commit
-    const n = parseFloat(raw);
-    if (!Number.isFinite(n)) return;
-    const clamped = Math.max(0.1, Math.min(50, Math.round(n * 100) / 100));
+    setTpErr(false);
+    const rounded = Math.round(n * 100) / 100;
+    const clamped = Math.min(50, Math.max(3, rounded));
+    if (clamped < rounded) {
+      // the committed value was adjusted by clamping — the user must SEE it
+      toast({ title: `TP$ → ${clamped.toFixed(2)}`, description: t("traderTpClamped") });
+    }
     if (state && Math.abs(clamped - (state.tpUsd ?? 0)) < 0.005) return; // unchanged
     patchConfig({ tpUsd: clamped });
-  }, [state, patchConfig]);
+  }, [state, patchConfig, t]);
 
   // BE$ — breakeven trigger draft (0 = AUTO: 60% of the TP target)
   const [beDraft, setBeDraft] = useState<string | null>(null);
@@ -514,16 +543,15 @@ export function AutoTradePanel() {
     patchConfig({ beUsd: clamped });
   }, [state, patchConfig]);
 
-  // DAY — v10 daily trade cap (0 = ∞ UNLIMITED — the user's "যত মন চাই তত" rule).
-  // Free input, no hidden ceiling: the backend accepts 0..10000.
+  // DAY — v14 daily trade cap. Range 1–100; 0/empty/invalid commits as 12
+  // (the safe default — the backend no longer accepts 0 = unlimited).
   const [dayDraft, setDayDraft] = useState<string | null>(null);
   const commitDay = useCallback((raw: string | null) => {
     setDayDraft(null);
     if (raw === null) return;
     const n = parseInt(raw, 10);
-    if (!Number.isFinite(n)) return;
-    const clamped = Math.max(0, Math.min(10000, n));
-    if (state && clamped === (state.maxDailyTrades ?? 0)) return;
+    const clamped = Math.max(1, Math.min(100, n >= 1 ? n : 12));
+    if (state && clamped === (state.maxDailyTrades ?? 12)) return;
     patchConfig({ maxDailyTrades: clamped });
   }, [state, patchConfig]);
 
@@ -575,13 +603,14 @@ export function AutoTradePanel() {
   // local rules draft state (edits apply on blur/enter)
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const commitDraft = useCallback((symbol: string, field: "lots" | "maxPositions", raw: string) => {
-    const rule = state?.rules.find((r) => r.symbol === symbol);
+    const rule = state?.rules?.find((r) => r.symbol === symbol);
     if (!rule) return;
     const num = parseFloat(raw);
     if (!Number.isFinite(num)) { setDrafts((d) => { const n = { ...d }; delete n[`${symbol}:${field}`]; return n; }); return; }
+    // v14 backend caps: MAX_LOT = 1.0 (lots 0.01–1), MAX_POSITIONS = 5 (1–5)
     const clamped = field === "lots"
-      ? Math.max(0.01, Math.min(100, Math.round(num * 100) / 100))
-      : Math.max(1, Math.min(500, Math.round(num)));
+      ? Math.max(0.01, Math.min(1, Math.round(num * 100) / 100))
+      : Math.max(1, Math.min(5, Math.round(num)));
     // v10 no-op guard: Enter can fire the commit twice (keydown + the blur
     // after it) — the second call reads the CLEARED draft's fallback and
     // would silently revert the first (maxPositions 9 → 10 round-trip bug
@@ -590,7 +619,7 @@ export function AutoTradePanel() {
     setDrafts((d) => { const n = { ...d }; delete n[`${symbol}:${field}`]; return n; });
     if (Math.abs(clamped - current) < 1e-9) return;
     const next: Record<string, unknown> = {
-      symbols: state!.rules.map((r) =>
+      symbols: (state?.rules ?? []).map((r) =>
         r.symbol === symbol
           ? { ...r, [field]: clamped }
           : r,
@@ -600,24 +629,40 @@ export function AutoTradePanel() {
   }, [state, patchConfig]);
 
   const availableSymbols = useMemo(
-    () => symbols.map((s) => s.name).filter((n) => !state?.rules.some((r) => r.symbol === n)).slice(0, 60),
+    () => symbols.map((s) => s.name).filter((n) => !state?.rules?.some((r) => r.symbol === n)).slice(0, 60),
     [symbols, state],
   );
 
-  if (!state) {
+  // v14 {locked:true} — password-locked deployment, anonymous viewer: the
+  // feed normalizes the stub payload to null state + locked flag. Show the
+  // lock notice INSTEAD of the cockpit (and instead of an eternal spinner).
+  const locked = useTraderLocked();
+  if (locked || !state) {
     return (
       <div className="flex h-full flex-col items-center justify-center gap-3 p-6 text-center">
-        <Bot className="h-8 w-8 animate-pulse text-muted-foreground/50" />
-        <p className="text-xs text-muted-foreground">{t("traderConnecting")}</p>
+        {locked ? (
+          <div className="flex h-10 w-10 items-center justify-center rounded-xl border border-gold/40 bg-gold/10 text-gold">
+            <Lock className="h-5 w-5" />
+          </div>
+        ) : (
+          <Bot className="h-8 w-8 animate-pulse text-muted-foreground/50" />
+        )}
+        <p className="text-xs text-muted-foreground">
+          {locked ? t("traderLockedNotice") : t("traderConnecting")}
+        </p>
       </div>
     );
   }
 
-  const enabledRules = state.rules.filter((r) => r.enabled);
-  const hasOpenPositions = state.positions.length > 0;
+  // defense-in-depth for half-shape payloads: never trust state.rules to exist
+  const rules: TraderSymbolRule[] = state.rules ?? [];
+  const enabledRules = rules.filter((r) => r.enabled);
+  const hasOpenPositions = (state.positions ?? []).length > 0;
   const tpUsd = state.tpUsd ?? 0;
   const beUsd = state.beUsd ?? 0;
-  const maxDailyTrades = state.maxDailyTrades ?? 0;
+  // v14: 0/undefined no longer means ∞ — normalize the display to 1–100/12
+  const rawDay = state.maxDailyTrades ?? 12;
+  const maxDailyTrades = rawDay >= 1 ? Math.min(100, rawDay) : 12;
   const accountLogin = state.accountLogin ?? 0;
   const serverName = state.serverName ?? "";
   // v11 mirror fields — old payloads may not carry them (guard with ?? [])
@@ -626,8 +671,8 @@ export function AutoTradePanel() {
 
   // + ORDER form plumbing — symbols come from the trader rules; the effective
   // symbol falls back to the first enabled rule so the form is ready at once
-  const orderSymbols = state.rules.map((r) => r.symbol);
-  const effSymbol = ordSymbol || state.rules.find((r) => r.enabled)?.symbol || orderSymbols[0] || "";
+  const orderSymbols = rules.map((r) => r.symbol);
+  const effSymbol = ordSymbol || rules.find((r) => r.enabled)?.symbol || orderSymbols[0] || "";
   const switchOrdSide = (side: "buy" | "sell") => {
     setOrdSide(side);
     if (ordType !== "market") {
@@ -639,7 +684,8 @@ export function AutoTradePanel() {
     setOrdErr(null);
     const lots = parseFloat(ordLots);
     if (!effSymbol) { setOrdErr(t("traderOrderErrSymbol")); return; }
-    if (!Number.isFinite(lots) || lots < 0.01) { setOrdErr(t("traderOrderErrLots")); return; }
+    // v14: backend MAX_LOT = 1.0 — reject below 0.01 AND above 1 before sending
+    if (!Number.isFinite(lots) || lots < 0.01 || lots > 1) { setOrdErr(t("traderOrderErrLots")); return; }
     const sl = parseFloat(ordSl);
     const tp = parseFloat(ordTp);
     const slU = ordSl.trim() !== "" && Number.isFinite(sl) && sl > 0 ? sl : undefined;
@@ -948,28 +994,41 @@ export function AutoTradePanel() {
               <SelectItem value="aggressive" className="text-xs">{t("traderRiskAggressive")}</SelectItem>
             </SelectContent>
           </Select>
-          {/* TP$ — fixed-dollar profit target (0 = R-multiple mode) */}
-          <div
-            className="flex h-7 items-center gap-1 rounded-md border border-border bg-card/60 px-2"
-            title={tpUsd > 0
-              ? `${t("traderTpTarget")} — ${t("traderTpActive")} +$${tpUsd.toFixed(2)}`
-              : `${t("traderTpTarget")} — ${t("traderTpModeR")}`}
-          >
-            <span className="text-[9px] font-bold uppercase text-muted-foreground">TP$</span>
-            <Input
-              value={tpDraft ?? String(tpUsd)}
-              onChange={(e) => setTpDraft(e.target.value)}
-              onBlur={() => commitTp(tpDraft)}
-              onKeyDown={(e) => { if (e.key === "Enter") (e.target as HTMLInputElement).blur(); }}
-              disabled={pending}
-              inputMode="decimal"
-              step={0.05}
-              aria-label={t("traderTpTarget")}
-              className="tnum h-5 w-12 border-0 bg-transparent px-0.5 text-center font-mono text-[10px] shadow-none focus-visible:border-transparent focus-visible:ring-0"
-            />
-            {tpUsd > 0 && (
-              <span className="tnum font-mono text-[9px] font-bold text-up" title={t("traderTpActive")}>
-                ✓ ${tpUsd.toFixed(2)}
+          {/* TP$ — fixed-dollar profit target. v14 contract: 0 = R-multiple
+              mode; $-mode needs ≥ $3 (sent value is clamped 3–50). Persistent
+              hint under the input + inline error for the 0<n<3 dead zone. */}
+          <div className="flex flex-col gap-0.5">
+            <div
+              className="flex h-7 items-center gap-1 rounded-md border border-border bg-card/60 px-2"
+              title={tpUsd > 0
+                ? `${t("traderTpTarget")} — ${t("traderTpActive")} +$${tpUsd.toFixed(2)}`
+                : `${t("traderTpTarget")} — ${t("traderTpModeR")}`}
+            >
+              <span className="text-[9px] font-bold uppercase text-muted-foreground">TP$</span>
+              <Input
+                value={tpDraft ?? String(tpUsd)}
+                onChange={(e) => { setTpDraft(e.target.value); if (tpErr) setTpErr(false); }}
+                onBlur={() => commitTp(tpDraft)}
+                onKeyDown={(e) => { if (e.key === "Enter") (e.target as HTMLInputElement).blur(); }}
+                disabled={pending}
+                inputMode="decimal"
+                step={1}
+                aria-label={t("traderTpTarget")}
+                aria-invalid={tpErr}
+                className="tnum h-5 w-12 border-0 bg-transparent px-0.5 text-center font-mono text-[10px] shadow-none focus-visible:border-transparent focus-visible:ring-0"
+              />
+              {tpUsd > 0 && (
+                <span className="tnum font-mono text-[9px] font-bold text-up" title={t("traderTpActive")}>
+                  ✓ ${tpUsd.toFixed(2)}
+                </span>
+              )}
+            </div>
+            <span className="px-0.5 text-[8px] leading-tight text-muted-foreground/70">
+              {t("traderTpHint")}
+            </span>
+            {tpErr && (
+              <span className="px-0.5 text-[8.5px] font-semibold leading-tight text-down" role="alert">
+                {t("traderTpErrRange")}
               </span>
             )}
           </div>
@@ -1006,9 +1065,8 @@ export function AutoTradePanel() {
               </span>
             )}
           </div>
-          {/* DAY — v10 daily trade cap (0 = ∞ UNLIMITED — “যত মন চাই তত”).
-              Free input, no hidden ceiling; raising it auto-resumes a
-              count-halted brain. */}
+          {/* DAY — v14 daily trade cap, 1–100 (0/invalid commits as 12).
+              Raising it auto-resumes a count-halted brain. */}
           <div
             className="flex h-7 items-center gap-1 rounded-md border border-border bg-card/60 px-2"
             title={t("traderDayHint")}
@@ -1025,15 +1083,12 @@ export function AutoTradePanel() {
               aria-label={t("traderDayHint")}
               className="tnum h-5 w-10 border-0 bg-transparent px-0.5 text-center font-mono text-[10px] shadow-none focus-visible:border-transparent focus-visible:ring-0"
             />
-            {maxDailyTrades === 0 ? (
-              <span className="flex items-center font-mono text-[9px] font-bold text-gold" title={t("traderDayUnlimited")}>
-                <InfinityIcon className="h-3 w-3" />
-              </span>
-            ) : (
-              <span className="tnum font-mono text-[9px] font-bold text-muted-foreground">
-                {state.today.trades}/{maxDailyTrades}
-              </span>
-            )}
+            <span className="tnum font-mono text-[9px] font-bold text-muted-foreground">
+              {state.today?.trades ?? 0}/{maxDailyTrades}
+            </span>
+            <span className="tnum font-mono text-[8px] font-bold leading-none text-muted-foreground/60" title={t("traderDayHint")}>
+              {t("traderDayRange")}
+            </span>
           </div>
           {state.haltedToday && (
             <Badge variant="outline" className="h-6 border-down/40 px-2 text-[9px] font-bold text-down">
@@ -1305,11 +1360,11 @@ export function AutoTradePanel() {
               {t("traderRules")}
             </h3>
             <Badge variant="outline" className="h-4 px-1.5 text-[9px]">
-              {enabledRules.length}/{state.rules.length}
+              {enabledRules.length}/{rules.length}
             </Badge>
           </div>
           <div className="space-y-1.5">
-            {state.rules.map((r) => (
+            {rules.map((r) => (
               <RuleRow
                 key={r.symbol}
                 rule={r}
@@ -1317,14 +1372,14 @@ export function AutoTradePanel() {
                 draftMax={drafts[`${r.symbol}:maxPositions`] ?? String(r.maxPositions)}
                 pending={pending}
                 onToggle={(enabled) => patchConfig({
-                  symbols: state.rules.map((x) => (x.symbol === r.symbol ? { ...x, enabled } : x)),
+                  symbols: rules.map((x) => (x.symbol === r.symbol ? { ...x, enabled } : x)),
                 })}
                 onLotsChange={(v) => setDrafts((d) => ({ ...d, [`${r.symbol}:lots`]: v }))}
                 onLotsCommit={(v) => commitDraft(r.symbol, "lots", v)}
                 onMaxChange={(v) => setDrafts((d) => ({ ...d, [`${r.symbol}:maxPositions`]: v }))}
                 onMaxCommit={(v) => commitDraft(r.symbol, "maxPositions", v)}
                 onRemove={() => patchConfig({
-                  symbols: state.rules.filter((x) => x.symbol !== r.symbol),
+                  symbols: rules.filter((x) => x.symbol !== r.symbol),
                 })}
               />
             ))}
@@ -1349,7 +1404,7 @@ export function AutoTradePanel() {
               onClick={() => {
                 if (!newSymbol) return;
                 patchConfig({
-                  symbols: [...state.rules, { symbol: newSymbol, enabled: true, lots: 0.01, maxPositions: 1 }],
+                  symbols: [...rules, { symbol: newSymbol, enabled: true, lots: 0.01, maxPositions: 1 }],
                 });
                 setNewSymbol("");
               }}
@@ -1621,7 +1676,7 @@ function RuleRow({
         aria-label={`${rule.symbol} enabled`}
       />
       <span className="min-w-0 flex-1 truncate font-mono text-[11px] font-bold">{rule.symbol}</span>
-      <label className="flex items-center gap-1" aria-label="lot size">
+      <label className="flex items-center gap-1" aria-label="lot size" title={t("traderLotsHint")}>
         <span className="text-[8px] font-semibold uppercase text-muted-foreground">{t("traderLots")}</span>
         <Input
           value={draft}
@@ -1632,6 +1687,9 @@ function RuleRow({
           inputMode="decimal"
           className="tnum h-6 w-14 border-border bg-background px-1.5 text-center font-mono text-[10px]"
         />
+        <span className="tnum font-mono text-[7.5px] font-bold leading-none text-muted-foreground/60">
+          {t("traderLotsRange")}
+        </span>
       </label>
       <label className="flex items-center gap-1" aria-label="max positions" title={t("traderMaxPosHint")}>
         <span className="text-[8px] font-semibold uppercase text-muted-foreground">{t("traderMaxPos")}</span>
@@ -1644,6 +1702,9 @@ function RuleRow({
           inputMode="numeric"
           className="tnum h-6 w-10 border-border bg-background px-1.5 text-center font-mono text-[10px]"
         />
+        <span className="tnum font-mono text-[7.5px] font-bold leading-none text-muted-foreground/60">
+          {t("traderMaxRange")}
+        </span>
       </label>
       <Button
         variant="ghost" size="sm" disabled={pending}

@@ -37,14 +37,14 @@ export default function Home() {
   const analysisQ = useQuery({
     queryKey: ["analysis", symbol, timeframe],
     queryFn: () => fetchAnalysis(symbol, timeframe),
-    refetchInterval: 30_000,
+    refetchInterval: 15_000,
     retry: 2,
     staleTime: 6_000,
   });
 
   // ── real-time per-timeframe analysis: every time a bar of the ACTIVE
   // symbol+tf closes (a new bar opens), refetch the engine immediately so
-  // signals/roadmap/drawings follow the market, not the 30s poll.
+  // signals/roadmap/drawings follow the market, not the 15s poll.
   const bars = useBars(symbol, timeframe);
   const lastBarTRef = useRef<number>(0);
   const lastFetchRef = useRef<number>(0);

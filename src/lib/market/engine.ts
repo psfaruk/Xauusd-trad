@@ -70,6 +70,10 @@ export interface EngineInput {
   bars: Record<string, Candle[]>; // tf → bars (forming allowed; filtered here)
   lastSignalBarTime: number | null;
   lastSignalTrigger?: string | null;
+  /** v14: broker server clock − UTC (30-min quantized). Threads into
+   *  detectLiquidity so PDH/PDL cut at server-local midnight (= NY 17:00)
+   *  instead of UTC midnight. 0 = unknown (open market / no offset yet). */
+  brokerOffsetSec?: number;
 }
 
 export interface TriggerResult {
@@ -539,7 +543,8 @@ export function evaluate(input: EngineInput): {
     Math.abs(biasScore) >= 0.3 ? (biasScore > 0 ? "BUY" : "SELL") : "NEUTRAL";
 
   // ── SMC reads ──
-  const pools = detectLiquidity(base);
+  // v14: brokerOffsetSec → PDH/PDL day cut at server-local midnight (NY 17:00)
+  const pools = detectLiquidity(base, 0.15, 3, input.brokerOffsetSec ?? 0);
   const zones = [...detectSupplyDemand(base.slice(-240)), ...detectOrderBlocks(base.slice(-240)), ...detectFvg(base.slice(-240))];
   const pd = premiumDiscount(base, 60, price);
 

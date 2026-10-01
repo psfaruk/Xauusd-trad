@@ -21,7 +21,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
   Sun, Moon, MonitorSmartphone, Languages, Database, Info, RefreshCw, LogOut, Loader2,
-  Cable, ShieldCheck, ShieldAlert, Unlink, Trash2,
+  Cable, ShieldCheck, ShieldAlert, Unlink, Trash2, AlertTriangle,
 } from "lucide-react";
 
 const THEMES = [
@@ -266,6 +266,13 @@ export function SettingsPanel() {
                   <span className="tnum font-mono font-semibold text-foreground">{v}</span>
                 </div>
               ))}
+              {/* v14 AES key-rotation warning — the saved MT5 password is
+                  encrypted with a key derived from APP_PASSWORD; rotating it
+                  on the host makes the stored credential undecryptable */}
+              <div className="flex items-start gap-1.5 border-b border-border/60 py-2 text-[10px] leading-snug text-muted-foreground">
+                <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0 text-gold/80" aria-hidden="true" />
+                <span>{t("mt5PasswordRotationNote")}</span>
+              </div>
               <div className="flex flex-col gap-2 py-3 sm:flex-row">
                 <Button
                   type="button"

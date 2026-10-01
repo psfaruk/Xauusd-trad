@@ -212,9 +212,10 @@ const restServer = createServer((req, res) => {
         source: manager.source,
         server: manager.serverName,
         loginMasked: configured ? maskLogin(manager.login || stored?.login) : null,
+        // v14: `login` (full number) REMOVED — loginMasked is the only form
+        // that leaves the service (the audit's connected-account leak).
         account: manager.connected && manager.account
           ? {
-              login: manager.login,
               balance: manager.account.balance,
               equity: manager.account.equity,
               currency: manager.account.currency,
@@ -314,6 +315,10 @@ const restServer = createServer((req, res) => {
       // v12: account numbers are PRIVATE — anonymous callers get connection
       // health only (the owner's browser carries the session cookie and sees
       // balance/equity; the audit's Critical #3)
+      // v14: guardTrading added (market REST was an open door behind Caddy);
+      // `login` REMOVED from the payload — masked login lives in
+      // /api/mt5-account.loginMasked only (the audit's full-login leak).
+      if (!guardTrading(req, res)) return;
       const priv = authorizeTradingReq(req).ok;
       return json(res, 200, {
         connected: manager.connected,
@@ -321,7 +326,6 @@ const restServer = createServer((req, res) => {
         server: manager.serverName,
         account: priv && manager.account
           ? {
-              login: manager.login,
               balance: manager.account.balance,
               equity: manager.account.equity,
               currency: manager.account.currency,
@@ -335,15 +339,21 @@ const restServer = createServer((req, res) => {
       });
     }
     if (url.pathname === "/api/symbols") {
+      // v14: market REST now requires the session/key (the audit's dual-door
+      // finding) — the app's own browser reaches these through the Next.js
+      // proxy which attaches x-trader-key server-side.
+      if (!guardTrading(req, res)) return;
       return json(res, 200, { source: manager.source, list: manager.symbolList() });
     }
     if (url.pathname === "/api/quote") {
+      if (!guardTrading(req, res)) return;
       const symbol = url.searchParams.get("symbol") ?? "XAUUSDm";
       const q = manager.getQuote(symbol);
       if (!q) return json(res, 404, { error: "no quote yet" });
       return json(res, 200, { symbol, ...q, spread: q.ask - q.bid });
     }
     if (url.pathname === "/api/ticks") {
+      if (!guardTrading(req, res)) return;
       const symbol = url.searchParams.get("symbol") ?? "XAUUSDm";
       const sec = Number(url.searchParams.get("sec") ?? 180);
       const q = manager.getQuote(symbol);
@@ -355,6 +365,7 @@ const restServer = createServer((req, res) => {
       });
     }
     if (url.pathname === "/api/flow") {
+      if (!guardTrading(req, res)) return;
       const symbol = url.searchParams.get("symbol") ?? "XAUUSDm";
       const tf = url.searchParams.get("tf") ?? "M1";
       // peek-only: returns data if a tracker exists (a socket flowsub creates it)
@@ -367,6 +378,7 @@ const restServer = createServer((req, res) => {
     }
     // ── AI live chart analysis — what the brain "sees" when it looks at the chart ──
     if (url.pathname === "/api/ai-chart") {
+      if (!guardTrading(req, res)) return;
       const symbol = url.searchParams.get("symbol") ?? "XAUUSDm";
       const tf = url.searchParams.get("tf") ?? "M15";
       manager.getCandles(symbol, tf, 260).then(
@@ -499,6 +511,7 @@ const restServer = createServer((req, res) => {
       return;
     }
     if (url.pathname === "/api/candles") {
+      if (!guardTrading(req, res)) return;
       const symbol = url.searchParams.get("symbol") ?? "XAUUSDm";
       const tf = url.searchParams.get("tf") ?? "M15";
       const limit = Number(url.searchParams.get("limit") ?? 500);

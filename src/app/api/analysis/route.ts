@@ -8,6 +8,7 @@ import { buildDrawings, magnetsToDrawings, pathToDrawing, projectSetup } from "@
 import { buildRoadmap } from "@/lib/market/roadmap";
 import { detectSupplyDemand } from "@/lib/market/smc";
 import type { AnalysisResponse, Candle, SignalPayload } from "@/lib/market/types";
+import { svcHeaders, getBrokerOffsetSec } from "@/lib/svc";
 
 const MT5_URL = process.env.MT5_SERVICE_URL ?? "http://127.0.0.1:3031";
 const CACHE_TTL = 8_000;
@@ -22,7 +23,7 @@ async function fetchCandles(symbol: string, tf: string, limit: number): Promise<
   try {
     const res = await fetch(
       `${MT5_URL}/api/candles?symbol=${encodeURIComponent(symbol)}&tf=${tf}&limit=${limit}`,
-      { cache: "no-store", signal: AbortSignal.timeout(12_000) },
+      { cache: "no-store", signal: AbortSignal.timeout(12_000), headers: svcHeaders() },
     );
     if (!res.ok) return [];
     const data = await res.json();
@@ -32,17 +33,50 @@ async function fetchCandles(symbol: string, tf: string, limit: number): Promise<
   }
 }
 
+// ── v14 SPREAD FALLBACK ──
+// The audit: fetchSpread failing returned 0 → the spread gate silently
+// PASSED and geometry built too-tight SLs. Now: last known good per symbol,
+// then a per-class default, so a dead quote fetch can never produce a
+// zero-spread world.
+const lastGoodSpread = new Map<string, number>();
+const DEFAULT_SPREADS: Record<string, number> = {
+  XAUUSD: 0.30, XAGUSD: 0.04, BTCUSD: 40, ETHUSD: 2.5,
+  USOIL: 0.06, UKOIL: 0.06, USTEC: 3, US500: 0.9, US30: 2,
+  EURUSD: 0.00016, GBPUSD: 0.00018, AUDUSD: 0.00018, NZDUSD: 0.00020,
+  USDCAD: 0.0002, USDCHF: 0.0002, EURJPY: 0.02, GBPJPY: 0.03, USDJPY: 0.015,
+};
+function defaultSpread(symbol: string): number {
+  if (/XAU/i.test(symbol)) return DEFAULT_SPREADS.XAUUSD;
+  if (/XAG/i.test(symbol)) return DEFAULT_SPREADS.XAGUSD;
+  if (/BTC/i.test(symbol)) return DEFAULT_SPREADS.BTCUSD;
+  if (/ETH/i.test(symbol)) return DEFAULT_SPREADS.ETHUSD;
+  if (/OIL/i.test(symbol)) return DEFAULT_SPREADS.USOIL;
+  if (/USTEC|US500|US30|NAS|SPX|DJ/i.test(symbol)) {
+    if (/USTEC|NAS/i.test(symbol)) return DEFAULT_SPREADS.USTEC;
+    if (/US30|DJ/i.test(symbol)) return DEFAULT_SPREADS.US30;
+    return DEFAULT_SPREADS.US500;
+  }
+  if (/JPY/i.test(symbol)) return DEFAULT_SPREADS.EURJPY;
+  if (/EUR|GBP|AUD|NZD|CAD|CHF/i.test(symbol)) return DEFAULT_SPREADS.EURUSD;
+  return 0.25; // unknown symbol class — conservative flat default
+}
 async function fetchSpread(symbol: string): Promise<number> {
   try {
     const res = await fetch(`${MT5_URL}/api/quote?symbol=${encodeURIComponent(symbol)}`, {
       cache: "no-store",
       signal: AbortSignal.timeout(4000),
+      headers: svcHeaders(),
     });
-    if (!res.ok) return 0;
+    if (!res.ok) return lastGoodSpread.get(symbol) ?? defaultSpread(symbol);
     const q = await res.json();
-    return q.spread ?? 0;
+    const sp = q.spread ?? 0;
+    if (sp > 0) {
+      lastGoodSpread.set(symbol, sp);
+      return sp;
+    }
+    return lastGoodSpread.get(symbol) ?? defaultSpread(symbol);
   } catch {
-    return 0;
+    return lastGoodSpread.get(symbol) ?? defaultSpread(symbol);
   }
 }
 
@@ -146,14 +180,14 @@ async function trackOpenSignals(symbol: string): Promise<void> {
  * with the same detectors and persist outcomes so the panel/stats/chart
  * start populated (reference: seedHistoricalSignals).
  */
-async function ensureSeeded(symbol: string, tf: string, bars: Candle[], digits: number, spread: number): Promise<void> {
+async function ensureSeeded(symbol: string, tf: string, bars: Candle[], digits: number, spread: number, brokerOffsetSec = 0): Promise<void> {
   const key = `${symbol}|${tf}`;
   if (seeding.has(key)) return;
   try {
     const count = await db.signalRecord.count({ where: { symbol, timeframe: tf } });
     if (count >= 5) return;
     seeding.add(key);
-    const { signals } = seedSignals({ symbol, tf, digits, spread, bars });
+    const { signals } = seedSignals({ symbol, tf, digits, spread, bars, brokerOffsetSec });
     for (const s of signals) {
       await db.signalRecord
         .create({
@@ -188,12 +222,6 @@ export async function GET(req: Request) {
   const symbol = url.searchParams.get("symbol") ?? "XAUUSDm";
   const tf = url.searchParams.get("tf") ?? "M15";
 
-  const cacheKey = `${symbol}|${tf}`;
-  const hit = cache.get(cacheKey);
-  if (hit && Date.now() - hit.at < CACHE_TTL) {
-    return NextResponse.json(hit.data);
-  }
-
   const limits: Record<string, number> = {
     M1: 900, M5: 700, M15: 600, M30: 400, H1: 400, H4: 300,
   };
@@ -210,13 +238,28 @@ export async function GET(req: Request) {
     );
   }
 
+  // v14: cache keyed on the LAST CLOSED bar time — a new bar close forces a
+  // fresh evaluate even inside the 8s TTL (the audit's "stale zones after
+  // candle close"). Same-bar polls still dedupe through TTL.
+  const lastClosedT = (bars[tf].filter((b) => !b.f).slice(-1)[0] ?? bars[tf][bars[tf].length - 1]).t;
+  const cacheKey = `${symbol}|${tf}|${lastClosedT}`;
+  const hit = cache.get(cacheKey);
+  if (hit && Date.now() - hit.at < CACHE_TTL) {
+    return NextResponse.json(hit.data);
+  }
+  // prune: keep the map bounded (one key per bar per market)
+  if (cache.size > 40) cache.clear();
+
   const digitsInfo = await fetch(`${MT5_URL}/api/symbols`, {
     cache: "no-store",
     signal: AbortSignal.timeout(4000),
+    headers: svcHeaders(),
   }).then((r) => (r.ok ? r.json() : null)).catch(() => null);
   const digits =
     digitsInfo?.list?.find((s: any) => s.name === symbol)?.digits ?? 2;
   const spread = await fetchSpread(symbol);
+  // v14: broker clock offset → PDH/PDL day cut at server-local midnight (NY 17:00)
+  const brokerOffsetSec = await getBrokerOffsetSec();
 
   const lastSig = await db.signalRecord.findFirst({
     where: { symbol, timeframe: tf },
@@ -224,7 +267,7 @@ export async function GET(req: Request) {
   });
 
   // backtest seed (fire-and-forget; first sight of this market+tf)
-  void ensureSeeded(symbol, tf, bars[tf], digits, spread);
+  void ensureSeeded(symbol, tf, bars[tf], digits, spread, brokerOffsetSec);
 
   const result = evaluate({
     symbol,
@@ -232,6 +275,7 @@ export async function GET(req: Request) {
     digits,
     spread,
     bars,
+    brokerOffsetSec,
     lastSignalBarTime: lastSig?.barTime ?? null,
     lastSignalTrigger: lastSig?.trigger ?? null,
   });
@@ -259,7 +303,17 @@ export async function GET(req: Request) {
       s.id = created.id;
       s.createdAt = created.createdAt.toISOString();
     } catch {
-      // unique constraint → cooldown dedupe
+      // v14: unique conflict (symbol|tf|barTime|direction) — the audit's
+      // "silent drop": the signal showed in the UI this poll and vanished
+      // the next. Merge with the EXISTING row so the payload stays stable.
+      const existing = await db.signalRecord
+        .findFirst({ where: { symbol: s.symbol, timeframe: s.timeframe, barTime: s.barTime, direction: s.direction } })
+        .catch(() => null);
+      if (existing) {
+        s.id = existing.id;
+        s.createdAt = existing.createdAt.toISOString();
+        if (existing.status !== "active" && existing.status !== "pending") s.status = existing.status as any;
+      }
     }
   }
 

@@ -65,6 +65,9 @@ class FeedStore {
   private traderState: TraderState | null = null;
   private traderSubs = new Set<() => void>();
   private traderLive = false;
+  /** v14: the deployment is password-locked and the viewer is anonymous — the
+   *  server answers the trader room/REST with {locked:true} instead of state */
+  private traderLocked = false;
 
   connect() {
     if (this.socket) return;
@@ -174,9 +177,7 @@ class FeedStore {
 
     // AI trader state stream (room "trader")
     socket.on("trader", (s: TraderState) => {
-      if (!s || typeof s !== "object") return;
-      this.traderState = s;
-      this.traderSubs.forEach((fn) => fn());
+      this.applyTrader(s);
     });
 
     // throttled flush → watchlist/header updates at 4 Hz
@@ -323,16 +324,36 @@ class FeedStore {
   }
 
   // ── AI trader state ──
+  /** v14 {locked:true} guard — a password-locked mt5-service answers anonymous
+   *  subscribers with `{locked:true}` and NONE of the TraderState fields
+   *  (rules/journal/positions are absent), which used to crash every consumer
+   *  that touched state.rules. Normalize at the store boundary: locked →
+   *  traderState null + traderLocked true (useTraderLocked); a real payload
+   *  clears the lock. Both the socket stream and the REST seed go through here. */
+  private applyTrader(s: unknown) {
+    if (!s || typeof s !== "object") return;
+    if ((s as { locked?: unknown }).locked === true) {
+      this.traderLocked = true;
+      this.traderState = null;
+      this.traderSubs.forEach((fn) => fn());
+      return;
+    }
+    this.traderLocked = false;
+    this.traderState = s as TraderState;
+    this.traderSubs.forEach((fn) => fn());
+  }
+
   subscribeTrader(fn: () => void): () => void {
     this.traderSubs.add(fn);
     if (!this.traderLive) {
       this.traderLive = true;
       this.socket?.emit("tradersub");
-      // REST seed (socket emits only on change)
+      // REST seed (socket emits only on change) — guarded by applyTrader so a
+      // locked deployment's {locked:true} stub never enters the store
       fetch(restUrl("/api/trader"))
         .then((r) => (r.ok ? r.json() : null))
         .then((s) => {
-          if (s) { this.traderState = s; this.traderSubs.forEach((f) => f()); }
+          if (s) this.applyTrader(s);
         })
         .catch(() => {});
     } else if (this.traderState) fn();
@@ -345,6 +366,7 @@ class FeedStore {
     };
   }
   getTraderSnapshot(): TraderState | null { return this.traderState; }
+  getTraderLocked(): boolean { return this.traderLocked; }
 
   async postTrader(path: string, body?: unknown): Promise<any> {
     const res = await fetch(restUrl(path), {
@@ -535,8 +557,17 @@ export function useTicks(symbol: string): TickPoint[] {
 }
 const EMPTY_TICKS: TickPoint[] = [];
 
-/** AI auto-trader live state (socket room "trader" + REST seed). */
+/** AI auto-trader live state (socket room "trader" + REST seed). Null when
+ *  disconnected OR when the deployment is password-locked ({locked:true}). */
 export function useTrader(): TraderState | null {
   const subscribe = useCallback((fn: () => void) => feed.subscribeTrader(fn), []);
   return useSyncExternalStore(subscribe, () => feed.getTraderSnapshot(), () => null);
+}
+
+/** v14: true while the trader stream answers {locked:true} (password-locked
+ *  deployment, anonymous viewer) — panels use this to show a "log in" notice
+ *  instead of the cockpit / an eternal "connecting…" spinner. */
+export function useTraderLocked(): boolean {
+  const subscribe = useCallback((fn: () => void) => feed.subscribeTrader(fn), []);
+  return useSyncExternalStore(subscribe, () => feed.getTraderLocked(), () => false);
 }

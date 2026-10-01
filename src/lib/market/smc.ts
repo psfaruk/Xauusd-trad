@@ -200,7 +200,7 @@ export interface LiquidityPool {
  * CONFIRMATION bar (atrAll[availIdx]), not `lastAtr(bars)` — the whole-series
  * last value is "today's" volatility applied to last week's pools.
  */
-export function detectLiquidity(bars: Candle[], tolAtr = 0.15, maxPerSide = 3): LiquidityPool[] {
+export function detectLiquidity(bars: Candle[], tolAtr = 0.15, maxPerSide = 3, brokerOffsetSec = 0): LiquidityPool[] {
   const atrAll = atr(bars);
   const sw = swings(bars, 2, 2);
   const pools: LiquidityPool[] = [];
@@ -241,7 +241,11 @@ export function detectLiquidity(bars: Candle[], tolAtr = 0.15, maxPerSide = 3): 
     }
   }
   // prior-day high/low — known only once the day closes (available next day)
-  const dayBars = groupByDay(bars);
+  // v14: groupByDay cuts at SERVER-LOCAL midnight (= NY 17:00 for Exness,
+  // whose clock follows US DST) — bars are true UTC now, so the day key is
+  // (t + brokerOffsetSec)'s calendar day. The old cut at UTC midnight put
+  // the boundary 2–3h into the NY session (wrong PDH/PDL lines).
+  const dayBars = groupByDay(bars, brokerOffsetSec);
   if (dayBars.length >= 2) {
     const prev = dayBars[dayBars.length - 2];
     const nextDay = dayBars[dayBars.length - 1];
@@ -275,10 +279,11 @@ export function detectLiquidity(bars: Candle[], tolAtr = 0.15, maxPerSide = 3): 
 // (v12.1: the old lastAtr() full-series helper is gone — equal-high pools
 // now use the ATR as of their own confirmation bar, see atrAt above.)
 
-function groupByDay(bars: Candle[]): { t: number; hi: number; lo: number }[] {
+function groupByDay(bars: Candle[], brokerOffsetSec = 0): { t: number; hi: number; lo: number }[] {
   const map = new Map<string, { t: number; hi: number; lo: number }>();
   for (const b of bars) {
-    const d = new Date(b.t * 1000).toISOString().slice(0, 10);
+    // v14: server-local calendar day (forex day) — NOT the UTC calendar day
+    const d = new Date((b.t + brokerOffsetSec) * 1000).toISOString().slice(0, 10);
     const cur = map.get(d);
     if (!cur) map.set(d, { t: b.t, hi: b.h, lo: b.l });
     else {

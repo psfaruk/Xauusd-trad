@@ -906,16 +906,23 @@ export default function TradingChart(props: Props) {
             let xs = xOfTime(d.t0) ?? rightEdge - 24;
             xs = clamp(xs, -2, rightEdge - 24);
             // risk shading (red entry↔SL, green entry↔TP) — reads at a glance
-            ctx.fillStyle = "rgba(248,113,113,0.10)";
-            ctx.fillRect(xs, Math.min(yE, yS), rightEdge - xs, Math.abs(yS - yE));
-            ctx.fillStyle = "rgba(52,211,153,0.10)";
-            ctx.fillRect(xs, Math.min(yE, yT), rightEdge - xs, Math.abs(yT - yE));
+            // v14: LIVE/pending setups ONLY. A PLAN (projected) setup draws
+            // NO shading — the audit: same zone shading as a live entry
+            // invited entries at the planned price. The dotted lines, the
+            // PLAN badges and the "planned entry" note carry it alone.
+            if (!projected) {
+              ctx.fillStyle = "rgba(248,113,113,0.10)";
+              ctx.fillRect(xs, Math.min(yE, yS), rightEdge - xs, Math.abs(yS - yE));
+              ctx.fillStyle = "rgba(52,211,153,0.10)";
+              ctx.fillRect(xs, Math.min(yE, yT), rightEdge - xs, Math.abs(yT - yE));
+            }
             // dotted birth line — where the trade started
             if (xs > 2) {
               hardSeg(ctx, Math.round(xs) + 0.5, 0, Math.round(xs) + 0.5, h, "rgba(154,160,170,0.4)", "transparent", 0.7, [2, 4]);
             }
             // ENTRY (gold, dotted while waiting) / SL (red dashed) / TP (green dashed)
-            const inkM = projected ? 0.85 : 1;
+            // v14: PLAN ink dimmed to 0.55 (was 0.85 — still read as a live entry)
+            const inkM = projected ? 0.55 : 1;
             // ENTRY gets a soft glow so the entry price pops over everything
             ctx.save();
             ctx.shadowColor = "rgba(212,175,55,0.55)";

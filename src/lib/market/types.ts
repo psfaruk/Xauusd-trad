@@ -215,17 +215,24 @@ export interface AiVerdictRecord {
 }
 
 export interface TraderState {
+  /** v14: present (and true) ONLY on the password-locked stub payload — a
+   *  locked mt5-service answers anonymous sockets/REST with {locked:true}
+   *  and none of the other fields. useFeed normalizes it away (null state +
+   *  a traderLocked flag) so consumers never see this shape as a TraderState. */
+  locked?: boolean;
   enabled: boolean;
   riskMode: TraderRiskMode;
-  /** fixed-dollar take-profit target — every trade banks profit at +$tpUsd
-   *  (0.50 default). 0 = R-multiple mode (tpR × risk). */
+  /** fixed-dollar take-profit target — every trade banks profit at +$tpUsd.
+   *  0 = R-multiple mode (tpR × risk); $-mode requires ≥ 3 (server range
+   *  3–50, v14 — the old 0.1–50 UI clamp sent values the server rejects). */
   tpUsd: number;
   /** v9 breakeven trigger — live profit ≥ this $ moves SL to entry(+lock).
    *  0 = AUTO (60% of tpUsd, or breakevenR in R-mode). */
   beUsd: number;
   /** v9: $ locked above entry when breakeven fires */
   beLockUsd?: number;
-  /** v10: daily trade cap the user chose — 0 = UNLIMITED */
+  /** v14: daily trade cap, 1–100 (backend default 12). 0/invalid input
+   *  commits as 12 — unlimited mode is gone. */
   maxDailyTrades?: number;
   /** v10: the MT5 login the brain follows — verify it matches your MT5 app */
   accountLogin?: number;

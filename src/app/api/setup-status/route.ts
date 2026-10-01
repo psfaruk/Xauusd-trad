@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { db } from "@/lib/db";
 import { mt5ServiceStatus } from "@/lib/mt5-spawn";
+import { svcHeaders } from "@/lib/svc";
 
 export const dynamic = "force-dynamic";
 
@@ -42,7 +43,8 @@ export async function GET() {
   try {
     const r = await fetch(
       `${process.env.MT5_SERVICE_URL ?? "http://127.0.0.1:3031"}/api/status`,
-      { cache: "no-store", signal: AbortSignal.timeout(4000) },
+      // v14: market REST is guarded now — attach the derived trader key
+      { cache: "no-store", signal: AbortSignal.timeout(4000), headers: svcHeaders() },
     );
     if (r.ok) {
       const j = (await r.json()) as { source?: string; server?: string; reason?: string };

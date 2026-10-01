@@ -362,7 +362,11 @@ const CONSEC_LOSS_BREAK = 3;          // circuit breaker after this many consecu
 
 // ── the real-AI layer (LLM judge) ──
 const PRIORITY_SYMBOLS = new Set(["XAUUSDm", "USOILm", "USTEC_x100m"]); // user: trade these MORE
-const CAND_FLOOR_PRIO = 0.26;         // lamp floor to become an LLM candidate (priority pairs)
+// v14: raised 0.26 → 0.34 — the audit: a 0.26 priority floor let weak
+// tape entries through even in R-mode. Tighter than the old v5 CAND_FLOOR
+// (0.30) was on priority pairs, still below STD so the LLM judge rationale
+// (priority = filtered harder downstream) survives.
+const CAND_FLOOR_PRIO = 0.34;         // lamp floor to become an LLM candidate (priority pairs)
 const CAND_FLOOR_STD = 0.42;         // same for the rest
 const EXT_MAX_ATR = 1.75;            // never chase further than this many ATR past EMA20 (entry chase guard)
 const JUDGE_TIMEOUT_MS = 4500;       // LLM call budget — beyond this, local rules decide (speed matters)
@@ -987,16 +991,16 @@ export class AiTrader {
     if (typeof patch.dailyLossLimitPct === "number")
       this.cfg.dailyLossLimitPct = Math.max(1, Math.min(50, patch.dailyLossLimitPct));
     if (typeof patch.maxDailyTrades === "number") {
-      // v12: 0 stays UNLIMITED-by-choice but is capped at MAX_DAILY_TRADES_CAP
-      // (100) — the audit's "unlimited churn" surface. 8–12 is the sane range.
-      this.cfg.maxDailyTrades = Math.max(0, Math.min(MAX_DAILY_TRADES_CAP, Math.round(patch.maxDailyTrades)));
-      this.think(this.cfg.maxDailyTrades > 0
-        ? `📅 দৈনিক ট্রেড লিমিট ${this.cfg.maxDailyTrades} — এটাই আজকের সর্বোচ্চ`
-        : "📅 দৈনিক ট্রেড লিমিট আনলিমিটেড — ব্যালেন্স-সুরক্ষা লিমিট বাকি আছে", "info");
-      this.journalLog({ action: "info", symbol: "", reason: `daily trade cap set to ${this.cfg.maxDailyTrades > 0 ? this.cfg.maxDailyTrades : "UNLIMITED"}` });
+      // v14: NO unlimited mode — the audit flagged "0 = unlimited" as a
+      // misconfiguration trap. 0 / invalid now resets to the safe default
+      // (12); the real range is [1, MAX_DAILY_TRADES_CAP].
+      const rawDaily = Math.round(patch.maxDailyTrades);
+      this.cfg.maxDailyTrades = Math.max(1, Math.min(MAX_DAILY_TRADES_CAP, rawDaily >= 1 ? rawDaily : 12));
+      this.think(`📅 দৈনিক ট্রেড লিমিট ${this.cfg.maxDailyTrades} — এটাই আজকের সর্বোচ্চ`, "info");
+      this.journalLog({ action: "info", symbol: "", reason: `daily trade cap set to ${this.cfg.maxDailyTrades}` });
       // the user raising the cap is an explicit wish to resume
       if (this.haltedToday && this.haltReason.startsWith("max daily trades")
-        && (this.cfg.maxDailyTrades === 0 || this.today.trades < this.cfg.maxDailyTrades)) {
+        && this.today.trades < this.cfg.maxDailyTrades) {
         this.haltedToday = false;
         this.haltReason = "";
         this.think("▶️ ট্রেড লিমিট বাড়ানো হলো — আবার এন্ট্রি চালু", "info");
@@ -1641,18 +1645,30 @@ export class AiTrader {
       const edge = this.edge(rule.symbol);
       const prio = PRIORITY_SYMBOLS.has(rule.symbol);
 
-      // ══ v12 SESSION / WEEKEND GATE (the audit's step-1 directive: trade
-      //    London+NY only, UTC 7–20; Asia and the weekend are OFF for the
-      //    brain — the thin Asia tape and weekend crypto drifts are where the
-      //    scalp edge dies). Manual user orders are NOT affected. ══
-      const brokerNow = this.host.brokerNowSec();
-      const gmt = new Date(brokerNow * 1000);
-      const h = gmt.getUTCHours();
-      const dow = gmt.getUTCDay(); // 0=Sun … 6=Sat
-      const weekend = dow === 6 || (dow === 0 && h < 21) || (dow === 5 && h >= 21); // FX/metals closed Sat + late-Fri/Sun
-      if (weekend || h < 7 || h >= 20) {
-        const why = weekend ? "weekend (market closed)" : `outside London+NY window (UTC ${h}h, window 7–20)`;
-        this.journalLog({ action: "skip", symbol: rule.symbol, reason: `session gate: ${why}` });
+      // ══ v14 SESSION GATE — TRUE UTC (was: brokerNowSec = SERVER-LOCAL
+      //    hours, so the "UTC 7–20" comment lied; the window ended 20h and
+      //    Friday closed at 21h *server* — cutting the last NY hours the
+      //    audit flagged. New window: London+NY = 07:00–24:00 UTC Mon–Fri
+      //    PLUS Sat 00:00–01:00 UTC (Friday's late-NY tail — gold trades
+      //    until ≈ Sat 01:00 UTC). Manual user orders are NOT affected. ══
+      const g = new Date();               // machine clock = UTC (Railway/NTP)
+      const h = g.getUTCHours();
+      const dow = g.getUTCDay();          // 0=Sun … 6=Sat
+      const inWindow = (dow >= 1 && dow <= 5 && h >= 7) || (dow === 6 && h < 1);
+      if (!inWindow) {
+        const why = (dow === 6 || dow === 0)
+          ? "weekend (market closed)"
+          : `outside London+NY window (UTC ${h}h, window 7–24 + Fri tail to Sat 01:00)`;
+        // v14: session skips go through the SAME v6.2 throttle as every
+        // other veto (≥90s per symbol OR category change). Before, this
+        // branch journaled EVERY decide() pass (~1.2s per symbol) and
+        // drowned the 240-entry journal cap inside ~5 minutes — the
+        // audit's "real opens/closes evicted" + "narration sees only SKIP".
+        const prevSkip = this.lastSkipLogAt.get(rule.symbol);
+        if (!prevSkip || Date.now() - prevSkip.at >= 90_000 || prevSkip.cat !== "session") {
+          this.lastSkipLogAt.set(rule.symbol, { at: Date.now(), cat: "session" });
+          this.journalLog({ action: "skip", symbol: rule.symbol, reason: `session gate: ${why}` });
+        }
         continue;
       }
 
@@ -1704,6 +1720,7 @@ export class AiTrader {
       // (exhaustion tail) are excluded — $-target scalps ride most of the candle.
       // v12: measured on the BROKER clock (server now + broker offset) — the
       // M1 bar boundary belongs to the broker, not to the container clock.
+      const brokerNow = this.host.brokerNowSec();
       const ageFrac = ((brokerNow % 60) + 60) % 60 / 60;
       if (ageFrac < 0.08 || ageFrac > 0.95) continue;
 

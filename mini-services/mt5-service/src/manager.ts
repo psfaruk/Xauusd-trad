@@ -568,14 +568,19 @@ export class Mt5Manager {
     if (bidRaw <= 0 || askRaw <= 0) return;
 
     // broker→UTC offset (30-min quantized, only from fresh ticks)
+    // v14 FIX: the old gate `if (Math.abs(drift) < 900)` tested the WHOLE
+    // drift — an Exness server (UTC+2/+3) has |drift| ≈ 7200/10800s, so
+    // the gate NEVER fired and offsetSec stayed 0 forever: every bar ship
+    // server-local times stamped as "UTC" (killzones/PDH/drawings 2–3h
+    // off). Correct logic: quantize FIRST, then trust q when the RESIDUAL
+    // (drift − q, i.e. network latency + sub-30m skew) is < 15 min.
     const utcNow = this.nowSec();
     const drift = timeSec - utcNow;
-    if (Math.abs(drift) < 900) {
-      const q = Math.round(drift / 1800) * 1800;
-      if (q !== this.offsetSec) {
-        this.offsetSec = q;
-        this.cache.clear(); // re-stamp everything in UTC
-      }
+    const q = Math.round(drift / 1800) * 1800;
+    const residual = drift - q;
+    if (Math.abs(residual) < 900 && q !== this.offsetSec) {
+      this.offsetSec = q;
+      this.cache.clear(); // re-stamp everything in UTC
     }
 
     const div = 10 ** digits;

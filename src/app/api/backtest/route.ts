@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { seedSignals } from "@/lib/market/seed";
 import type { Candle } from "@/lib/market/types";
+import { svcHeaders, getBrokerOffsetSec } from "@/lib/svc";
 
 /**
  * Engine backtest — walk-forward run of the LIVE engine over real MT5
@@ -17,7 +18,7 @@ async function fetchCandles(symbol: string, tf: string, limit: number): Promise<
   try {
     const res = await fetch(
       `${MT5_URL}/api/candles?symbol=${encodeURIComponent(symbol)}&tf=${tf}&limit=${limit}`,
-      { cache: "no-store", signal: AbortSignal.timeout(15_000) },
+      { cache: "no-store", signal: AbortSignal.timeout(15_000), headers: svcHeaders() },
     );
     if (!res.ok) return [];
     const data = await res.json();
@@ -43,13 +44,16 @@ export async function GET(req: Request) {
     fetch(`${MT5_URL}/api/symbols`, {
       cache: "no-store",
       signal: AbortSignal.timeout(4000),
+      headers: svcHeaders(),
     }).then((r) => (r.ok ? r.json() : null)).catch(() => null),
   ]);
   const meta = symbolsRes?.list?.find((s: any) => s.name === symbol);
   const digits = meta?.digits ?? 2;
   const spread = meta?.spread ?? 0;
 
-  const { signals, scanned } = seedSignals({ symbol, tf, digits, spread, bars });
+  // v14: broker offset → PDH/PDL day cut at server-local midnight (NY 17:00)
+  const brokerOffsetSec = await getBrokerOffsetSec();
+  const { signals, scanned } = seedSignals({ symbol, tf, digits, spread, bars, brokerOffsetSec });
 
   const won = signals.filter((s) => s.status === "won").length;
   const lost = signals.filter((s) => s.status === "lost").length;

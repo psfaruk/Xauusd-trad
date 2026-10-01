@@ -85,14 +85,14 @@ export function HomePanel({ analysis }: { analysis: AnalysisResponse | null }) {
             <div>
               <div className="text-[10px] uppercase tracking-wider text-muted-foreground">{t("balance")}</div>
               <div className="tnum font-mono text-lg font-bold text-foreground">
-                {trader ? trader.balance.toFixed(2) : "—"}
+                {trader?.balance != null ? trader.balance.toFixed(2) : "—"}
                 <span className="ml-1 text-[10px] font-normal text-muted-foreground">{trader?.currency ?? "USD"}</span>
               </div>
             </div>
             <div>
               <div className="text-[10px] uppercase tracking-wider text-muted-foreground">{t("equity")}</div>
               <div className="tnum font-mono text-lg font-bold text-foreground">
-                {trader ? trader.equity.toFixed(2) : "—"}
+                {trader?.equity != null ? trader.equity.toFixed(2) : "—"}
               </div>
             </div>
             <div>
@@ -151,7 +151,7 @@ export function HomePanel({ analysis }: { analysis: AnalysisResponse | null }) {
               </div>
               <div>
                 <div className="text-[10px] uppercase tracking-wider text-muted-foreground">{t("openPositions")}</div>
-                <div className="tnum font-mono text-lg font-bold">{trader?.positions.length ?? 0}</div>
+                <div className="tnum font-mono text-lg font-bold">{trader?.positions?.length ?? 0}</div>
               </div>
               <div>
                 <div className="text-[10px] uppercase tracking-wider text-muted-foreground">{t("lifetimeWin")}</div>
@@ -165,9 +165,9 @@ export function HomePanel({ analysis }: { analysis: AnalysisResponse | null }) {
                 </div>
               </div>
             </div>
-            {(trader?.positions.length ?? 0) > 0 && (
+            {(trader?.positions?.length ?? 0) > 0 && (
               <div className="mt-3 flex flex-wrap gap-1.5 border-t border-border pt-3">
-                {trader!.positions.map((p) => (
+                {(trader?.positions ?? []).map((p) => (
                   <button
                     key={p.ticket}
                     onClick={() => openChart(p.symbol)}
