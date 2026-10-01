@@ -7,7 +7,13 @@ export async function GET(req: Request) {
   const url = new URL(req.url);
   const symbol = url.searchParams.get("symbol");
   const timeframe = url.searchParams.get("tf");
-  const limit = Math.min(Number(url.searchParams.get("limit") ?? 50), 200);
+  // v16.3: NaN ("?limit=abc") and negatives ("?limit=-1") used to reach
+  // Prisma's take: and threw PrismaClientValidationError → HTTP 500. Clamp
+  // to a sane integer range — invalid input gets the default, never a 500.
+  const rawLimit = Number(url.searchParams.get("limit") ?? 50);
+  const limit = Number.isFinite(rawLimit)
+    ? Math.max(1, Math.min(200, Math.floor(rawLimit)))
+    : 50;
   const rows = await db.signalRecord.findMany({
     where: {
       ...(symbol ? { symbol } : {}),

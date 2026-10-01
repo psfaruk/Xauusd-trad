@@ -33,8 +33,13 @@ export function StatusBar() {
 
   const source = status?.source ?? "mt5";
   const connected = status?.connected ?? false;
+  // v16.3 TRUE UTC: serverTime is BROKER wall-clock (UTC + offsetSec —
+  // Exness runs GMT+2/+3). The old code fed it straight into sessionOf() and
+  // printed it with a "UTC" suffix: sessions mislabeled ~6h/day (TOKYO read
+  // as LONDON, NY's last hours as OFF HOURS) and the clock was 2–3h fast.
   const serverTime = status?.serverTime ?? Math.floor(Date.now() / 1000);
-  const session = sessionOf(serverTime);
+  const utcSec = serverTime - (status?.offsetSec ?? 0);
+  const session = sessionOf(utcSec);
   const majorSession = session === "LONDON" || session === "NEW YORK";
   const offline = source === "disconnected" && !connected;
   // v16: live account numbers in the status bar (owner sockets only — the
@@ -114,7 +119,7 @@ export function StatusBar() {
       <span>
         {t("serverTime")}{" "}
         <span className="tnum font-mono text-foreground">
-          {new Date(serverTime * 1000).toISOString().slice(11, 19)} UTC
+          {new Date(utcSec * 1000).toISOString().slice(11, 19)} UTC
         </span>
       </span>
       <span className="hidden lg:inline">

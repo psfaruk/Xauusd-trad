@@ -45,13 +45,21 @@ class FeedStore {
   private statusSubs = new Set<() => void>();
   private keySubs = new Map<string, Set<() => void>>();
   private flushTimer: ReturnType<typeof setInterval> | null = null;
+  /** v16.3 SIGNATURE — the 250ms flush notifies symbol subscribers only when
+   *  the quotes map actually changed (see rebuildSymbols). */
+  private symbolsSig = "";
   private fetching = new Map<string, Promise<Candle[]>>();
   private basePrice = new Map<string, number>(); // day-open reference for change%
   private flowSubs = new Map<string, Set<() => void>>(); // "SYMBOL|tf" → flow listeners
   private flowSnapshot = new Map<string, FlowPayload>();
   /** "SYMBOL|tf" → latest cross-candle delta slice (updated ~every 2s) */
   private deepHist = new Map<string, { t: number; d: number }[]>();
-  private liveBarKeys = new Set<string>();  // "SYMBOL|tf" currently subscribed
+  /** v16.3 REFCOUNT (was a Set): in the Flow trio view FocusAreaChart holds
+   *  symbol|M1 AND the bare chart holds symbol|<tf> — when tf is M1 both share
+   *  ONE key. The Set-based unsubscribe deleted the key (and emitted "unsub"!)
+   * when the FIRST holder unmounted, freezing the still-mounted chart's M1
+   * stream forever. Count holders; emit "sub" on 0→1, "unsub" on 1→0. */
+  private liveBarRefCount = new Map<string, number>();
   private liveFlowKeys = new Set<string>(); // flow keys currently subscribed
   private flowTeardown = new Map<string, ReturnType<typeof setTimeout>>(); // grace timers
 
@@ -78,9 +86,40 @@ class FeedStore {
     });
     this.socket = socket;
 
+    // ── v16.3 SYMBOLS SELF-HEAL (30s): change% base refresh, poisoned-quote
+    //    repair, liveness. Created on EVERY "connect" and cleared on
+    //    "disconnect" — the old code created it once and cleared it on the
+    //    FIRST disconnect, so after any reconnect (network blip, service
+    //    restart) the heal loop was dead for the rest of the session —
+    //    exactly when stale quotes needed repairing.
+    let symTimer: ReturnType<typeof setInterval> | null = null;
+    const armSymbolHeal = () => {
+      if (symTimer) return;
+      symTimer = setInterval(() => {
+        fetch(restUrl("/api/symbols"))
+          .then((r) => (r.ok ? r.json() : null))
+          .then((d) => {
+            if (d?.list) {
+              for (const q of d.list) {
+                // self-heal: the server list is authoritative (same quotes
+                // map the ticks come from) — overwrite whenever the server
+                // value is newer, so a poisoned one-sided quote (ask=0 from
+                // the broker's pre-subscribe frames) can never stick.
+                const local = this.ticks.get(q.name);
+                const staleLocal = !local || !local.live || (q.ts ?? 0) >= (local.ts ?? 0);
+                if (staleLocal) this.ticks.set(q.name, q);
+                if (q.mid) this.basePrice.set(q.name, q.mid - q.change);
+              }
+              this.rebuildSymbols();
+            }
+          })
+          .catch(() => {});
+      }, 30_000);
+    };
+
     // self-heal: after ANY reconnect the server rooms are fresh — re-join trader too
     socket.on("connect", () => {
-      for (const key of this.liveBarKeys) {
+      for (const key of this.liveBarRefCount.keys()) {
         const [symbol, tf] = key.split("|");
         socket.emit("sub", { symbol, tf });
       }
@@ -89,6 +128,7 @@ class FeedStore {
         socket.emit("flowsub", { symbol, tf });
       }
       if (this.traderLive) socket.emit("tradersub");
+      armSymbolHeal(); // v16.3: resurrect the 30s heal on every reconnect
     });
 
     socket.on("status", (s: FeedStatus) => {
@@ -182,34 +222,23 @@ class FeedStore {
 
     // throttled flush → watchlist/header updates at 4 Hz
     this.flushTimer = setInterval(() => this.rebuildSymbols(), 250);
-
-    // refresh symbol list every 30 s (change% base / liveness / self-heal)
-    const symTimer = setInterval(() => {
-      fetch(restUrl("/api/symbols"))
-        .then((r) => (r.ok ? r.json() : null))
-        .then((d) => {
-          if (d?.list) {
-            for (const q of d.list) {
-              // self-heal: the server list is authoritative (same quotes
-              // map the ticks come from) — overwrite whenever the server
-              // value is newer, so a poisoned one-sided quote (ask=0 from
-              // the broker's pre-subscribe frames) can never stick.
-              const local = this.ticks.get(q.name);
-              const staleLocal = !local || !local.live || (q.ts ?? 0) >= (local.ts ?? 0);
-              if (staleLocal) this.ticks.set(q.name, q);
-              if (q.mid) this.basePrice.set(q.name, q.mid - q.change);
-            }
-            this.rebuildSymbols();
-          }
-        })
-        .catch(() => {});
-    }, 30000);
-    socket.on("disconnect", () => clearInterval(symTimer));
+    socket.on("disconnect", () => {
+      if (symTimer) { clearInterval(symTimer); symTimer = null; }
+    });
   }
 
   private rebuildSymbols() {
     const next: SymbolQuote[] = [];
     for (const [name, q] of this.ticks) next.push(q);
+    // v16.3 IDLE GATE: the 250ms flush used to fan out a notify unconditionally —
+    // every useSymbolList consumer (incl. the 1800-line cockpit) re-rendered
+    // 4×/s even on a dead-quiet tape. Ticks mutate the map between flushes; no
+    // mutation → identical signature → skip. (getQuoteSnapshot still reads the
+    // live map, so nothing goes stale — this only skips the no-op re-render.)
+    let sig = "";
+    for (const q of next) sig += `${q.name}:${q.mid ?? 0}:${q.changePct ?? 0}:${q.live ? 1 : 0}:${q.ts ?? 0};`;
+    if (sig === this.symbolsSig) return;
+    this.symbolsSig = sig;
     this.symbolsSnapshot = next;
     this.symbolSubs.forEach((fn) => fn());
     for (const name of this.ticks.keys()) {
@@ -218,12 +247,21 @@ class FeedStore {
   }
 
   subscribeBars(symbol: string, tf: string) {
-    this.liveBarKeys.add(`${symbol}|${tf}`);
-    this.socket?.emit("sub", { symbol, tf });
+    const key = `${symbol}|${tf}`;
+    const n = (this.liveBarRefCount.get(key) ?? 0) + 1;
+    this.liveBarRefCount.set(key, n);
+    if (n === 1) this.socket?.emit("sub", { symbol, tf }); // first holder joins the room
   }
   unsubscribeBars(symbol: string, tf: string) {
-    this.liveBarKeys.delete(`${symbol}|${tf}`);
-    this.socket?.emit("unsub", { symbol, tf });
+    const key = `${symbol}|${tf}`;
+    const n = (this.liveBarRefCount.get(key) ?? 0) - 1;
+    if (n > 0) {
+      this.liveBarRefCount.set(key, n); // others still hold it — room stays live
+      return;
+    }
+    this.liveBarRefCount.delete(key);
+    if (n === 0) this.socket?.emit("unsub", { symbol, tf }); // last holder left
+    // n < 0: never subscribed (defensive) — never emit a stray unsub
   }
 
   subscribeFlow(symbol: string, tf: string, cb: () => void): () => void {
@@ -338,6 +376,18 @@ class FeedStore {
       this.traderSubs.forEach((fn) => fn());
       return;
     }
+    // v16.3 SHAPE GATE: a half-shape payload (older service build, future stub
+    // variant) must never reach the panels — state.positions.map / state.brain
+    // derefs would crash the cockpit. Refuse it (panels keep their
+    // "connecting" notice); a well-formed payload clears the lock as usual.
+    const p = s as Partial<TraderState>;
+    const wellFormed = Array.isArray(p.positions)
+      && Array.isArray(p.journal)
+      && Array.isArray(p.brain)
+      && Array.isArray(p.rules)
+      && Array.isArray(p.feelings)
+      && p.today != null && typeof p.today === "object";
+    if (!wellFormed) return;
     this.traderLocked = false;
     this.traderState = s as TraderState;
     this.traderSubs.forEach((fn) => fn());

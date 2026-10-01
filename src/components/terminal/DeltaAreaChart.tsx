@@ -184,13 +184,17 @@ export default function DeltaAreaChart() {
       const has = !!p && p.h > 0 && hist.length > 1;
 
       // window: [start, now] — full bar or the last winSec seconds
+      // v16.3: p.t is SECONDS (bar open, UTC sec) while now/deltaHist[].t
+      // are MILLISECONDS — the full-candle branch (winSec===0, the default
+      // zoom) fed seconds into an ms axis and the whole path collapsed to a
+      // sub-pixel sliver at the right edge + a 1970 clock label.
       let winStart: number;
       if (!has) {
         winStart = now - tf * 1000;
       } else if (winSec === 0) {
-        winStart = p.t; // running bar open
+        winStart = p.t * 1000; // running bar open (sec → ms)
       } else {
-        winStart = Math.max(p.t, now - winSec * 1000);
+        winStart = Math.max(p.t * 1000, now - winSec * 1000);
       }
       const winEnd = now;
 
@@ -198,7 +202,7 @@ export default function DeltaAreaChart() {
 
       // ── background wash over the bar's elapsed span ──
       if (has) {
-        const bx = xOf(Math.max(p.t, winStart));
+        const bx = xOf(Math.max(p.t * 1000, winStart));
         ctx.fillStyle = theme.barBg;
         ctx.fillRect(bx, padT, Math.max(0, W - padR - bx), plotH);
       }

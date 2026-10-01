@@ -544,11 +544,11 @@ export default function FocusAreaChart({ onActivate }: Props) {
       rafRef.current = requestAnimationFrame(loop);
     };
     rafRef.current = requestAnimationFrame(loop);
-    const ro = new ResizeObserver(() => {});
-    ro.observe(canvas);
+    // v16.3: the old no-op ResizeObserver (new ResizeObserver(() => {}))
+    // observed the canvas but did nothing — the rAF loop already reads the
+    // canvas size every frame. Removed.
     return () => {
       cancelAnimationFrame(rafRef.current);
-      ro.disconnect();
     };
   }, []); // the rAF loop reads everything from refs — mount once
 

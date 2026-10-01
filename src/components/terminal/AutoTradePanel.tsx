@@ -623,6 +623,20 @@ export function AutoTradePanel() {
     patchConfig({ maxDailyTrades: clamped });
   }, [state, patchConfig]);
 
+  // ── v16.3 network-failure armor: post() re-throws network-layer errors
+  //    (offline / service restart) — every fire-and-forget call site must
+  //    clear its busy state + surface the error instead of leaving a dimmed
+  //    row with a disabled ✕ forever (plus an unhandled rejection).
+  const [actionErr, setActionErr] = useState<string | null>(null);
+  const postSafe = useCallback((path: string, body?: unknown, onDone?: (r: { ok?: boolean; error?: string } | undefined) => void) => {
+    setActionErr(null);
+    post(path, body)
+      .then((r) => onDone?.(r))
+      .catch((e: unknown) => {
+        setActionErr(e instanceof Error ? e.message : "network error — service unreachable");
+      });
+  }, [post]);
+
   // ── v9 per-position SL/TP customization — drafts + last modify error ──
   const [modDrafts, setModDrafts] = useState<Record<string, string>>({});
   const [modErr, setModErr] = useState<{ ticket: number; msg: string } | null>(null);
@@ -632,16 +646,16 @@ export function AutoTradePanel() {
     const v = parseFloat(raw);
     if (!Number.isFinite(v) || v <= 0) return;
     setModErr(null);
-    post("/api/trader/modify", { ticket, [field]: v }).then((r: { ok?: boolean; error?: string } | undefined) => {
+    postSafe("/api/trader/modify", { ticket, [field]: v }, (r) => {
       if (r && r.ok === false) setModErr({ ticket, msg: String(r.error ?? "failed") });
     });
-  }, [post]);
+  }, [postSafe]);
   const moveBe = useCallback((ticket: number) => {
     setModErr(null);
-    post("/api/trader/modify", { ticket, be: true }).then((r: { ok?: boolean; error?: string } | undefined) => {
+    postSafe("/api/trader/modify", { ticket, be: true }, (r) => {
       if (r && r.ok === false) setModErr({ ticket, msg: String(r.error ?? "failed") });
     });
-  }, [post]);
+  }, [postSafe]);
 
   // ── v11 pending-order cancel — optimistic ✕ (row dims, mirror refreshes
   //    within a beat); a 400 surfaces the brain's human-readable reason ──
@@ -650,11 +664,17 @@ export function AutoTradePanel() {
   const cancelPending = useCallback((ticket: number) => {
     setCancelErr(null);
     setCancellingTickets((xs) => [...xs, ticket]);
-    post("/api/trader/cancel-pending", { ticket }).then((r: { ok?: boolean; error?: string } | undefined) => {
+    postSafe("/api/trader/cancel-pending", { ticket }, (r) => {
       setCancellingTickets((xs) => xs.filter((x) => x !== ticket));
       if (r && r.ok === false) setCancelErr({ ticket, msg: String(r.error ?? "failed") });
     });
-  }, [post]);
+    // v16.3: network failure must still un-dim the row
+    // (postSafe swallows the rejection; clear the pending marker on a timer
+    // so a dead request can't hold the ✕ disabled forever)
+    setTimeout(() => {
+      setCancellingTickets((xs) => xs.filter((x) => x !== ticket));
+    }, 8_000);
+  }, [postSafe]);
 
   // ── v11 + ORDER — app→MT5 manual trading (market / limit / stop) ──
   const [orderOpen, setOrderOpen] = useState(false);
@@ -1216,13 +1236,20 @@ export function AutoTradePanel() {
               <Button
                 variant="outline" size="sm" disabled={pending}
                 className="ml-auto h-6 gap-1 px-2 text-[9px] font-bold text-down hover:border-down/40 hover:bg-down/10"
-                onClick={() => post("/api/trader/close-all")}
+                onClick={() => postSafe("/api/trader/close-all")}
               >
                 <X className="h-3 w-3" />
                 {t("traderCloseAll")}
               </Button>
             )}
           </div>
+          {/* v16.3: network-layer failure of a close/close-all post (offline,
+              service restart) — surfaced instead of a silent no-op */}
+          {actionErr && (
+            <p className="mb-1.5 rounded-md border border-down/30 bg-down/10 px-2 py-1 text-[9px] font-semibold text-down">
+              ⚠ {t("traderOrderFailed")}: {actionErr}
+            </p>
+          )}
           {state.positions.length === 0 ? (
             <p className="rounded-lg border border-dashed border-border p-3 text-center text-[10px] text-muted-foreground/70">
               {t("traderNoPositions")}
@@ -1261,7 +1288,7 @@ export function AutoTradePanel() {
                       <Button
                         variant="ghost" size="sm" disabled={pending}
                         className="h-6 w-6 p-0 text-muted-foreground hover:text-down"
-                        onClick={() => post("/api/trader/close", { ticket: p.ticket })}
+                        onClick={() => postSafe("/api/trader/close", { ticket: p.ticket })}
                         aria-label={t("traderClose")}
                       >
                         <X className="h-3.5 w-3.5" />

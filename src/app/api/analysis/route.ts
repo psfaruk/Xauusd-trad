@@ -8,7 +8,7 @@ import { buildDrawings, magnetsToDrawings, pathToDrawing, projectSetup } from "@
 import { buildRoadmap } from "@/lib/market/roadmap";
 import { detectSupplyDemand } from "@/lib/market/smc";
 import type { AnalysisResponse, Candle, SignalPayload } from "@/lib/market/types";
-import { svcHeaders, getBrokerOffsetSec } from "@/lib/svc";
+import { svcHeaders, getBrokerOffsetSec, spreadFor } from "@/lib/svc";
 
 const MT5_URL = process.env.MT5_SERVICE_URL ?? "http://127.0.0.1:3031";
 const CACHE_TTL = 8_000;
@@ -33,52 +33,9 @@ async function fetchCandles(symbol: string, tf: string, limit: number): Promise<
   }
 }
 
-// ── v14 SPREAD FALLBACK ──
-// The audit: fetchSpread failing returned 0 → the spread gate silently
-// PASSED and geometry built too-tight SLs. Now: last known good per symbol,
-// then a per-class default, so a dead quote fetch can never produce a
-// zero-spread world.
-const lastGoodSpread = new Map<string, number>();
-const DEFAULT_SPREADS: Record<string, number> = {
-  XAUUSD: 0.30, XAGUSD: 0.04, BTCUSD: 40, ETHUSD: 2.5,
-  USOIL: 0.06, UKOIL: 0.06, USTEC: 3, US500: 0.9, US30: 2,
-  EURUSD: 0.00016, GBPUSD: 0.00018, AUDUSD: 0.00018, NZDUSD: 0.00020,
-  USDCAD: 0.0002, USDCHF: 0.0002, EURJPY: 0.02, GBPJPY: 0.03, USDJPY: 0.015,
-};
-function defaultSpread(symbol: string): number {
-  if (/XAU/i.test(symbol)) return DEFAULT_SPREADS.XAUUSD;
-  if (/XAG/i.test(symbol)) return DEFAULT_SPREADS.XAGUSD;
-  if (/BTC/i.test(symbol)) return DEFAULT_SPREADS.BTCUSD;
-  if (/ETH/i.test(symbol)) return DEFAULT_SPREADS.ETHUSD;
-  if (/OIL/i.test(symbol)) return DEFAULT_SPREADS.USOIL;
-  if (/USTEC|US500|US30|NAS|SPX|DJ/i.test(symbol)) {
-    if (/USTEC|NAS/i.test(symbol)) return DEFAULT_SPREADS.USTEC;
-    if (/US30|DJ/i.test(symbol)) return DEFAULT_SPREADS.US30;
-    return DEFAULT_SPREADS.US500;
-  }
-  if (/JPY/i.test(symbol)) return DEFAULT_SPREADS.EURJPY;
-  if (/EUR|GBP|AUD|NZD|CAD|CHF/i.test(symbol)) return DEFAULT_SPREADS.EURUSD;
-  return 0.25; // unknown symbol class — conservative flat default
-}
-async function fetchSpread(symbol: string): Promise<number> {
-  try {
-    const res = await fetch(`${MT5_URL}/api/quote?symbol=${encodeURIComponent(symbol)}`, {
-      cache: "no-store",
-      signal: AbortSignal.timeout(4000),
-      headers: svcHeaders(),
-    });
-    if (!res.ok) return lastGoodSpread.get(symbol) ?? defaultSpread(symbol);
-    const q = await res.json();
-    const sp = q.spread ?? 0;
-    if (sp > 0) {
-      lastGoodSpread.set(symbol, sp);
-      return sp;
-    }
-    return lastGoodSpread.get(symbol) ?? defaultSpread(symbol);
-  } catch {
-    return lastGoodSpread.get(symbol) ?? defaultSpread(symbol);
-  }
-}
+// ── v14 SPREAD FALLBACK — now the SHARED helper in lib/svc.ts (v16.3), so
+//    the analysis route and the backtest route can never disagree about the
+//    spread regime again. The original local copy lives on in git history. ──
 
 /** Track open signals against the newest closed bars of their timeframe. */
 async function trackOpenSignals(symbol: string): Promise<void> {
@@ -245,7 +202,7 @@ export async function GET(req: Request) {
   const cacheKey = `${symbol}|${tf}|${lastClosedT}`;
   const hit = cache.get(cacheKey);
   if (hit && Date.now() - hit.at < CACHE_TTL) {
-    return NextResponse.json(hit.data);
+    return NextResponse.json(hit.data, { headers: { "Cache-Control": "no-store" } });
   }
   // prune: keep the map bounded (one key per bar per market)
   if (cache.size > 40) cache.clear();
@@ -257,7 +214,7 @@ export async function GET(req: Request) {
   }).then((r) => (r.ok ? r.json() : null)).catch(() => null);
   const digits =
     digitsInfo?.list?.find((s: any) => s.name === symbol)?.digits ?? 2;
-  const spread = await fetchSpread(symbol);
+  const spread = await spreadFor(symbol); // v16.3: shared fallback helper
   // v14: broker clock offset → PDH/PDL day cut at server-local midnight (NY 17:00)
   const brokerOffsetSec = await getBrokerOffsetSec();
 
@@ -415,5 +372,5 @@ export async function GET(req: Request) {
   (payload as any).signals = signals;
 
   cache.set(cacheKey, { at: Date.now(), data: payload });
-  return NextResponse.json(payload);
+  return NextResponse.json(payload, { headers: { "Cache-Control": "no-store" } });
 }

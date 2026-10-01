@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { seedSignals } from "@/lib/market/seed";
 import type { Candle } from "@/lib/market/types";
-import { svcHeaders, getBrokerOffsetSec } from "@/lib/svc";
+import { svcHeaders, getBrokerOffsetSec, spreadFor } from "@/lib/svc";
 
 /**
  * Engine backtest — walk-forward run of the LIVE engine over real MT5
@@ -36,23 +36,28 @@ export async function GET(req: Request) {
   const key = `${symbol}|${tf}`;
   const hit = cache.get(key);
   if (hit && Date.now() - hit.at < CACHE_TTL) {
-    return NextResponse.json(hit.data);
+    return NextResponse.json(hit.data, { headers: { "Cache-Control": "no-store" } });
   }
 
-  const [bars, symbolsRes] = await Promise.all([
+  // v16.3: spread now comes from the SHARED spreadFor() (live quote → last
+  // known good → per-class default). The old `meta?.spread ?? 0` built a
+  // zero-spread world whenever /api/symbols failed — the backtest then
+  // admitted trades the LIVE engine (v14 spread fallback) would reject and
+  // silently reported better stats than reality.
+  const [bars, digits, spread, brokerOffsetSec] = await Promise.all([
     fetchCandles(symbol, tf, 900),
     fetch(`${MT5_URL}/api/symbols`, {
       cache: "no-store",
       signal: AbortSignal.timeout(4000),
       headers: svcHeaders(),
-    }).then((r) => (r.ok ? r.json() : null)).catch(() => null),
+    })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => d?.list?.find((s: any) => s.name === symbol)?.digits ?? 2)
+      .catch(() => 2),
+    spreadFor(symbol),
+    getBrokerOffsetSec(),
   ]);
-  const meta = symbolsRes?.list?.find((s: any) => s.name === symbol);
-  const digits = meta?.digits ?? 2;
-  const spread = meta?.spread ?? 0;
 
-  // v14: broker offset → PDH/PDL day cut at server-local midnight (NY 17:00)
-  const brokerOffsetSec = await getBrokerOffsetSec();
   const { signals, scanned } = seedSignals({ symbol, tf, digits, spread, bars, brokerOffsetSec });
 
   const won = signals.filter((s) => s.status === "won").length;
@@ -92,5 +97,5 @@ export async function GET(req: Request) {
     generatedAt: Date.now(),
   };
   cache.set(key, { at: Date.now(), data });
-  return NextResponse.json(data);
+  return NextResponse.json(data, { headers: { "Cache-Control": "no-store" } });
 }

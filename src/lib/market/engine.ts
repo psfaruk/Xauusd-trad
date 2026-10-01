@@ -482,8 +482,13 @@ export function evaluate(input: EngineInput): {
 } {
   const tf = input.timeframe;
   const bars = (input.bars[tf] ?? []).filter((b) => !b.f);
-  const m1 = (input.bars.M1 ?? []).filter((b) => !b.f);
-  const base = bars.length > 30 ? bars : m1;
+  // v16.3: NO MORE SILENT M1 FALLBACK — the old `bars.length > 30 ? bars : m1`
+  // evaluated triggers on M1 bars when the active tf was short on history,
+  // but still emitted SignalPayload.timeframe=<active tf> with M1 barTimes:
+  // cooldowns divided M1 stamps by the active tf's seconds, and mislabeled
+  // rows persisted to the DB. The honest answer for a short series is the
+  // "not enough history" nearMiss below.
+  const base = bars;
   const nearMiss: string[] = [];
   const checks: CheckItem[] = [];
 

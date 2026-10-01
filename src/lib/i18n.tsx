@@ -145,6 +145,7 @@ const DICT: Record<Locale, Record<string, string>> = {
     structure: "Structure",
     regime: "Regime",
     session: "Session",
+    keyLevels: "Key levels", // v16.3: was missing — RoadmapPanel rendered the raw key
     latency: "Latency",
     serverTime: "Server time",
     dataFrom: "Data source",
@@ -523,6 +524,7 @@ const DICT: Record<Locale, Record<string, string>> = {
     structure: "স্ট্রাকচার",
     regime: "রেজিম",
     session: "সেশন",
+    keyLevels: "কী-লেভেল", // v16.3: আগে অনুপস্থিত — Roadmap প্যানেল র-কী দেখাত
     latency: "লেটেন্সি",
     serverTime: "সার্ভার সময়",
     dataFrom: "ডেটা সোর্স",

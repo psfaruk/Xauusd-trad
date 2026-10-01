@@ -302,6 +302,23 @@ export async function POST(req: Request) {
     if (!s) {
       return NextResponse.json({ error: "state required" }, { status: 400 });
     }
+    // v16.3 SHAPE NORMALIZATION — the route's header promises "never a 500",
+    // but a shape-valid-yet-partial body.state ({} / missing collections)
+    // crashed buildContext (s.positions.map) and then the catch's
+    // localNarrate (s.journal.length) crashed AGAIN — HTTP 500 anyway. Fill
+    // every collection the consumers deref; scalar fields keep ??-guards.
+    s = {
+      ...s,
+      positions: Array.isArray(s.positions) ? s.positions : [],
+      pendingOrders: Array.isArray(s.pendingOrders) ? s.pendingOrders : [],
+      recentHistory: Array.isArray(s.recentHistory) ? s.recentHistory : [],
+      journal: Array.isArray(s.journal) ? s.journal : [],
+      brain: Array.isArray(s.brain) ? s.brain : [],
+      feelings: Array.isArray(s.feelings) ? s.feelings : [],
+      balanceHist: Array.isArray(s.balanceHist) ? s.balanceHist : [],
+      rules: Array.isArray(s.rules) ? s.rules : [],
+      today: s.today ?? { trades: 0, wins: 0, losses: 0, pnl: 0, winPct: 0 },
+    };
 
     const now = Date.now();
     const minInterval = force ? FORCE_MIN_INTERVAL_MS : MIN_INTERVAL_MS;

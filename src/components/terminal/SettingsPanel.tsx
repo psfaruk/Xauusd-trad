@@ -469,7 +469,7 @@ export function SettingsPanel() {
               [t("connection"), status?.connected ? t("live") : status?.source === "disconnected" ? t("mt5Offline") : t("connecting")],
               [t("latency"), status?.latencyMs != null ? `${status.latencyMs} ms` : "—"],
               [t("symbolsWatched"), String(symbols.length || "—")],
-              [t("serverTime"), status ? `${new Date(status.serverTime * 1000).toISOString().slice(11, 19)} UTC` : "—"],
+              [t("serverTime"), status ? `${new Date((status.serverTime - (status.offsetSec ?? 0)) * 1000).toISOString().slice(11, 19)} UTC` : "—"],
             ].map(([k, v], i, arr) => (
               <div
                 key={k as string}

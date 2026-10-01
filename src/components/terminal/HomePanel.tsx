@@ -114,13 +114,25 @@ export function HomePanel({ analysis }: { analysis: AnalysisResponse | null }) {
               <div className="text-[10px] uppercase tracking-wider text-muted-foreground">{t("session")}</div>
               <div className="flex items-center gap-1 text-sm font-semibold">
                 <Clock className="h-3 w-3 text-muted-foreground" />
-                <span className={cn("rounded px-1.5 text-[10px] font-bold", sessionOf(status?.serverTime ?? 0) === "OFF HOURS" ? "bg-muted text-muted-foreground" : "bg-primary/15 text-primary")}>
-                  {sessionOf(status?.serverTime ?? Math.floor(Date.now() / 1000))}
-                </span>
+                {/* v16.3: one clock for BOTH the highlight and the label, in
+                    TRUE UTC (serverTime is broker wall-clock = UTC+offsetSec).
+                    The old code computed the className from serverTime??0 and
+                    the label from Date.now() — they could disagree, and 0 is
+                    midnight UTC (TOKYO) which never styles as OFF HOURS. */}
+                {(() => {
+                  const utcSec = (status?.serverTime ?? Math.floor(Date.now() / 1000))
+                    - (status?.offsetSec ?? 0);
+                  const s = sessionOf(utcSec);
+                  return (
+                    <span className={cn("rounded px-1.5 text-[10px] font-bold", s === "OFF HOURS" ? "bg-muted text-muted-foreground" : "bg-primary/15 text-primary")}>
+                      {s}
+                    </span>
+                  );
+                })()}
               </div>
               <div className="tnum font-mono text-[10px] text-muted-foreground">
                 {localNow.toTimeString().slice(0, 8)} ·{" "}
-                {new Date((status?.serverTime ?? 0) * 1000).toISOString().slice(11, 16)} UTC
+                {new Date(((status?.serverTime ?? Math.floor(Date.now() / 1000)) - (status?.offsetSec ?? 0)) * 1000).toISOString().slice(11, 16)} UTC
               </div>
             </div>
           </CardContent>

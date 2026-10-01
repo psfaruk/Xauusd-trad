@@ -659,7 +659,13 @@ io.on("connection", (socket) => {
         }
       : null,
     latencyMs: manager.latencyMs,
+    // v16.3: offsetSec MUST ride the initial emit too — the periodic
+    // manager.onStatus broadcast carries it, but the FIRST status a socket
+    // receives (the one the UI boots from) did not, so serverTime could not
+    // be converted to true UTC until the next broadcast (session chip + clock
+    // rendered broker wall-clock as "UTC" for up to 5s after load).
     serverTime: manager.nowSec() + manager.offsetSec,
+    offsetSec: manager.offsetSec,
     reason: manager.reason,
   });
   socket.emit("snapshot", { source: manager.source, quotes: manager.symbolList() });

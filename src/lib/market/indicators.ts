@@ -178,13 +178,21 @@ export function adx(bars: Candle[], n = 14): number {
     const sum = pdi + mdi;
     dx.push(sum === 0 ? 0 : (100 * Math.abs(pdi - mdi)) / sum);
   }
-  // Wilder-smooth the last n DX values
+  // ── v16.3 PROPER WILDER ADX ──
+  // The old tail averaged the LAST n DX values then re-applied n−1 smoothing
+  // steps — close to Wilder's number but not equal to any reference (TA-Lib /
+  // TradingView seed ADX from the FIRST n DX values and smooth FORWARD
+  // through the whole series). Since the same code ran live AND in backtests
+  // the classification was self-consistent, but the adx≥28 regime gate sat
+  // on a number no other platform would reproduce.
   const valid = dx.filter((v) => Number.isFinite(v));
   if (valid.length < n) return 0;
+  // seed = mean of the FIRST n valid DX values (Wilder's original definition)
   let a = 0;
-  for (let i = valid.length - n; i < valid.length; i++) a += valid[i];
+  for (let i = 0; i < n; i++) a += valid[i];
   a /= n;
-  for (let i = valid.length - n + 1; i < valid.length; i++) a = (a * (n - 1) + valid[i]) / n;
+  // then smooth forward through EVERY subsequent DX — the running ADX
+  for (let i = n; i < valid.length; i++) a = (a * (n - 1) + valid[i]) / n;
   return a;
 }
 

@@ -76,7 +76,10 @@ export interface FeedStatus {
   server: string;
   account: { balance: number; equity: number; currency: string } | null;
   latencyMs: number | null;
+  /** broker wall-clock seconds (UTC + offsetSec). True UTC = serverTime − offsetSec.
+   *  v16.3: optional — older service builds omit it; treat as 0. */
   serverTime: number;
+  offsetSec?: number;
   reason: string;
 }
 

@@ -216,7 +216,7 @@ export function SignalsPanel({ analysis }: { analysis: AnalysisResponse | null }
                       STATUS_STYLE[s.status] ?? STATUS_STYLE.expired,
                     )}
                   >
-                    {t(s.status) === s.status ? s.status : t(s.status)}
+                    {t(s.status)}
                     {s.resultR != null ? ` ${s.resultR >= 0 ? "+" : ""}${s.resultR.toFixed(1)}R` : ""}
                   </span>
                   <span className="tnum ml-auto font-mono text-[10px] text-muted-foreground">
