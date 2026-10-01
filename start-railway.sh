@@ -28,6 +28,50 @@ else
   echo "✓ MT5 credentials present (login ${MT5_LOGIN})"
 fi
 
+# ════════════════════════════════════════════════════════════════
+# v12.1 SECURITY — the public deploy must NEVER run with the auth
+# layer inert. APP_PASSWORD locks BOTH doors at once:
+#   · browser login (aurum_sess cookie, HMAC-verified by Next.js AND
+#     mt5-service — same derivation, no shared DB needed)
+#   · server-to-server trader key (TRADER_API_KEY = HMAC(APP_PASSWORD,
+#     "aurum-trader-api-key") — derived inside each process)
+#
+# Resolution order:
+#   1. APP_PASSWORD from Railway Variables (recommended: you pick it)
+#   2. first boot on a volume → random 24-char secret generated once,
+#      stored at /data/.aurum_app_password (mode 600) and printed to
+#      the deploy log ONE time — read it in Railway → Deployments
+#      → that boot's logs. Restarts reuse the stored value.
+#   3. no volume, no variable (ephemeral deploy) → a fresh random
+#      password every boot, printed to the log each time.
+# ════════════════════════════════════════════════════════════════
+AUTH_STORE=""
+[ -d /data ] && AUTH_STORE="/data/.aurum_app_password"
+
+if [ -z "${APP_PASSWORD:-}" ]; then
+  if [ -n "$AUTH_STORE" ] && [ -s "$AUTH_STORE" ]; then
+    APP_PASSWORD="$(cat "$AUTH_STORE")"
+    echo "[auth] reusing persisted APP_PASSWORD from volume"
+  else
+    APP_PASSWORD="$(head -c 18 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 24)"
+    if [ -n "$AUTH_STORE" ]; then
+      umask 077
+      printf '%s' "$APP_PASSWORD" > "$AUTH_STORE"
+      echo "[auth] generated APP_PASSWORD → stored on volume (shown once below)"
+    else
+      echo "[auth] ⚠ no volume mounted — fresh random APP_PASSWORD each boot (set APP_PASSWORD or attach a volume for a stable one)"
+    fi
+    echo "┌──────────────────────────────────────────────────────────────"
+    echo "│  AURUM LOGIN PASSWORD (save it now — shown ONCE per boot):"
+    echo "│  $APP_PASSWORD"
+    echo "└──────────────────────────────────────────────────────────────"
+  fi
+fi
+export APP_PASSWORD
+# explicit TRADER_API_KEY (if the operator set one) always wins; otherwise
+# both processes derive it from APP_PASSWORD — no second secret to manage.
+if [ -n "${TRADER_API_KEY:-}" ]; then export TRADER_API_KEY; fi
+
 # ── persistent database (Railway volume mounted at /data, optional) ──
 if [ -d /data ]; then
   export DATABASE_URL="file:/data/aurum.db"

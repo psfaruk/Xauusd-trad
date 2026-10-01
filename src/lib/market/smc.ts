@@ -195,19 +195,31 @@ export interface LiquidityPool {
  * real bars forward from availability — so historical sweeps are visible
  * (the old last-bar-only check missed every sweep that wasn't on the very
  * last bar) and the walk-forward backtest can filter pools as-of any bar.
+ *
+ * v12.1 LOOKAHEAD FIX: the equal-high tolerance is the ATR as of the pool's
+ * CONFIRMATION bar (atrAll[availIdx]), not `lastAtr(bars)` — the whole-series
+ * last value is "today's" volatility applied to last week's pools.
  */
 export function detectLiquidity(bars: Candle[], tolAtr = 0.15, maxPerSide = 3): LiquidityPool[] {
-  const a = lastAtr(bars);
+  const atrAll = atr(bars);
   const sw = swings(bars, 2, 2);
   const pools: LiquidityPool[] = [];
-  const tol = a * tolAtr;
+
+  /** ATR as of bar index idx (falls back to the last valid value). */
+  const atrAt = (idx: number): number => {
+    const v = atrAll[Math.max(0, Math.min(bars.length - 1, idx))];
+    if (v != null) return v as number;
+    for (let i = atrAll.length - 1; i >= 0; i--) if (atrAll[i] != null) return atrAll[i] as number;
+    return 1;
+  };
 
   // equal highs → BSL above; available once the 2nd equal high confirms
   const highs = sw.filter((s) => s.kind === "high").slice(-8);
   for (let i = 0; i + 1 < highs.length; i++) {
-    if (Math.abs(highs[i].price - highs[i + 1].price) <= tol) {
-      const second = highs[i + 1];
-      const availIdx = Math.min(bars.length - 1, second.index + 2); // fractal confirms right=2 bars later
+    const second = highs[i + 1];
+    const availIdx = Math.min(bars.length - 1, second.index + 2); // fractal confirms right=2 bars later
+    const tol = atrAt(availIdx) * tolAtr;
+    if (Math.abs(highs[i].price - second.price) <= tol) {
       pools.push({
         side: "BSL", price: (highs[i].price + second.price) / 2,
         t: bars[availIdx].t, hits: 2, state: "untouched",
@@ -217,9 +229,10 @@ export function detectLiquidity(bars: Candle[], tolAtr = 0.15, maxPerSide = 3): 
   }
   const lows = sw.filter((s) => s.kind === "low").slice(-8);
   for (let i = 0; i + 1 < lows.length; i++) {
-    if (Math.abs(lows[i].price - lows[i + 1].price) <= tol) {
-      const second = lows[i + 1];
-      const availIdx = Math.min(bars.length - 1, second.index + 2);
+    const second = lows[i + 1];
+    const availIdx = Math.min(bars.length - 1, second.index + 2);
+    const tol = atrAt(availIdx) * tolAtr;
+    if (Math.abs(lows[i].price - second.price) <= tol) {
       pools.push({
         side: "SSL", price: (lows[i].price + second.price) / 2,
         t: bars[availIdx].t, hits: 2, state: "untouched",
@@ -259,11 +272,8 @@ export function detectLiquidity(bars: Candle[], tolAtr = 0.15, maxPerSide = 3): 
   return [...bsl, ...ssl];
 }
 
-function lastAtr(bars: Candle[]): number {
-  const a = atr(bars);
-  for (let i = a.length - 1; i >= 0; i--) if (a[i] != null) return a[i] as number;
-  return 1;
-}
+// (v12.1: the old lastAtr() full-series helper is gone — equal-high pools
+// now use the ATR as of their own confirmation bar, see atrAt above.)
 
 function groupByDay(bars: Candle[]): { t: number; hi: number; lo: number }[] {
   const map = new Map<string, { t: number; hi: number; lo: number }>();

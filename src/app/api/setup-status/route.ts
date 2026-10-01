@@ -5,19 +5,23 @@ import { mt5ServiceStatus } from "@/lib/mt5-spawn";
 export const dynamic = "force-dynamic";
 
 /**
- * GET /api/setup-status — deployment verification helper.
+ * GET /api/setup-status — deployment verification helper (PUBLIC, unauthed).
  *
  * After a Railway deploy, hit this endpoint to confirm every piece of the
- * stack came up: env credentials, the mt5-service sidecar, and the SQLite
- * database. Returns booleans only — never secrets (login is masked).
+ * stack came up. v12.1 SECURITY: this route is reachable WITHOUT login
+ * (Railway probes + the owner checks the deploy before logging in), so it
+ * must leak NOTHING:
+ *   · never the DATABASE_URL string (the old response included the full
+ *     connection string — path, filename and all)
+ *   · never a re-identifiable login mask (the old `abc***xyz` revealed 6 of
+ *     an 8-digit MT5 login — only the first 2 digits survive now, and only
+ *     so the owner can tell WHICH account is wired up)
+ *   · booleans and names only.
  */
 export async function GET() {
   const login = process.env.MT5_LOGIN ?? "";
-  const masked = login
-    ? login.length <= 4
-      ? "*".repeat(login.length)
-      : `${login.slice(0, 3)}***${login.slice(-3)}`
-    : null;
+  // first 2 digits max — enough to recognise the account, useless to an attacker
+  const masked = login ? `${login.slice(0, 2)}${"*".repeat(Math.max(4, login.length - 2))}` : null;
 
   let service: { rest: boolean; io: boolean } = { rest: false, io: false };
   try {
@@ -62,12 +66,14 @@ export async function GET() {
       loginMasked: masked,
       mode: process.env.MT5_LOGIN && process.env.MT5_PASSWORD ? "LIVE-ready" : "SIM (credentials missing)",
     },
+    // v12.1: database presence as a BOOLEAN + volume hint — the actual
+    // DATABASE_URL connection string never leaves the process.
+    database: { ok: dbOk, persistent: (process.env.DATABASE_URL ?? "").includes("/data/") },
+    authLocked: !!(process.env.APP_PASSWORD || process.env.TRADER_API_KEY),
     service: { ...service, url: process.env.MT5_SERVICE_URL ?? "http://127.0.0.1:3031" },
-    database: { ok: dbOk, url: process.env.DATABASE_URL ?? null },
     broker,
-    hint:
-      process.env.MT5_LOGIN && process.env.MT5_PASSWORD
-        ? null
-        : "Add MT5_LOGIN and MT5_PASSWORD in Railway → Variables, then redeploy for live broker data.",
+    hint: process.env.MT5_LOGIN && process.env.MT5_PASSWORD
+      ? null
+      : "Add MT5_LOGIN and MT5_PASSWORD in Railway → Variables, then redeploy for live broker data.",
   });
 }

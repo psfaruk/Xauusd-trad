@@ -337,13 +337,20 @@ const DEFAULT_SYMBOLS: SymbolRule[] = [
 ];
 
 // ── agentic constants ──
-const STATE_VERSION = 9;              // v9: R:R-audit safety migration — $-mode TP < $3 switched to
-                                      // R-multiple mode, lots/positions/daily caps clamped to the new
-                                      // hard limits (see MAX_LOT etc.). v8: final honest repair — today's
-                                      // counters rebuilt from EPISODIC MEMORY (the brain's own trades only;
-                                      // memorize() never records adopted positions, so phantom/user settles
-                                      // can never reach it). v7 armor: zombie pre-check + silent
-                                      // settles + no adopted restore (the 09:28–09:32 storm).
+const STATE_VERSION = 10;             // v10 (v12.1): R-MODE MIGRATION GATE FIX — the v12 clamp
+                                      // piggybacked on `vSaved < 9`, but v9-era code ALREADY saved
+                                      // `version: 9`, so every real state file skipped the clamp and
+                                      // the brain kept running the audit's loss-machine settings
+                                      // ($0.50 TP / balanced / 40 daily trades). Gate moved to < 10:
+                                      // every pre-v12.1 state — including version 9 files — is now
+                                      // clamped exactly once ($TP<3 → R-mode, conservative risk,
+                                      // daily ≤ cap, lots/positions ≤ hard limits).
+                                      // v9: $-mode TP < $3 switched to R-multiple mode (superseded).
+                                      // v8: final honest repair — today's counters rebuilt from EPISODIC
+                                      // MEMORY (the brain's own trades only; memorize() never records
+                                      // adopted positions, so phantom/user settles can never reach it).
+                                      // v7 armor: zombie pre-check + silent settles + no adopted
+                                      // restore (the 09:28–09:32 storm).
 const SPREAD_BUDGET = 3.5;            // SL ≥ spread × 3.5 (spread ≤ ~29% of SL by construction)
 const SL_ATR_CAP = 3.6;               // SL never wider than ATR × 3.6
 const GLOBAL_MAX_POSITIONS = 10;       // v12: 50→10 — the audit: 50 concurrent positions on a $500
@@ -561,14 +568,16 @@ export class AiTrader {
         }
       }
       const vSaved = raw?.version ?? 1;
-      if (vSaved < 9) {
-        // v9 R:R-AUDIT SAFETY MIGRATION (runs AFTER all raw fields are loaded
-        // so the journalLog→saveState inside can never truncate persisted
-        // state): the old config carried loss-machine settings — $0.50 TP
-        // (inside spread noise), lot caps up to 100, unlimited daily trades.
-        // Clamp EVERYTHING to the v12 safe limits and say it out loud. Runs
-        // once; explicit user choices after this point are respected (within
-        // the hard caps).
+      if (vSaved < 10) {
+        // v10 (v12.1) R:R-AUDIT SAFETY MIGRATION — runs AFTER all raw fields
+        // are loaded so the journalLog→saveState inside can never truncate
+        // persisted state. The old config carried loss-machine settings —
+        // $0.50 TP (inside spread noise), lot caps up to 100, unlimited
+        // daily trades. Clamp EVERYTHING to the v12 safe limits and say it
+        // out loud. Runs once; explicit user choices after this point are
+        // respected (within the hard caps).
+        // (v12.1 FIX: this gate was `< 9` while v9-era saves already wrote
+        // version 9 — real states never migrated. Now < 10 vs STATE_VERSION 10.)
         const before = { tpUsd: this.cfg.tpUsd, riskMode: this.cfg.riskMode, maxDailyTrades: this.cfg.maxDailyTrades };
         if (this.cfg.tpUsd > 0 && this.cfg.tpUsd < MIN_TP_USD) this.cfg.tpUsd = 0;
         this.cfg.riskMode = "conservative";

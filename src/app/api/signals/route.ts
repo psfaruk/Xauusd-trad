@@ -21,7 +21,12 @@ export async function GET(req: Request) {
   const totalR = rows.reduce((a, r) => a + (r.resultR ?? 0), 0);
   return NextResponse.json({
     signals: rows.map((h) => {
-      const trace = JSON.parse(h.trace || "{}");
+      let trace: Record<string, unknown> = {};
+      try {
+        trace = JSON.parse(h.trace || "{}") as Record<string, unknown>;
+      } catch {
+        trace = {}; // malformed legacy row → empty trace, never a 500
+      }
       return {
         id: h.id,
         symbol: h.symbol,

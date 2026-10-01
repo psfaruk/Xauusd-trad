@@ -7,12 +7,14 @@
  *  (dark / light / system) with instant preview.
  */
 
+import { useEffect, useState } from "react";
 import { useTheme } from "next-themes";
 import { useStatus } from "@/hooks/useFeed";
 import { useI18n, type Locale } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Sun, Moon, MonitorSmartphone, Languages, Database, Info, RefreshCw } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { Sun, Moon, MonitorSmartphone, Languages, Database, Info, RefreshCw, LogOut, Loader2 } from "lucide-react";
 
 const THEMES = [
   { value: "dark", icon: Moon, key: "themeDark" },
@@ -24,6 +26,36 @@ export function SettingsPanel() {
   const { theme, setTheme } = useTheme();
   const { locale, setLocale, t } = useI18n();
   const status = useStatus();
+
+  /** session state — the logout row only exists when the deployment is locked */
+  const [authLocked, setAuthLocked] = useState(false);
+  const [loggingOut, setLoggingOut] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch("/api/auth", { cache: "no-store" })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d: { authRequired?: boolean } | null) => {
+        if (!cancelled && d) setAuthLocked(Boolean(d.authRequired));
+      })
+      .catch(() => {
+        /* open deployments stay buttonless — nothing to log out of */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  async function handleLogout() {
+    if (loggingOut) return;
+    setLoggingOut(true);
+    try {
+      await fetch("/api/auth", { method: "DELETE", cache: "no-store" });
+    } catch {
+      /* best effort — reload anyway */
+    }
+    window.location.reload(); // re-mounts the shell + LoginGate in locked mode
+  }
 
   return (
     <div className="slim-scroll h-full overflow-y-auto">
@@ -142,6 +174,26 @@ export function SettingsPanel() {
               <span className="font-mono text-foreground">GLM (LLM judge)</span>
             </div>
             <div>{t("aboutNote")}</div>
+
+            {authLocked && (
+              <div className="mt-2 flex flex-col gap-1.5 border-t border-border/60 pt-3">
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className="h-8 w-full gap-2 text-[11px] font-semibold text-muted-foreground hover:text-foreground"
+                  onClick={handleLogout}
+                  disabled={loggingOut}
+                >
+                  {loggingOut ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
+                  ) : (
+                    <LogOut className="h-3.5 w-3.5" aria-hidden="true" />
+                  )}
+                  {loggingOut ? "Locking…" : "Lock / Log out"}
+                </Button>
+              </div>
+            )}
           </CardContent>
         </Card>
       </div>

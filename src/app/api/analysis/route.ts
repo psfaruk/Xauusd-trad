@@ -80,14 +80,22 @@ async function trackOpenSignals(symbol: string): Promise<void> {
       let resultR: number | null = null;
       const risk = Math.abs(s.entry - s.sl) || 1e-9;
 
+      // v12.1 LOOKAHEAD FIX: bars the position was actually LIVE for.
+      // For a pending limit that is strictly FROM the fill bar onward — a
+      // bar that touched TP/SL before the entry ever filled must not count
+      // (the old code scanned every bar since signal creation and turned
+      // pre-fill wicks into phantom wins/losses; seed.ts was already
+      // correct — this makes the live tracker match it).
+      let liveBars = since;
+
       // pending limit → filled when price traded through the entry level,
       // or CANCELLED when the market ran away without filling (stale zone)
       if (status === "pending") {
-        const filled = since.some((b) =>
-          s.direction === "BUY" ? b.l <= s.entry : b.h >= s.entry,
-        );
-        if (filled) {
+        const fillBar =
+          since.find((b) => (s.direction === "BUY" ? b.l <= s.entry : b.h >= s.entry)) ?? null;
+        if (fillBar) {
           status = "active";
+          liveBars = since.filter((b) => b.t >= fillBar.t);
         } else if (aNow > 0) {
           const runaway = s.direction === "BUY"
             ? lastClosed.c - s.entry
@@ -100,7 +108,7 @@ async function trackOpenSignals(symbol: string): Promise<void> {
       }
 
       if (status === "active") {
-        for (const b of since) {
+        for (const b of liveBars) {
           // pessimistic both-touch (reference rule): a bar spanning SL and TP is a loss
           const bothTouch = s.direction === "BUY"
             ? (b.h >= s.tp && b.l <= s.sl)
@@ -263,7 +271,12 @@ export async function GET(req: Request) {
     take: 30,
   });
   const signals: SignalPayload[] = history.map((h) => {
-    const trace = JSON.parse(h.trace || "{}");
+    let trace: Record<string, unknown> = {};
+    try {
+      trace = JSON.parse(h.trace || "{}") as Record<string, unknown>;
+    } catch {
+      trace = {}; // malformed legacy row → empty trace, never a 500
+    }
     return {
       id: h.id,
       symbol: h.symbol,
@@ -279,10 +292,10 @@ export async function GET(req: Request) {
       status: h.status as any,
       resultR: h.resultR,
       barTime: h.barTime,
-      factors: trace.factors ?? [],
-      checks: trace.checks ?? [],
-      entryNote: trace.entryNote,
-      targetNote: trace.targetNote,
+      factors: (trace.factors as string[]) ?? [],
+      checks: (trace.checks as SignalPayload["checks"]) ?? [],
+      entryNote: trace.entryNote as string | undefined,
+      targetNote: trace.targetNote as string | undefined,
       createdAt: h.createdAt.toISOString(),
     };
   });

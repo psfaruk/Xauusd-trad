@@ -320,7 +320,10 @@ export async function POST(req: Request) {
       const zai = await ZAI.create();
       const completion = await zai.chat.completions.create({
         messages: [
-          { role: "assistant", content: systemPrompt(s) },
+          // v12.1: a system prompt must carry role "system" — "assistant"
+          // made the model treat its own instructions as prior chat turns
+          // (weaker instruction-following, occasional persona drift).
+          { role: "system", content: systemPrompt(s) },
           {
             role: "user",
             content: `Live brain state (JSON):\n${JSON.stringify(ctx)}\n\nNarrate now — follow up on the latest event first.`,

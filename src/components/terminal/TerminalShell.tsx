@@ -24,6 +24,7 @@ import { ChartWorkspace } from "./ChartWorkspace";
 import { AutoSignalsView } from "./AutoSignalsView";
 import { SettingsPanel } from "./SettingsPanel";
 import { StatusBar } from "./StatusBar";
+import { LoginGate } from "./LoginGate";
 
 interface Props {
   analysis: AnalysisResponse | null;
@@ -77,15 +78,19 @@ export default function TerminalShell({
   };
 
   return (
-    <div className={isDesktop ? "flex h-screen flex-col overflow-hidden bg-background" : "flex h-[100dvh] flex-col overflow-hidden bg-background"}>
-      <TopBar />
-      {isDesktop && <DesktopTabStrip />}
-      <main className="min-h-0 flex-1">
-        {/* the tab body — each tab owns its full height */}
-        <TabBody {...chartProps} />
-      </main>
-      {isDesktop ? <StatusBar /> : <MobileNav />}
-    </div>
+    <>
+      {/* auth overlay — covers (never unmounts) the shell when the deployment is locked */}
+      <LoginGate />
+      <div className={isDesktop ? "flex h-screen flex-col overflow-hidden bg-background" : "flex h-[100dvh] flex-col overflow-hidden bg-background"}>
+        <TopBar />
+        {isDesktop && <DesktopTabStrip />}
+        <main className="min-h-0 flex-1">
+          {/* the tab body — each tab owns its full height */}
+          <TabBody {...chartProps} />
+        </main>
+        {isDesktop ? <StatusBar /> : <MobileNav />}
+      </div>
+    </>
   );
 }
 

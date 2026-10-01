@@ -4,8 +4,11 @@
  * Market feed store — one socket.io connection to mt5-service, candle caches,
  * throttled tick distribution (no re-render storms).
  *
- * Socket:  io("/?XTransformPort=3030")        (gateway → mt5-service socket.io)
- * Candles: /api/candles?…&XTransformPort=3031 (gateway → mt5-service REST)
+ * Socket:  io("/?XTransformPort=3030")            (gateway → mt5-service socket.io)
+ * REST:    /api/mt5/<endpoint>?…                  (same-origin Next.js proxy →
+ *         127.0.0.1:3031 — v12.1: the old /api/<ep>?XTransformPort=3031 direct
+ *         calls 404'd on every edge that routes /api/* to the app, which
+ *         broke the chart history bootstrap in ALL real preview sessions)
  */
 
 import { useCallback, useEffect, useRef, useSyncExternalStore } from "react";
@@ -13,11 +16,12 @@ import { io, type Socket } from "socket.io-client";
 import type { Candle, FeedStatus, FlowPayload, SymbolQuote, TraderState } from "@/lib/market/types";
 
 export const MT5_WS_PORT = 3030;
-export const MT5_REST_PORT = 3031;
+/** /api/<mt5-endpoint> → /api/mt5/<mt5-endpoint> (same-origin proxy route). */
 export const restUrl = (path: string) =>
-  `${path}${path.includes("?") ? "&" : "?"}XTransformPort=${MT5_REST_PORT}`;
+  path.startsWith("/api/") ? `/api/mt5/${path.slice(5)}` : path;
 
 const EMPTY: Candle[] = [];
+const EMPTY_SYMBOLS: SymbolQuote[] = []; // stable reference — getSnapshot must never return a fresh array
 export interface TickPoint { t: number; p: number }
 
 const TICK_RING_MS = 31 * 60_000; // client-side tick history horizon (deep area-chart zoom)
@@ -453,7 +457,7 @@ export function useSymbolList(): SymbolQuote[] {
   return useSyncExternalStore(
     (fn) => feed.subscribeSymbols(fn),
     () => feed.getSymbols(),
-    () => EMPTY,
+    () => EMPTY_SYMBOLS,
   );
 }
 
