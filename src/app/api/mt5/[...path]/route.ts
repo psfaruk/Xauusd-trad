@@ -39,6 +39,10 @@ const ALLOWED = new Set([
   "status", // connection/broker status
   "history", // deal history
   "trader", // trading brain state + actions (GET/POST sub-paths)
+  // v13: in-app MT5 account setup (Settings → MT5 Account)
+  "mt5-account", // connection + configured account (masked login)
+  "mt5-connect", // adopt Exness credentials (live-tested, AES-stored)
+  "mt5-disconnect", // drop session / forget credentials
 ]);
 
 async function proxy(req: Request, method: "GET" | "POST"): Promise<Response> {

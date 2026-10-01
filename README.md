@@ -45,7 +45,8 @@ Browser — lightweight-charts + canvas overlay, socket.io live ticks
 ```
 
 - **মোবাইল/ডেস্কটপ উভয়ই** একই ডেটা-পাইপলাইন ব্যবহার করে, লেআউট সম্পূর্ণ আলাদা।
-- MT5 unreachable হলে **SIM fallback** (স্পষ্টভাবে লেবেল করা) — সাইট কখনো মৃত থাকে না, ৬০ সেকেন্ড পরপর MT5 রি-কানেক্ট চেষ্টা করে।
+- **কোনো SIM নেই (v13)** — MT5 সংযুক্ত না থাকলে অ্যাপ স্পষ্টভাবে "MT5 OFFLINE" দেখায় এবং Settings → MT5 Account থেকে সংযোগ করা যায়। কোনো নকল প্রাইস কখনো দেখানো হয় না।
+- **সব সার্ভার সাপোর্টেড** — Exness-MT5Trial6 থেকে Exness-MT5Real21 পর্যন্ত: সার্ভারের নাম দিলেই অ্যাপ নিজেই MetaQuotes ডিরেক্টরি থেকে গেটওয়ে IP খুঁজে নেয়।
 
 ## 🚀 লোকাল রান / Run locally
 
@@ -59,41 +60,41 @@ cd mini-services/mt5-service && bun install && bun run dev
 # socket.io :3030 + REST :3031
 ```
 
-`.env` (defaults already work):
+`.env` (সবই ঐচ্ছিক):
 
 ```env
 DATABASE_URL=file:./db/custom.db
-MT5_SERVER=Exness-MT5Trial6
-MT5_LOGIN=<আপনার MT5 লগইন>
-MT5_PASSWORD=<আপনার MT5 পাসওয়ার্ড>
 MT5_SERVICE_URL=http://127.0.0.1:3031
+# MT5 ক্রেডেনশিয়াল দুইভাবে দেওয়া যায় —
+#   ১) env দিয়ে:            MT5_LOGIN / MT5_PASSWORD / MT5_SERVER
+#   ২) অ্যাপের ভিতরে (v13):  Settings → MT5 Account ফর্মে লগইন দিন —
+#      ক্রেডেনশিয়াল AES-256-GCM এনক্রিপ্টেড ডিস্কে সেভ হয়, রিস্টার্টে অটো-রিকানেক্ট
 ```
 
-> 🔐 **ক্রেডেনশিয়াল কখনো কোডে হার্ডকোড করা নেই** — শুধুমাত্র environment variable (`.env`) থেকে পড়া হয়। ভ্যারিয়েবল সেট না থাকলে অ্যাপ **SIM মোডে** বুট করে (সাইট মৃত থাকে না), সেট করলে লাইভ MT5 ডেটা চালু হয়ে যায়।
+> 🔐 **ক্রেডেনশিয়াল কখনো কোডে হার্ডকোড করা নেই।** অ্যাপ-ফর্ম দিয়ে দিলে সেটা শুধু আপনার সার্ভারে এনক্রিপ্টেড থাকে (`data/mt5-credentials.json`, mode 600) — কোনো রেসপন্স/লগ/রেপোতে কখনো ফেরত যায় না।
 
-## 🚂 Railway Deploy (অটো-ডিপ্লয় + অটো ভ্যারিয়েবল)
+## 🚂 Railway Deploy (শূন্য ভ্যারিয়েবল + অটো-ডিপ্লয়)
 
-রেপোতে `Dockerfile` + `railway.json` + `start-railway.sh` + `Caddyfile.railway` সব রেডি — Railway **সবকিছু অটোমেটিক** বিল্ড/রান করে।
+রেপোতে `Dockerfile` + `railway.json` + `start-railway.sh` + `Caddyfile.railway` সব রেডি — Railway **সবকিছু অটোমেটিক** বিল্ড/রান করে। **কোনো ভ্যারিয়েবল সেট করতেই হয় না** — MT5 অ্যাকাউন্ট ডিপ্লয়ের পর অ্যাপের ভিতরে থেকে সংযোগ করা যায়।
 
 ### ধাপ (একবারই)
 
 1. [Railway](https://railway.app) → **New Project → Deploy from GitHub repo** → `psfaruk/Xauusd-trad` → branch `main`
 2. Railway নিজে থেকেই `Dockerfile` ধরে নেবে (`railway.json` নির্দেশ করে আছে) — বিল্ড শুরু হবে
-3. (ঐচ্ছিক, প্রস্তাবিত) **Volume** যোগ করুন, mount path `/data` — ড্রয়িং/সিগন্যাল হিস্ট্রি/ট্রেডার-স্টেট redeploy-এর পরও থাকবে
-4. **Variables**-এ আপনার MT5 অ্যাকাউন্ট যোগ করুন:
+3. **🌐 পাবলিক URL চালু করুন (গুরুত্বপূর্ণ ধাপ):** সার্ভিস পেজ → **Settings → Networking → Public Networking → Generate Domain** → পোর্ট জিজ্ঞেস করলে **80** বেছে নিন (Dockerfile `EXPOSE 80` করে আছে, তাই সাধারণত অটো-সিলেক্টেড থাকে)। এটাই `https://<আপনার-অ্যাপ>.up.railway.app` তৈরি করে — **এই ধাপ ছাড়া অ্যাপের কোনো URL পাবেন না।**
+4. (ঐচ্ছিক, প্রস্তাবিত) **Volume** যোগ করুন, mount path `/data` — ড্রয়িং/সিগন্যাল হিস্ট্রি/ট্রেডার-স্টেট/**MT5 ক্রেডেনশিয়াল** redeploy-এর পরও থাকবে
+5. Deploy শেষ হলে URL খুলুন → **প্রথম বুটের লগ** (Deployments → সেই ডিপ্লয় → View Logs) থেকে `AURUM LOGIN PASSWORD` লাইনটি কপি করুন — এটাই অ্যাপের লগইন পাসওয়ার্ড (নিজে ভ্যারিয়েবল না দিলে অটো-জেনারেট হয়; `APP_PASSWORD` ভ্যারিয়েবল দিলে আপনার পছন্দেরটাই চলবে)
+6. লগইন করুন → **Settings → MT5 Account** → Exness লগইন / পাসওয়ার্ড / সার্ভার (যেমন `Exness-MT5Trial6`) দিন → **Connect** → লাইভ ডেটা চালু ✓
+7. যাচাই: `https://<আপনার-অ্যাপ>.up.railway.app/api/setup-status` → `"ok": true` হলেই সব ঠিক
 
-   | Variable | মান | আবশ্যক? |
-   |---|---|---|
-   | `MT5_LOGIN` | আপনার MT5 লগইন নম্বর | লাইভ ডেটার জন্য হ্যাঁ |
-   | `MT5_PASSWORD` | আপনার MT5 পাসওয়ার্ড | লাইভ ডেটার জন্য হ্যাঁ |
-   | `MT5_SERVER` | ডিফল্ট `Exness-MT5Trial6` | না (ডিফল্ট আছে) |
-   | `MT5_SERVICE_URL` | ডিফল্ট `http://127.0.0.1:3031` | না (অটো-সেট) |
-   | `DATABASE_URL` | — | না (boot স্ক্রিপ্ট অটো-সেট করে) |
+### ভ্যারিয়েবল টেবিল (সবই ঐচ্ছিক)
 
-5. Deploy শেষ হলে যাচাই করুন: `https://<আপনার-অ্যাপ>.up.railway.app/api/setup-status`
-   → `"ok": true`, `"mode": "LIVE-ready"`, `"broker.source": "mt5"` দেখলেই লাইভ ডেটা চালু ✓
-
-**ভ্যারিয়েবল ছাড়াও ডিপ্লয় হয়** — তখন অ্যাপ SIM মোডে চলে (সাইট কখনো মৃত থাকে না)। ভ্যারিয়েবল যোগ করলেই Railway নিজে থেকে রিডিপ্লয় করে আর লাইভ MT5 ডেটা চালু হয়ে যায়।
+| Variable | মান | আবশ্যক? |
+|---|---|---|
+| `APP_PASSWORD` | অ্যাপ-লগইন পাসওয়ার্ড | না — না দিলে অটো-জেনারেট হয়ে প্রথম বুট-লগে একবার দেখায় |
+| `MT5_LOGIN` / `MT5_PASSWORD` | MT5 ক্রেডেনশিয়াল | না — অ্যাপের Settings → MT5 Account ফর্মে দিলেই হয় |
+| `MT5_SERVER` | ডিফল্ট `Exness-MT5Trial6` | না |
+| `DATABASE_URL` | — | না (boot স্ক্রিপ্ট অটো-সেট করে) |
 
 ### অটো-ডিপ্লয়
 
@@ -108,14 +109,14 @@ GitHub রেপো কানেক্ট থাকায় **`main` ব্র�
 
 **Health check:** `/` · **Port:** একটিই (Railway $PORT) — গেটওয়ে `?XTransformPort` দিয়ে রাউট করে।
 
-> ⚠️ Exness gateway IP-গুলো সময়ে সময়ে বদলাতে পারে — `mini-services/mt5-service/src/manager.ts`-এর `GATEWAYS` লিস্ট আপডেট করুন (MetaQuotes broker-search API থেকে নতুন IP পাওয়া যায়, দেখুন `mt5-poc/PROTOCOL.md`)।
+> ℹ️ Exness সার্ভারের গেটওয়ে IP অ্যাপ **নিজেই অটো-ডিসকভার** করে (MetaQuotes broker-search API — ঠিক যেভাবে একটি MT5 টার্মিনাল করে)। Trial6-এর জন্য ভেরিফাইড IP লিস্ট বিল্ট-ইন আছে।
 
 ## 📁 গুরুত্বপূর্ণ ফাইল / Key files
 
 ```
 mini-services/mt5-service/
   src/mt5-client.ts      MT5 web-terminal protocol client (AES framing, auth, candles, quotes)
-  src/manager.ts         reconnect loop, tick→bar builder, candle cache, sim fallback
+  src/manager.ts         reconnect loop, tick→bar builder, candle cache, server discovery
   index.ts               :3030 socket.io + :3031 REST
 src/lib/market/
   indicators.ts          EMA/RSI/ATR/ADX/MACD/Stoch/BB/swings (exact formulas)
@@ -132,4 +133,4 @@ Dockerfile + start-railway.sh + Caddyfile.railway + railway.json
 
 ## ⚠️ Disclaimer
 
-শিক্ষামূলক ডেমো টুল। ফাইন্যান্সিয়াল অ্যাডভাইস নয় — ট্রেডিং ঝুঁকিপূর্ণ। ডেটা সোর্স একটি **ডেমো MT5 অ্যাকাউন্ট** (Exness-MT5Trial6)।
+শিক্ষামূলক ডেমো টুল। ফাইন্যান্সিয়াল অ্যাডভাইস নয় — ট্রেডিং ঝুঁকিপূর্ণ। ডিফল্ট সার্ভার একটি **ডেমো MT5 অ্যাকাউন্ট** (Exness-MT5Trial6); রিয়েল অ্যাকাউন্ট সংযোগ করলে সম্পূর্ণ ঝুঁকি আপনার।

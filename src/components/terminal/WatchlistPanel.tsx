@@ -18,7 +18,7 @@ export function WatchlistPanel({ showAccount = true }: { showAccount?: boolean }
       <div className="flex items-center justify-between border-b border-border px-3 py-2">
         <span className="text-xs font-bold uppercase tracking-wider">{t("watchlist")}</span>
         <span className="font-mono text-[9px] uppercase text-muted-foreground">
-          {status == null ? "…" : status.source === "mt5" ? "MT5 direct" : "sim"}
+          {status == null ? "…" : status.source === "mt5" ? "MT5 direct" : "offline"}
         </span>
       </div>
       <ScrollArea className="slim-scroll min-h-0 flex-1">

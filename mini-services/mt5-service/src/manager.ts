@@ -1,8 +1,14 @@
 /**
  * MT5 data manager — one persistent MT5 session with auto-reconnect across
  * gateway IPs, live tick → bar building for every timeframe, a candle cache,
- * broker→UTC offset detection and a labelled SIMULATOR fallback (used only if
- * every Exness gateway is unreachable, e.g. network egress blocked).
+ * broker→UTC offset detection.
+ *
+ * v13: NO SIMULATOR. The owner connects their Exness account from the app
+ * (Settings → MT5 Account → POST /api/mt5-connect) or via MT5_LOGIN /
+ * MT5_PASSWORD env. Without credentials the manager sits in a labelled
+ * "disconnected" state and every data call fails loudly — fake prices are
+ * strictly worse than no prices (they once fed the trading brain and the
+ * chart while the user believed they were watching the real market).
  */
 
 import { Mt5WsClient, TF_CODE, type SymbolInfo, type AccountInfo, type Mt5Position, type Mt5Order, type Mt5Deal, type TradeResult, type TradeSide } from "./mt5-client";
@@ -20,7 +26,7 @@ export interface Tick {
   symbol: string; bid: number; ask: number; mid: number; ts: number; // UTC sec
 }
 export type BarEvent = { symbol: string; tf: string; ev: "open" | "update" | "close"; bar: Bar };
-export type FeedSource = "mt5" | "sim";
+export type FeedSource = "mt5" | "disconnected";
 export interface StatusPayload {
   connected: boolean;
   source: FeedSource;
@@ -32,11 +38,56 @@ export interface StatusPayload {
   reason: string;
 }
 
-const GATEWAYS = [
+/** Verified access IPs for Exness-MT5Trial6 (PROTOCOL.md, 2026-09-27).
+ *  Any OTHER server's IPs are resolved live via the MetaQuotes broker
+ *  directory (search.mtapi.io) — the exact discovery an MT5 terminal does —
+ *  and cached with the stored credentials. */
+const TRIAL6_GATEWAYS = [
   "47.130.41.116", "57.182.183.85", "16.79.3.122", "18.61.99.175",
   "8.219.172.6", "47.236.224.248", "47.81.62.132", "43.210.112.100",
   "35.154.31.85",
 ];
+
+/** Resolve a server name (e.g. "Exness-MT5Real8") to its access IPs.
+ *  Throws a human-readable error when the server is unknown — the connect
+ *  endpoint surfaces it straight into the Settings form. */
+export async function resolveGateways(server: string): Promise<string[]> {
+  // cheap sanity gate: 3–64 chars of letters/digits/dash/dot/underscore.
+  // Discovery itself decides whether the server truly exists.
+  if (!/^[\w.-]{3,64}$/.test(server)) {
+    throw new Error(`invalid server name "${server}"`);
+  }
+  if (/^Exness-MT5Trial6$/i.test(server)) return [...TRIAL6_GATEWAYS];
+  try {
+    const r = await fetch(
+      `http://search.mtapi.io/Search?company=${encodeURIComponent(server)}&mt5=true`,
+      { signal: AbortSignal.timeout(6000) },
+    );
+    if (r.ok) {
+      const j = (await r.json()) as {
+        result?: { results?: { name?: string; access?: string[] }[] }[];
+      };
+      for (const block of j.result ?? []) {
+        for (const s of block.results ?? []) {
+          if (
+            s.name === server &&
+            Array.isArray(s.access) && s.access.length
+          ) {
+            const ips = s.access
+              .map((a) => String(a).split(":")[0])
+              .filter(Boolean);
+            if (ips.length) return ips;
+          }
+        }
+      }
+    }
+  } catch {
+    /* discovery unreachable → fall through to the error */
+  }
+  throw new Error(
+    `server "${server}" not found — check the exact name in your MT5 app (e.g. Exness-MT5Trial6)`,
+  );
+}
 
 const WATCH_CANDIDATES = [
   "XAUUSDm", "XAUUSD247m", "XAGUSDm", "USOILm", "UKOILm",
@@ -55,42 +106,11 @@ const TF_DAYS: Record<string, number> = {
   M1: 12, M5: 25, M15: 45, M30: 70, H1: 150, H4: 320, D1: 900, W1: 3650, MN1: 15000,
 };
 
-const SIM_SEED: Record<string, { p: number; vol: number; digits: number }> = {
-  XAUUSDm: { p: 4285.9, vol: 0.00035, digits: 3 },
-  XAGUSDm: { p: 50.85, vol: 0.0005, digits: 3 },
-  USOILm: { p: 78.42, vol: 0.0006, digits: 2 },
-  UKOILm: { p: 82.15, vol: 0.0006, digits: 2 },
-  USTECm: { p: 21450, vol: 0.0005, digits: 1 },
-  USTEC_x100m: { p: 21450, vol: 0.0005, digits: 1 },
-  US500m: { p: 6820, vol: 0.0004, digits: 1 },
-  US500_x100m: { p: 6820, vol: 0.0004, digits: 1 },
-  BTCUSDm: { p: 84815, vol: 0.0006, digits: 2 },
-  ETHUSDm: { p: 2995, vol: 0.0008, digits: 2 },
-  SOLUSDm: { p: 198.4, vol: 0.001, digits: 2 },
-  EURUSDm: { p: 1.0865, vol: 0.00006, digits: 5 },
-  GBPUSDm: { p: 1.2698, vol: 0.00007, digits: 5 },
-  USDJPYm: { p: 155.32, vol: 0.00007, digits: 3 },
-  AUDUSDm: { p: 0.6512, vol: 0.00007, digits: 5 },
-  USDCADm: { p: 1.3715, vol: 0.00006, digits: 5 },
-  USDCHFm: { p: 0.8842, vol: 0.00006, digits: 5 },
-  NZDUSDm: { p: 0.5945, vol: 0.00008, digits: 5 },
-  EURJPYm: { p: 168.55, vol: 0.00007, digits: 3 },
-  GBPJPYm: { p: 197.28, vol: 0.00008, digits: 3 },
-  EURGBPm: { p: 0.8556, vol: 0.00005, digits: 5 },
-};
-
-function gauss(): number {
-  let u = 0, v = 0;
-  while (u === 0) u = Math.random();
-  while (v === 0) v = Math.random();
-  return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
-}
-
 interface CacheEntry { bars: Bar[]; fetchedAt: number; }
 
 export class Mt5Manager {
   // ── public state ──
-  source: FeedSource = "mt5";
+  source: FeedSource = "disconnected";
   connected = false;
   symbols = new Map<string, SymbolInfo>();
   watch: string[] = [];
@@ -98,15 +118,18 @@ export class Mt5Manager {
   serverName: string;
   offsetSec = 0; // broker server time − UTC (seconds, 30-min quantized)
   latencyMs: number | null = null;
-  reason = "connecting";
+  reason = "not configured";
 
   // ── internal ──
   private client: Mt5WsClient | null = null;
-  readonly login: number;
-  private password: string;
+  private _login = 0;
+  private _password = "";
+  /** gateway IPs for the CURRENT server (resolved via resolveGateways) */
+  private gateways: string[] = [...TRIAL6_GATEWAYS];
+  /** set by disconnect() — blocks auto-reconnect until new credentials land */
+  private manualDisconnect = false;
   private hbTimer: ReturnType<typeof setInterval> | null = null;
   private retryTimer: ReturnType<typeof setTimeout> | null = null;
-  private simTimer: ReturnType<typeof setInterval> | null = null;
   private gatewayIdx = 0;
   private failedRounds = 0;
   private stopped = false;
@@ -231,16 +254,92 @@ export class Mt5Manager {
 
   constructor(opts?: { server?: string; login?: number; password?: string }) {
     this.serverName = opts?.server ?? process.env.MT5_SERVER ?? "Exness-MT5Trial6";
-    // SECURITY: credentials come ONLY from env (MT5_LOGIN / MT5_PASSWORD) —
-    // never hard-code broker credentials in a public repo. Missing creds →
-    // the manager stays in SIM mode (connectLoop checks every attempt).
-    this.login = Number(opts?.login ?? process.env.MT5_LOGIN ?? 0);
-    this.password = opts?.password ?? process.env.MT5_PASSWORD ?? "";
+    // SECURITY: credentials come from env (MT5_LOGIN / MT5_PASSWORD) or from
+    // the in-app Settings → MT5 Account form (stored encrypted — see
+    // credentials.ts). Never hard-coded in a public repo. Missing creds →
+    // the manager sits in the "disconnected" state (v13: no simulator).
+    this._login = Number(opts?.login ?? process.env.MT5_LOGIN ?? 0);
+    this._password = opts?.password ?? process.env.MT5_PASSWORD ?? "";
   }
 
-  /** True when broker credentials are configured (env or options). */
+  /** The MT5 login currently configured (0 when none) — display only. */
+  get login(): number { return this._login; }
+
+  /** True when broker credentials are configured (env or in-app). */
   get hasCredentials(): boolean {
-    return !!this.login && !!this.password;
+    return !!this._login && !!this._password;
+  }
+
+  // ═══════════════ v13: in-app credential control ═══════════════
+  /** Live-test credentials WITHOUT touching the persistent session — a
+   *  one-shot dial + login + account read on a throw-away socket. Throws a
+   *  human-readable error the connect endpoint forwards to the Settings
+   *  form. Returns the broker's account snapshot on success. */
+  async testCredentials(login: number, password: string, server: string): Promise<{ account: AccountInfo; gateways: string[] }> {
+    const gateways = await resolveGateways(server);
+    let lastErr: Error | null = null;
+    // try up to 2 gateways — a single dead IP must not read as "bad password"
+    for (const gw of gateways.slice(0, 2)) {
+      let client: Mt5WsClient | null = null;
+      try {
+        client = await Mt5WsClient.connect(gw);
+        await client.auth();
+        await client.login(login, password);
+        const acct = await client.account();
+        if (!Number.isFinite(acct.equity) || acct.equity <= 0) acct.equity = acct.balance;
+        return { account: { ...acct, login }, gateways };
+      } catch (e) {
+        lastErr = e as Error;
+      } finally {
+        try { client?.close(); } catch { /* already closed */ }
+      }
+    }
+    throw lastErr ?? new Error("Exness gateway unreachable");
+  }
+
+  /** Adopt new credentials (Settings → Connect). Recycles the live session
+   *  onto the new server immediately. `gateways` may come from the stored
+   *  cache (credentials.ts) to skip discovery on boot. */
+  applyCredentials(creds: { login: number; password: string; server: string; gateways?: string[] }): void {
+    this.manualDisconnect = false;
+    this._login = creds.login;
+    this._password = creds.password;
+    this.serverName = creds.server;
+    this.gateways = creds.gateways?.length ? creds.gateways : [...TRIAL6_GATEWAYS];
+    this.gatewayIdx = 0;
+    this.failedRounds = 0;
+    this.firstFailAt = 0;
+    // drop any session on the OLD server, then dial the new one right away
+    this.stopClient();
+    this.connected = false;
+    this.source = "mt5";
+    this.reason = `connecting (${creds.server})`;
+    this.emitStatus();
+    if (this.retryTimer) clearTimeout(this.retryTimer);
+    this.retryTimer = setTimeout(() => this.connectLoop(), 100);
+  }
+
+  /** Owner-initiated disconnect (Settings → Disconnect / Forget). Kills the
+   *  broker session; auto-reconnect stays off until new credentials arrive.
+   *  (A plain network drop does NOT set this — connectLoop keeps retrying.) */
+  disconnect(reason = "disconnected by owner"): void {
+    this.manualDisconnect = true;
+    this.stopClient();
+    this.connected = false;
+    this.source = "disconnected";
+    this.account = null;
+    this.reason = reason;
+    this.watch = [];
+    this.symbols.clear();
+    this.cache.clear();
+    this.emitStatus();
+  }
+
+  /** Close the broker socket + its heartbeat without touching the rest. */
+  private stopClient(): void {
+    if (this.hbTimer) { clearInterval(this.hbTimer); this.hbTimer = null; }
+    try { this.client?.close(); } catch { /* already closed */ }
+    this.client = null;
   }
 
   nowSec() { return Math.floor(Date.now() / 1000); }
@@ -262,10 +361,10 @@ export class Mt5Manager {
     G.__mt5Manager = this;
     this.stopped = false;
     this.connectLoop();
-    // wedge self-check: a healthy manager recovers (or falls back to sim)
-    // within ~2 min. If we stay "mt5 + connecting" for 4 min, the hot-reload
-    // wedge or a dead timer loop is certain — exit so the port watchdog
-    // respawns us fresh (24/7 resilience).
+    // wedge self-check: a healthy manager recovers within ~2 min. If we
+    // stay "mt5 + connecting" for 4 min, the hot-reload wedge or a dead
+    // timer loop is certain — exit so the port watchdog respawns us fresh
+    // (24/7 resilience).
     if (!this.wedgeTimer) {
       this.wedgeTimer = setInterval(() => {
         if (
@@ -305,7 +404,6 @@ export class Mt5Manager {
     this.client?.close();
     if (this.hbTimer) clearInterval(this.hbTimer);
     if (this.retryTimer) clearTimeout(this.retryTimer);
-    if (this.simTimer) clearInterval(this.simTimer);
     if (this.wedgeTimer) clearInterval(this.wedgeTimer);
   }
 
@@ -331,20 +429,25 @@ export class Mt5Manager {
 
   private async connectLoop() {
     if (this.stopped) return;
-    // No broker credentials → SIM mode (no point hammering the gateway with
-    // doomed logins). Re-check every 60s in case env/opts changed (hot reload).
-    if (!this.hasCredentials) {
-      this.startSim(
-        "MT5_LOGIN / MT5_PASSWORD not set — SIM mode. Set them as environment variables for live broker data.",
-      );
+    // v13: NO simulator. Without credentials (or after an owner-initiated
+    // disconnect) the manager sits in a labelled "disconnected" state and
+    // re-checks every 30s — applyCredentials() pokes connectLoop immediately
+    // when the owner connects from Settings, so this poll is only a safety.
+    if (!this.hasCredentials || this.manualDisconnect) {
+      this.connected = false;
+      this.source = "disconnected";
+      this.reason = this.manualDisconnect
+        ? "disconnected — reconnect from Settings → MT5 Account"
+        : "MT5 account not connected — open Settings → MT5 Account";
+      this.emitStatus();
       if (this.retryTimer) clearTimeout(this.retryTimer);
-      this.retryTimer = setTimeout(() => this.connectLoop(), 60_000);
+      this.retryTimer = setTimeout(() => this.connectLoop(), 30_000);
       return;
     }
     // outage window starts at the first connect attempt (wedge detection:
     // even a hang INSIDE Mt5WsClient.connect with no retry will be caught)
     if (!this.firstFailAt) this.firstFailAt = Date.now();
-    const gw = GATEWAYS[this.gatewayIdx % GATEWAYS.length];
+    const gw = this.gateways[this.gatewayIdx % this.gateways.length];
     this.gatewayIdx++;
     this.connected = false;
     this.reason = `connecting via ${gw}`;
@@ -363,7 +466,7 @@ export class Mt5Manager {
 
     try {
       await client.auth();
-      await client.login(this.login, this.password);
+      await client.login(this.login, this._password);
       if (this.stopped) { client.close(); return; } // same race, one gate deeper
       const acct = await client.account();
       if (!Number.isFinite(acct.equity) || acct.equity <= 0) acct.equity = acct.balance;
@@ -388,8 +491,7 @@ export class Mt5Manager {
       this.reason = "connected";
       this.failedRounds = 0;
       this.firstFailAt = 0; // recovered — reset the wedge clock
-      this.stopSim();
-      this.cache.clear(); // sim/MT5 switchover → fresh data
+      this.cache.clear(); // server/account switchover → fresh data
       this.emitStatus();
       console.log(
         `[mt5] connected via ${gw} — account ${this.login} (${acct.balance.toFixed(2)} ${acct.currency}), ${symbols.size} symbols, watching ${w.length}`,
@@ -439,53 +541,11 @@ export class Mt5Manager {
     const delay = Math.min(2000 * 2 ** Math.min(this.failedRounds, 5), 60000);
     console.log(`[mt5] retry in ${delay}ms — ${errMsg}`);
 
-    if (this.failedRounds >= 3 && this.source !== "sim") {
-      this.startSim(`MT5 unreachable (${errMsg}) — simulator active, keep retrying`);
-    }
+    // v13: no simulator fallback — a broker outage shows as "reconnecting"
+    // everywhere and the stale cache keeps the chart alive meanwhile.
     this.emitStatus();
     if (this.retryTimer) clearTimeout(this.retryTimer);
     this.retryTimer = setTimeout(() => this.connectLoop(), delay);
-  }
-
-  // ═════════════════════ simulator fallback ═════════════════════
-  private simPrices = new Map<string, { p: number; digits: number }>();
-
-  private startSim(reason: string) {
-    this.source = "sim";
-    this.reason = reason;
-    this.simPrices.clear();
-    for (const [sym, cfg] of Object.entries(SIM_SEED)) {
-      this.simPrices.set(sym, { p: cfg.p, digits: cfg.digits });
-      if (!this.symbols.has(sym)) {
-        this.symbols.set(sym, { id: -1, digits: cfg.digits, name: sym });
-      }
-    }
-    if (!this.watch.length) this.watch = Object.keys(SIM_SEED);
-    this.account = {
-      login: this.login, balance: 407.42, equity: 407.42,
-      currency: "USD", group: "sim", server: this.serverName,
-    };
-    this.cache.clear();
-    this.emitStatus();
-    console.log(`[sim] ${reason}`);
-    if (this.simTimer) clearInterval(this.simTimer);
-    this.simTimer = setInterval(() => {
-      for (const [sym, st] of this.simPrices) {
-        const cfg = SIM_SEED[sym];
-        const dt = 0.7; // seconds between sim ticks
-        st.p *= 1 + cfg.vol * gauss() * Math.sqrt(dt / 60) * 8;
-        const spread = st.p * 0.00004;
-        const bid = st.p - spread / 2;
-        const ask = st.p + spread / 2;
-        this.handleQuote(-1, this.nowSec(), bid, ask, sym, cfg.digits);
-      }
-    }, 700);
-  }
-
-  private stopSim() {
-    if (this.simTimer) clearInterval(this.simTimer);
-    this.simTimer = null;
-    this.simPrices.clear();
   }
 
   // ═════════════════════ quotes → ticks → bars ═════════════════════
@@ -758,31 +818,6 @@ export class Mt5Manager {
     }));
   }
 
-  private simHistory(symbol: string, tf: string, limit: number): Bar[] {
-    const cfg = SIM_SEED[symbol];
-    if (!cfg) return [];
-    const tfSec = TF_SEC[tf];
-    const now = this.nowSec();
-    const bucket = Math.floor(now / tfSec) * tfSec;
-    const out: Bar[] = [];
-    // walk backwards generating a random-walk, then reverse
-    let p = cfg.p;
-    const m1Count = Math.max(limit, 300) * (tfSec / 60);
-    const stepVol = cfg.vol * Math.sqrt(tfSec / 60) * 4;
-    for (let i = 0; i < m1Count; i++) {
-      const o = p;
-      let h = o, l = o, c = o;
-      for (let k = 0; k < 4; k++) {
-        c *= 1 + stepVol * gauss() / 2;
-        h = Math.max(h, c); l = Math.min(l, c);
-      }
-      p = c;
-      out.push({ t: bucket - i * tfSec, o, h, l, c, v: 40 + Math.floor(Math.random() * 200) });
-    }
-    out.reverse();
-    return out;
-  }
-
   async getCandles(symbol: string, tf: string, limit: number): Promise<Bar[]> {
     limit = Math.max(10, Math.min(3000, limit));
     const key = `${symbol}|${tf}`;
@@ -791,11 +826,15 @@ export class Mt5Manager {
     const stale = !entry || Date.now() - entry.fetchedAt > Math.min(tfSec * 1000 * 0.5, 60000);
 
     if (stale) {
+      // v13: disconnected → no data, loudly. (A stale cache may still serve
+      // the chart during a transient reconnect.)
+      if (this.source !== "mt5") {
+        if (entry?.bars.length) return entry.bars.slice(-limit);
+        throw new Error("MT5 not connected — open Settings → MT5 Account");
+      }
       let bars: Bar[] = [];
       try {
-        bars = this.source === "mt5"
-          ? await this.fetchCandlesMt5(symbol, tf, limit)
-          : this.simHistory(symbol, tf, limit);
+        bars = await this.fetchCandlesMt5(symbol, tf, limit);
       } catch (e) {
         // serve stale cache if fetch fails
         if (entry?.bars.length) return entry.bars.slice(-limit);
@@ -852,12 +891,12 @@ export class Mt5Manager {
       const q = this.quotes.get(name);
       const prev = this.dayClose.get(name);
       // fallback price when market is closed (no live quote yet):
-      // last D1 close → last known mid → seeded price
+      // last D1 close → last known mid. (v13: no seeded sim price — a
+      // disconnected feed shows no price, not a fabricated one.)
       let mid = q?.mid ?? 0;
       if (!q) {
         const fallback = prev
           ?? this.lastKnownMid.get(name)
-          ?? SIM_SEED[name]?.p
           ?? 0;
         mid = fallback;
         if (fallback && prev) this.lastKnownMid.set(name, fallback);

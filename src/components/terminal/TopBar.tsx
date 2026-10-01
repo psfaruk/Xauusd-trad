@@ -79,13 +79,13 @@ export function ConnectionChip() {
   const { t } = useI18n();
   const source = status?.source ?? "mt5";
   const connected = status?.connected ?? false;
-  const label =
-    source === "sim" ? t("simulated") : connected ? t("live") : t("connecting");
-  const cls = source !== "mt5"
-    ? "border-amber-500/40 bg-amber-500/10 text-amber-500"
+  const offline = source === "disconnected" && !connected;
+  const label = connected ? t("live") : offline ? t("mt5Offline") : t("connecting");
+  const cls = offline
+    ? "border-red-500/40 bg-red-500/10 text-red-500"
     : connected
       ? "border-up/40 bg-up/10 text-up"
-      : "border-border bg-muted/50 text-muted-foreground";
+      : "border-amber-500/40 bg-amber-500/10 text-amber-500";
   return (
     <span
       className={cn(
@@ -96,10 +96,10 @@ export function ConnectionChip() {
       <span
         className={cn(
           "h-1.5 w-1.5 rounded-full",
-          connected && source === "mt5" ? "bg-up live-dot" : source === "sim" ? "bg-amber-500 live-dot" : "bg-muted-foreground",
+          connected ? "bg-up live-dot" : offline ? "bg-red-500" : "bg-amber-500 live-dot",
         )}
       />
-      {source === "sim" ? t("simulated") : label}
+      {label}
     </span>
   );
 }

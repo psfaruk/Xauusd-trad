@@ -89,8 +89,7 @@ class FeedStore {
     });
 
     socket.on("status", (s: FeedStatus) => {
-      this.status = s;
-      this.statusSubs.forEach((fn) => fn());
+      this.applyStatus(s);
     });
     socket.on("snapshot", (snap: { source: string; quotes: SymbolQuote[] }) => {
       this.ticks.clear();
@@ -399,6 +398,14 @@ class FeedStore {
 
   // ── snapshots (stable references for useSyncExternalStore) ──
   getStatus() { return this.status; }
+
+  /** store a fresh FeedStatus — the single path the socket "status" handler
+   *  and the one-shot REST pull (refreshFeedStatus) both go through. */
+  applyStatus(s: FeedStatus) {
+    if (!s || typeof s !== "object") return;
+    this.status = s;
+    this.statusSubs.forEach((fn) => fn());
+  }
   getSymbols() { return this.symbolsSnapshot; }
   getBarsSnapshot(key: string) { return this.barsSnapshot.get(key) ?? EMPTY; }
   getQuoteSnapshot(name: string) { return this.ticks.get(name) ?? null; }
@@ -443,6 +450,19 @@ export function useFeedBoot() {
   useEffect(() => {
     feed.connect();
   }, []);
+}
+
+/** One-shot REST status pull — used after MT5 connect/disconnect actions so
+ *  the UI updates immediately instead of waiting for the next socket event. */
+export function refreshFeedStatus() {
+  fetch(restUrl("/api/status"), { cache: "no-store" })
+    .then((r) => (r.ok ? r.json() : null))
+    .then((s: FeedStatus | null) => {
+      if (s) feed.applyStatus(s);
+    })
+    .catch(() => {
+      /* best effort — the socket stream remains the source of truth */
+    });
 }
 
 export function useStatus(): FeedStatus | null {

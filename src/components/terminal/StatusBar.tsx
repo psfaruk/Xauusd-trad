@@ -35,17 +35,20 @@ export function StatusBar() {
   const serverTime = status?.serverTime ?? Math.floor(Date.now() / 1000);
   const session = sessionOf(serverTime);
   const majorSession = session === "LONDON" || session === "NEW YORK";
+  const offline = source === "disconnected" && !connected;
   const sourceLabel =
-    source === "sim" ? t("simulated").toUpperCase()
+    offline ? t("mt5Offline")
     : connected ? `MT5 ${t("live").toUpperCase()}`
     : t("connecting").toUpperCase();
-  const sourceClass = source === "sim" ? "text-amber-500" : connected ? "text-up" : "text-amber-500";
+  const sourceClass = offline ? "text-red-500" : connected ? "text-up" : "text-amber-500";
 
   return (
     <footer className="flex h-6 shrink-0 items-center gap-3 overflow-hidden border-t border-border bg-card/80 px-3 text-[10px] text-muted-foreground">
       <span className="flex items-center gap-1 font-semibold">
-        {connected || source === "sim" ? (
+        {connected ? (
           <ShieldCheck className={cn("h-3 w-3", sourceClass)} />
+        ) : offline ? (
+          <ShieldAlert className="h-3 w-3 text-red-500" />
         ) : (
           <ShieldAlert className="h-3 w-3 text-amber-500" />
         )}

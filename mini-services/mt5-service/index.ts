@@ -25,6 +25,16 @@
  *                                                 trend, tick value-area (POC),
  *                                                 flow bias + active trade zones
  *                                                 (the brain "sees" the chart)
+ *          GET  /api/mt5-account                 → MT5 connection + configured
+ *                                                 account (masked login) — PRIVATE
+ *          POST /api/mt5-connect {login,password,server}
+ *                                               → live-test + adopt Exness
+ *                                                 credentials from the app's
+ *                                                 Settings → MT5 Account form
+ *                                                 (stored AES-encrypted on disk)
+ *          POST /api/mt5-disconnect {forget?}    → drop the broker session
+ *                                                 (forget:true wipes the saved
+ *                                                 credentials file)
  *
  * Run: bun run dev   (auto-restart on change)
  */
@@ -35,6 +45,7 @@ import { Server } from "socket.io";
 import { Mt5Manager } from "./src/manager";
 import { AiTrader, type TraderConfig } from "./src/trader";
 import { authorizeTradingReq, authorizeHandshake, rateLimit, clientIp } from "./src/auth";
+import { loadCredentials, saveCredentials, clearCredentials, maskLogin } from "./src/credentials";
 
 const IO_PORT = 3030;
 const REST_PORT = 3031;
@@ -186,6 +197,111 @@ const restServer = createServer((req, res) => {
       if (!guardTrading(req, res)) return;
       const hours = Math.min(72, Math.max(1, Number(url.searchParams.get("hours")) || 24));
       return json(res, 200, { hours, history: trader.state().recentHistory });
+    }
+
+    // ── v13: MT5 account setup from the app (Settings → MT5 Account) ──
+    // All three are PRIVATE (session/key) — credentials must never be
+    // settable by an anonymous visitor on a public deployment.
+    if (url.pathname === "/api/mt5-account") {
+      if (!guardTrading(req, res)) return;
+      const stored = loadCredentials();
+      const configured = manager.hasCredentials || !!stored;
+      return json(res, 200, {
+        configured,
+        connected: manager.connected,
+        source: manager.source,
+        server: manager.serverName,
+        loginMasked: configured ? maskLogin(manager.login || stored?.login) : null,
+        account: manager.connected && manager.account
+          ? {
+              login: manager.login,
+              balance: manager.account.balance,
+              equity: manager.account.equity,
+              currency: manager.account.currency,
+            }
+          : null,
+        reason: manager.reason,
+      });
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/mt5-connect") {
+      // tighter limiter than guardTrading: credential stuffing armor
+      const rl = rateLimit(`mt5conn:${clientIp(req)}`, 10, 60_000);
+      if (!rl.ok) {
+        res.writeHead(429, { "Content-Type": "application/json", "Retry-After": String(rl.retryAfter) });
+        return void res.end(JSON.stringify({ ok: false, error: `rate limit — retry in ${rl.retryAfter}s` }));
+      }
+      if (!guardTrading(req, res)) return;
+      return readBody(req, res, async (body) => {
+        const b = body as any;
+        const login = Number(String(b?.login ?? "").replace(/\s+/g, ""));
+        const password = String(b?.password ?? "");
+        const server = String(b?.server ?? "").trim();
+        if (!Number.isFinite(login) || login < 10000 || login > 9999999999) {
+          return json(res, 400, { ok: false, error: "invalid account login — enter your MT5 account number" });
+        }
+        if (!password || password.length > 128) {
+          return json(res, 400, { ok: false, error: "password required" });
+        }
+        if (!/^[\w.-]{3,64}$/.test(server)) {
+          return json(res, 400, { ok: false, error: "server required (e.g. Exness-MT5Trial6)" });
+        }
+        try {
+          // 1) live-test on a throw-away socket (resolves the server's access
+          //    IPs via the MetaQuotes directory exactly like an MT5 terminal)
+          const { account, gateways } = await manager.testCredentials(login, password, server);
+          // 2) adopt for the persistent session
+          manager.applyCredentials({ login, password, server, gateways });
+          // 3) persist (AES-encrypted, mode 600) so restarts auto-reconnect
+          const saved = saveCredentials({ login, password, server, gateways });
+          // 4) give the live session a moment to come up (UI updates via
+          //    socket "status" events either way)
+          const t0 = Date.now();
+          while (!manager.connected && Date.now() - t0 < 12_000) {
+            await new Promise((r) => setTimeout(r, 500));
+          }
+          console.log(`[mt5-connect] account ${maskLogin(login)} @ ${server} — ${manager.connected ? "live" : "still connecting"} (stored: ${saved ? "yes" : "NO — fs read-only?"})`);
+          return json(res, 200, {
+            ok: true,
+            connected: manager.connected,
+            server,
+            account: {
+              login,
+              balance: account.balance,
+              equity: account.equity,
+              currency: account.currency,
+            },
+          });
+        } catch (e) {
+          const raw = (e as Error).message ?? "connect failed";
+          const msg =
+            /LOGIN failed/i.test(raw)
+              ? "Login failed — check the account number, password and server"
+              : /server .*not found|invalid server/i.test(raw)
+                ? raw
+                : /WS connect (failed|timeout)|gateway unreachable/i.test(raw)
+                  ? "Exness gateway unreachable — try again in a moment"
+                  : raw;
+          console.log(`[mt5-connect] FAILED for ${maskLogin(login)} @ ${server}: ${msg}`);
+          return json(res, 400, { ok: false, error: msg });
+        }
+      });
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/mt5-disconnect") {
+      if (!guardTrading(req, res)) return;
+      return readBody(req, res, async (body) => {
+        const forget = (body as any)?.forget === true;
+        if (forget) {
+          clearCredentials();
+          manager.disconnect("disconnected — credentials removed");
+        } else {
+          manager.disconnect("disconnected — reconnect from Settings → MT5 Account");
+        }
+        // the brain must not trade a dead session — it already pauses on
+        // !connected, and the socket broadcast tells every UI instantly
+        return json(res, 200, { ok: true, configured: !forget && (manager.hasCredentials || !!loadCredentials()) });
+      });
     }
 
     if (url.pathname === "/health") {
@@ -604,6 +720,14 @@ restServer.listen(REST_PORT, BIND_HOST, () => {
   console.log(`[mt5-service] REST on ${BIND_HOST}:${REST_PORT}`);
   manager.start();
   trader.start();
+  // v13: auto-reconnect the stored MT5 account (Settings → MT5 Account) — a
+  // 24/7 deployment must come back up logged in after ANY restart. In-app
+  // credentials take precedence over MT5_LOGIN/MT5_PASSWORD env vars.
+  const stored = loadCredentials();
+  if (stored) {
+    console.log(`[mt5-service] stored account ${maskLogin(stored.login)} @ ${stored.server} — auto-connecting`);
+    manager.applyCredentials(stored);
+  }
 });
 // safety: if REST never came up within 5s, exit (prevents a socket-only zombie)
 setTimeout(() => {

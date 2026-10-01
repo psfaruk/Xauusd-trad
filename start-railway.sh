@@ -20,12 +20,18 @@ echo "│ AURUM Terminal — Railway boot"
 echo "│ PORT(gateway)=${PORT}  next=:3000  mt5-io=:3030  mt5-rest=:3031"
 echo "└──────────────────────────────────────────────────────"
 
-# ── credential check (never hard-coded; SIM mode when missing) ──
+# ── MT5 credentials (v13) — ZERO Railway variables required ──
+# The app's Settings → MT5 Account form connects the Exness account in-app:
+# credentials are live-tested, then stored AES-256-GCM encrypted at
+# /data/mt5-data/mt5-credentials.json (auto-persists on a volume; the data/
+# dir is symlinked there below). Every container restart auto-reconnects.
+# MT5_LOGIN / MT5_PASSWORD env vars still work if you prefer them — the
+# in-app account simply takes precedence once saved.
 if [ -z "${MT5_LOGIN:-}" ] || [ -z "${MT5_PASSWORD:-}" ]; then
-  echo "⚠️  MT5_LOGIN / MT5_PASSWORD not set → mt5-service runs in SIM mode."
-  echo "   Add them in Railway → Variables for LIVE broker data."
+  echo "ℹ️  No MT5_LOGIN/MT5_PASSWORD env — connect your account IN-APP:"
+  echo "    log in → Settings → MT5 Account → enter login/password/server → Connect."
 else
-  echo "✓ MT5 credentials present (login ${MT5_LOGIN})"
+  echo "✓ MT5 credentials present via env (login ${MT5_LOGIN})"
 fi
 
 # ════════════════════════════════════════════════════════════════

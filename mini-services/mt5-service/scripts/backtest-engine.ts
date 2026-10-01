@@ -30,7 +30,7 @@ class MockHost implements TraderHost {
   quote: { bid: number; ask: number; mid: number } | null = null;
   positionsList: Mt5Position[] = [];
   dealsList: Mt5Deal[] = [];
-  fills: { kind: "close" | "modify" | "sl-fire"; sl?: number; price: number }[] = [];
+  fills: { kind: "close" | "modify" | "sl-fire" | "tp-fire"; sl?: number; price: number }[] = [];
   digitsMap = new Map([["XAUUSDm", 2], ["USTEC_x100m", 2]]);
 
   getQuote() { return this.quote; }
@@ -40,6 +40,7 @@ class MockHost implements TraderHost {
   getOrCreateTracker(): never { throw new Error("no trackers in backtest"); }
   async marketRead() { return null; }
   recycleSession() { /* never needed */ }
+  brokerNowSec() { return Math.floor(Date.now() / 1000); }
   async pendingOrder(): Promise<never> { throw new Error("no pendings in backtest"); }
   async cancelOrder(): Promise<never> { throw new Error("no pendings in backtest"); }
   async account(): Promise<AccountInfo> {
@@ -77,83 +78,45 @@ class MockHost implements TraderHost {
     }
   }
 
-  /** the broker fires the SL the moment price crosses it (like the real one) */
+  /** the broker fires SL AND TP the moment price crosses them (like the
+   *  real one) — v13: TP firing added (R-mode wins are banked by the
+   *  broker-side TP, the monitor never $-closes in R-mode) */
   fireStops() {
     if (!this.quote) return;
     for (const bp of [...this.positionsList]) {
-      if (bp.sl <= 0) continue;
-      const hit = bp.side === "buy" ? this.quote.bid <= bp.sl : this.quote.ask >= bp.sl;
-      if (!hit) continue;
+      const cm = bp.symbol.startsWith("USTEC") && bp.symbol.includes("x100") ? 100 : bp.symbol.startsWith("XAUUSD") ? 100 : 1;
       const dir = bp.side === "buy" ? 1 : -1;
-      const profit = (bp.sl - bp.openPrice) * dir * bp.lots * (bp.symbol.startsWith("USTEC") && bp.symbol.includes("x100") ? 100 : bp.symbol.startsWith("XAUUSD") ? 100 : 1);
-      this.positionsList = this.positionsList.filter((p) => p.id !== bp.id);
-      this.dealsList.push({
-        deal: Date.now(), order: bp.id, positionId: bp.id, symbol: bp.symbol, side: bp.side === "buy" ? "sell" : "buy",
-        entry: "out", time: Date.now(), price: bp.sl, volume: bp.lots, profit, commission: 0, swap: 0, comment: "sl",
-      } as Mt5Deal);
-      this.fills.push({ kind: "sl-fire", sl: bp.sl, price: bp.sl });
+      if (bp.sl > 0) {
+        const hit = bp.side === "buy" ? this.quote.bid <= bp.sl : this.quote.ask >= bp.sl;
+        if (hit) {
+          const profit = (bp.sl - bp.openPrice) * dir * bp.lots * cm;
+          this.positionsList = this.positionsList.filter((p) => p.id !== bp.id);
+          this.dealsList.push({
+            deal: Date.now(), order: bp.id, positionId: bp.id, symbol: bp.symbol, side: bp.side === "buy" ? "sell" : "buy",
+            entry: "out", time: Date.now(), price: bp.sl, volume: bp.lots, profit, commission: 0, swap: 0, comment: "sl",
+          } as Mt5Deal);
+          this.fills.push({ kind: "sl-fire", sl: bp.sl, price: bp.sl });
+          continue;
+        }
+      }
+      if (bp.tp > 0) {
+        const hit = bp.side === "buy" ? this.quote.bid >= bp.tp : this.quote.ask <= bp.tp;
+        if (hit) {
+          const profit = (bp.tp - bp.openPrice) * dir * bp.lots * cm;
+          this.positionsList = this.positionsList.filter((p) => p.id !== bp.id);
+          this.dealsList.push({
+            deal: Date.now(), order: bp.id, positionId: bp.id, symbol: bp.symbol, side: bp.side === "buy" ? "sell" : "buy",
+            entry: "out", time: Date.now(), price: bp.tp, volume: bp.lots, profit, commission: 0, swap: 0, comment: "tp",
+          } as Mt5Deal);
+          this.fills.push({ kind: "tp-fire", price: bp.tp });
+        }
+      }
     }
   }
 }
 
-// ── recorded tick loading + window scan ────────────────────────────────────
+// ── scenario runner ──
 type Tick = { t: number; p: number };
-function loadTicks(): Tick[] {
-  const raw = JSON.parse(fs.readFileSync("/home/z/my-project/mini-services/mt5-service/data/ticks-XAUUSDm.json", "utf8"));
-  return (raw.ticks as Tick[]).filter((x) => x.p > 1000); // sanitize zero-glitches
-}
-/** find a real window: dip in [dipMin,dipMax] from start, then rise ≥ riseMin
- *  from the low — validated so the P/L path crosses the BE band ($0.30..$0.50)
- *  gradually (BE must fire BEFORE the $-target close) */
-function scanDipRise(ticks: Tick[], dipMin: number, dipMax: number, riseMin: number): { from: number; to: number } | null {
-  for (let i = 0; i + 800 < ticks.length; i += 25) {
-    const win = ticks.slice(i, i + 800);
-    let lo = Infinity, jLo = 0;
-    win.forEach((x, j) => { if (x.p < lo) { lo = x.p; jLo = j; } });
-    const dip = win[0].p - lo;
-    if (dip < dipMin || dip > dipMax) continue;
-    let hi = -Infinity, jHi = jLo;
-    for (let j = jLo; j < win.length; j++) if (win[j].p > hi) { hi = win[j].p; jHi = j; }
-    if (hi - lo < riseMin || jHi - jLo < 40) continue;
-    // BE-band validator: ≥ 2 ticks with pnl in [0.31, 0.49] (entry = p0+0.10,
-    // mark = p−0.10 → pnl = p − p0 − 0.20)
-    const p0 = win[0].p;
-    let band = 0;
-    for (let j = jLo; j <= jHi; j++) {
-      const pnl = win[j].p - p0 - 0.20;
-      if (pnl >= 0.31 && pnl <= 0.49) band++;
-    }
-    if (band < 2) continue;
-    return { from: i, to: i + jHi };
-  }
-  return null;
-}
-/** find a real window: rise in [riseMin,riseMax] from start (BE fires, the
- *  $-target does NOT), then fall ≥ fallMin from the high */
-function scanRiseFall(ticks: Tick[], riseMin: number, riseMax: number, fallMin: number): { from: number; to: number } | null {
-  for (let i = 0; i + 1200 < ticks.length; i += 25) {
-    const win = ticks.slice(i, i + 1200);
-    const p0 = win[0].p;
-    let hi = -Infinity, jHi = 0;
-    win.forEach((x, j) => { if (x.p > hi) { hi = x.p; jHi = j; } });
-    const rise = hi - p0;
-    if (rise < riseMin || rise > riseMax || jHi < 40) continue;
-    let lo = Infinity, jLo = jHi;
-    for (let j = jHi; j < win.length; j++) if (win[j].p < lo) { lo = win[j].p; jLo = j; }
-    if (hi - lo < fallMin || jLo - jHi < 40) continue;
-    // BE-band validator on the way up
-    let band = 0;
-    for (let j = 0; j <= jHi; j++) {
-      const pnl = win[j].p - p0 - 0.20;
-      if (pnl >= 0.31 && pnl <= 0.49) band++;
-    }
-    if (band < 2) continue;
-    return { from: i, to: i + jLo };
-  }
-  return null;
-}
-
-// ── scenario runner ────────────────────────────────────────────────────────
 let pass = 0, fail = 0;
 function check(name: string, ok: boolean, detail: string) {
   console.log(`  ${ok ? "✅ PASS" : "❌ FAIL"}  ${name}${detail ? ` — ${detail}` : ""}`);
@@ -198,7 +161,7 @@ async function runScenario(
   t.journal = []; t.brain = []; t.mem = []; t.lessons = [];
   t.edges.clear(); t.settled.clear(); t.positions.clear();
   t.today = { trades: 0, wins: 0, losses: 0, pnl: 0, winPct: 0 };
-  trader.updateConfig({ enabled: false, tpUsd: 0.5, beUsd: 0 }); // AUTO BE = 60% × $0.50 = $0.30
+  trader.updateConfig({ enabled: false }); // v13 defaults: conservative R-mode (tpUsd 0, 1.6R TP, 0.8R BE, 1.1R trail)
   const entry = path[0].p + (inject.side === "buy" ? HALF_SPREAD : -HALF_SPREAD);
   const ticket = 900001;
   const pos: TraderPosition = {
@@ -231,29 +194,29 @@ async function runScenario(
 }
 
 async function main() {
-  console.log("══ BACKTEST 2: the exit engine over REAL XAUUSDm ticks ══");
-  const ticks = loadTicks();
-  console.log(`loaded ${ticks.length} sanitized ticks (real recording)`);
+  console.log("══ BACKTEST 2 (v13): the R-mode exit engine — deterministic paths ══");
+  console.log("   profile: conservative · tpR 1.6 · beR 0.8 · trailR 1.1 · beLock $0.05");
 
-  // ── S1a: SYNTHETIC steady rally → the $0.50 rule banks the win at TP ──
-  // (deterministic: wiggle ±0.03 « trail-give 0.15 → the trail can never fire
-  //  first; the monitor's `pnl ≥ tpUsd` close is the only possible exit)
-  const p1a: Tick[] = Array.from({ length: 140 }, (_, i) => ({
-    t: Date.now() - 140_000 + i * 1000,
-    p: 4134.00 + (i / 139) * 1.6 + (i % 2 === 0 ? 0.03 : -0.03),
+  // ── S1a: steady rally → the broker-side TP banks the win at 1.6R ──
+  // (deterministic: wiggle ±0.03 « trailGive 0.55 → the trail can never fire
+  //  first; the 1.6R broker TP is the only possible exit)
+  //  geometry: slDist = 1.00 → BE at +$0.80 (0.8R), TP at +$1.60 (1.6R)
+  const p1a: Tick[] = Array.from({ length: 150 }, (_, i) => ({
+    t: Date.now() - 150_000 + i * 1000,
+    p: 4134.00 + (i / 149) * 1.95 + (i % 2 === 0 ? 0.03 : -0.03),
   }));
   const entry1a = p1a[0].p + HALF_SPREAD;
   await runScenario(
-    "S1a) $0.50 target — steady rally, the brain banks +$0.50 at TP",
+    "S1a) R-multiple target — steady rally, the broker TP banks +1.6R",
     p1a,
-    { symbol: "XAUUSDm", side: "buy", lots: 0.01, sl: entry1a - 2.0, tp: entry1a + 1.2 },
+    { symbol: "XAUUSDm", side: "buy", lots: 0.01, sl: entry1a - 1.0, tp: entry1a + 1.6 },
     ({ journal, fills, positions }) => {
       const be = journal.find((j) => j.reason.includes("SL → breakeven"));
-      check("AUTO-BREAKEVEN fired on the way up (≥$0.30 profit)", !!be, be?.reason ?? "no BE journal");
+      check("AUTO-BREAKEVEN fired on the way up (≥0.8R)", !!be, be?.reason ?? "no BE journal");
       const close = journal.find((j) => j.action === "close");
-      check("position CLOSED (target reached)", !!close && positions.size === 0, close ? `${close.exitKind} ${close.pnl?.toFixed(2)}` : "still open");
+      check("position CLOSED (1.6R target reached)", !!close && positions.size === 0, close ? `${close.exitKind} ${close.pnl?.toFixed(2)}` : "still open");
       check("exit classified as TP", close?.exitKind === "TP", `exitKind=${close?.exitKind}`);
-      check("banked ≥ $0.45 (the $0.50 rule)", (close?.pnl ?? 0) >= 0.45, `pnl=$${close?.pnl?.toFixed(2)}`);
+      check("banked ≥ $1.40 (the 1.6R rule, 0.01-lot gold)", (close?.pnl ?? 0) >= 1.4, `pnl=$${close?.pnl?.toFixed(2)}`);
       const slMoves = fills.filter((f) => f.kind === "modify").map((f) => f.sl ?? 0);
       const monotonic = slMoves.every((sl, i) => i === 0 || sl >= slMoves[i - 1] - 1e-9);
       check(`SL only ever TIGHTENED (${slMoves.length} moves)`, monotonic, slMoves.map((x) => x.toFixed(2)).slice(0, 6).join(" → "));
@@ -261,58 +224,53 @@ async function main() {
     },
   );
 
-  // ── S1b: REAL dip→rally window — v11 contract: TP if it reaches $0.50,
-  //         else the BE-trail banks a positive exit. A round-trip to a loss
-  //         is impossible in both branches. (Recording-dependent window —
-  //         the assertions describe the DESIGNED behavior, not one path.) ──
-  const w1 = scanDipRise(ticks, 0.18, 0.80, 0.95);
-  if (!w1) { console.log("❌ no dip-rise window found"); process.exit(1); }
-  const p1 = ticks.slice(w1.from, w1.to + 1);
-  const entry1 = p1[0].p + HALF_SPREAD;
+  // ── S1b: dip → rally to +0.95R (BE fires at 0.8R, trail NOT armed at 1.1R)
+  //         → full round-trip DOWN through entry → the BE lock (+$0.05) is
+  //         the ONLY thing standing between the winner and a loss ──
+  const p1b: Tick[] = [
+    ...Array.from({ length: 30 }, (_, i) => ({ t: Date.now() - 170_000 + i * 1000, p: 4134.00 - (i / 29) * 0.30 })),          // dip −0.30
+    ...Array.from({ length: 50 }, (_, i) => ({ t: Date.now() - 140_000 + i * 1000, p: 4133.70 + (i / 49) * 1.40 })),          // rally to +1.10 above p0 (peak pnlR 0.90)
+    ...Array.from({ length: 60 }, (_, i) => ({ t: Date.now() - 90_000 + i * 1000, p: 4135.10 - (i / 59) * 2.60 })),           // round-trip to −1.50
+  ];
+  const entry1b = p1b[0].p + HALF_SPREAD;
   await runScenario(
-    "S1b) real dip→rally — TP at $0.50 OR the profit-lock trail banks positive",
-    p1,
-    { symbol: "XAUUSDm", side: "buy", lots: 0.01, sl: entry1 - 2.0, tp: entry1 + 1.2 },
+    "S1b) rally→round-trip — the BE lock means a winner can NEVER become a loss",
+    p1b,
+    { symbol: "XAUUSDm", side: "buy", lots: 0.01, sl: entry1b - 1.0, tp: entry1b + 5.0 },
     ({ journal, fills, positions }) => {
       const be = journal.find((j) => j.reason.includes("SL → breakeven"));
-      check("AUTO-BREAKEVEN fired on the way up (≥$0.30 profit)", !!be, be?.reason ?? "no BE journal");
+      check("AUTO-BREAKEVEN fired on the way up (peak 0.95R ≥ 0.8R)", !!be, be?.reason ?? "no BE journal");
       const close = journal.find((j) => j.action === "close");
-      check("position settled", !!close && positions.size === 0, close ? `${close.exitKind} ${close.pnl?.toFixed(2)}` : "still open");
-      const tpBanked = close?.exitKind === "TP" && (close.pnl ?? 0) >= 0.45;
-      const trailBanked = close?.exitKind === "SL" && (close.pnl ?? 0) >= 0.05;
-      check(
-        "TP banked ≥$0.45 OR trail-banked positive (the winner never round-trips)",
-        tpBanked || trailBanked,
-        `exitKind=${close?.exitKind} pnl=$${close?.pnl?.toFixed(2)}`,
-      );
-      check("final P/L ≥ $0 (BE lock did its job)", (close?.pnl ?? -1) >= 0, `pnl=$${close?.pnl?.toFixed(2)}`);
+      check("position settled (round-trip closed by the BE lock)", !!close && positions.size === 0, close ? `${close.exitKind} ${close.pnl?.toFixed(2)}` : "still open");
+      check("exit classified as SL (the protected stop)", close?.exitKind === "SL", `exitKind=${close?.exitKind}`);
+      check("final P/L ≥ $0 — the winner did NOT round-trip into a loss", (close?.pnl ?? -1) >= 0, `pnl=$${close?.pnl?.toFixed(2)}`);
       const slMoves = fills.filter((f) => f.kind === "modify").map((f) => f.sl ?? 0);
       const monotonic = slMoves.every((sl, i) => i === 0 || sl >= slMoves[i - 1] - 1e-9);
       check(`SL only ever TIGHTENED (${slMoves.length} moves)`, monotonic, slMoves.map((x) => x.toFixed(2)).slice(0, 6).join(" → "));
     },
   );
 
-  // ── S2: rally (BE fires, TP NOT reached) → hard reversal → SL protects ──
-  const w2 = scanRiseFall(ticks, 0.52, 0.68, 1.35);
-  if (!w2) { console.log("❌ no rise-fall window found"); process.exit(1); }
-  const p2 = ticks.slice(w2.from, w2.to + 1);
+  // ── S2: rally to +1.15R (BE at 0.8R AND trail arms at 1.1R) → hard
+  //         reversal → the trailed stop protects the profit ──
+  const p2: Tick[] = [
+    ...Array.from({ length: 70 }, (_, i) => ({ t: Date.now() - 130_000 + i * 1000, p: 4134.00 + (i / 69) * 1.35 })),           // rally +1.35 (peak pnlR ≈ 1.15)
+    ...Array.from({ length: 60 }, (_, i) => ({ t: Date.now() - 60_000 + i * 1000, p: 4135.35 - (i / 59) * 3.00 })),           // hard reversal to −1.65
+  ];
   const entry2 = p2[0].p + HALF_SPREAD;
-  {
-    const peak = Math.max(...p2.map((x) => x.p));
-    const trough = Math.min(...p2.map((x) => x.p));
-    console.log(`  [S2 window] from=${w2.from} to=${w2.to} p0=${p2[0].p.toFixed(2)} peak=${peak.toFixed(2)} (rise ${(peak - p2[0].p).toFixed(2)}) trough=${trough.toFixed(2)} → max pnl ≈ ${(peak - p2[0].p - 0.20).toFixed(2)}`);
-  }
   await runScenario(
-    "S2) reversal after breakeven — the winner can never round-trip to a loss",
+    "S2) reversal after breakeven+trail — the winner can never round-trip to a loss",
     p2,
-    { symbol: "XAUUSDm", side: "buy", lots: 0.01, sl: entry2 - 3.0, tp: entry2 + 5.0 },
-    ({ journal, positions }) => {
+    { symbol: "XAUUSDm", side: "buy", lots: 0.01, sl: entry2 - 1.0, tp: entry2 + 5.0 },
+    ({ journal, fills, positions }) => {
       const be = journal.find((j) => j.reason.includes("SL → breakeven"));
       check("AUTO-BREAKEVEN fired during the rally", !!be, be?.reason ?? "no BE journal");
       const close = journal.find((j) => j.action === "close");
       check("position settled after the reversal", !!close && positions.size === 0, close ? `${close.exitKind} ${close.pnl?.toFixed(2)}` : "still open");
       check("exit classified as SL (the protected stop)", close?.exitKind === "SL", `exitKind=${close?.exitKind}`);
-      check("final P/L ≥ $0 — the BE lock did its job", (close?.pnl ?? -1) >= 0, `pnl=$${close?.pnl?.toFixed(2)}`);
+      check("final P/L ≥ $0 — BE/trail lock did its job", (close?.pnl ?? -1) >= 0, `pnl=$${close?.pnl?.toFixed(2)}`);
+      const slMoves = fills.filter((f) => f.kind === "modify").map((f) => f.sl ?? 0);
+      const aboveEntry = slMoves.some((sl) => sl > entry2);
+      check(`SL moved ABOVE entry (${slMoves.length} moves — BE and/or trail)`, aboveEntry, slMoves.map((x) => x.toFixed(2)).slice(0, 6).join(" → "));
     },
   );
 

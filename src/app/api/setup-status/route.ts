@@ -64,7 +64,11 @@ export async function GET() {
       mt5PasswordSet: !!process.env.MT5_PASSWORD,
       mt5Server: process.env.MT5_SERVER ?? "Exness-MT5Trial6 (default)",
       loginMasked: masked,
-      mode: process.env.MT5_LOGIN && process.env.MT5_PASSWORD ? "LIVE-ready" : "SIM (credentials missing)",
+      // v13: MT5 credentials can now be set IN-APP (Settings → MT5 Account,
+      // AES-encrypted on disk) — env vars are just one of two ways in.
+      mode: process.env.MT5_LOGIN && process.env.MT5_PASSWORD
+        ? "LIVE-ready (env credentials)"
+        : "MT5 not connected — set it up in Settings → MT5 Account (or set MT5_LOGIN/MT5_PASSWORD env)",
     },
     // v12.1: database presence as a BOOLEAN + volume hint — the actual
     // DATABASE_URL connection string never leaves the process.

@@ -14,7 +14,7 @@ import { useState } from "react";
 import type { AnalysisResponse, SignalPayload, UserDrawing } from "@/lib/market/types";
 import type { Layers, ToolId } from "@/hooks/useTerminal";
 import { useTerminal } from "@/hooks/useTerminal";
-import { useSymbolList } from "@/hooks/useFeed";
+import { useStatus, useSymbolList } from "@/hooks/useFeed";
 import { useI18n } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
 import TradingChart from "./TradingChart";
@@ -37,7 +37,7 @@ import {
   PopoverTrigger,
 } from "@/components/ui/popover";
 import { AnalysisPanel } from "./AnalysisPanel";
-import { PencilRuler, X, Sparkles } from "lucide-react";
+import { PencilRuler, X, Sparkles, Unplug, Settings } from "lucide-react";
 
 interface Props {
   analysis: AnalysisResponse | null;
@@ -58,14 +58,16 @@ export function ChartWorkspace({
   onClearDrawings,
   mobile = false,
 }: Props) {
-  const { symbol, timeframe, chartView, tool, setTool, layers, selectedSignalId } = useTerminal();
+  const { symbol, timeframe, chartView, tool, setTool, setMainTab, layers, selectedSignalId } = useTerminal();
   const symbols = useSymbolList();
+  const status = useStatus();
   const { t } = useI18n();
   const digits = symbols.find((s) => s.name === symbol)?.digits ?? 2;
   const [sheetOpen, setSheetOpen] = useState(false);
 
   const signals = ((analysis as any)?.signals ?? []) as SignalPayload[];
   const isPrice = chartView === "price";
+  const offline = status?.source === "disconnected" && !(status?.connected ?? false);
 
   const chart = !isPrice ? (
     chartView === "flow" ? (
@@ -178,7 +180,30 @@ export function ChartWorkspace({
             <DrawingToolbar variant="vertical" onClearAll={onClearDrawings} />
           </div>
         )}
-        <div className="relative min-w-0 flex-1">{chart}</div>
+        <div className="relative min-w-0 flex-1">
+          {chart}
+          {/* offline banner — MT5 not connected: no market data. Non-blocking:
+              the chart stays visible/usable behind it, only the card eats clicks */}
+          {offline && (
+            <div className="pointer-events-none absolute inset-0 z-20 flex items-center justify-center p-4">
+              <div className="pointer-events-auto flex max-w-[320px] flex-col items-center gap-2 rounded-lg border border-red-500/40 bg-card/95 px-5 py-4 text-center shadow-lg backdrop-blur-sm">
+                <Unplug className="h-4 w-4 text-red-500" aria-hidden="true" />
+                <div className="text-[11px] font-semibold leading-relaxed text-foreground">
+                  {t("chartNoData")}
+                </div>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-7 gap-1.5 border-red-500/40 text-[10px] font-bold text-red-500 hover:bg-red-500/10 hover:text-red-500"
+                  onClick={() => setMainTab("settings")}
+                >
+                  <Settings className="h-3.5 w-3.5" aria-hidden="true" />
+                  {t("openSettings")}
+                </Button>
+              </div>
+            </div>
+          )}
+        </div>
       </div>
     </div>
   );

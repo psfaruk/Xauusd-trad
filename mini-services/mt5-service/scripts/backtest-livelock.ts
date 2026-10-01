@@ -42,6 +42,7 @@ class MockHost implements TraderHost {
   getOrCreateTracker(): never { throw new Error("no trackers"); }
   async marketRead() { return null; }
   recycleSession() { this.recycleCalls++; }
+  brokerNowSec() { return Math.floor(Date.now() / 1000); }
   async pendingOrder(): Promise<never> { throw new Error("no pendings in backtest"); }
   async cancelOrder(): Promise<never> { throw new Error("no pendings in backtest"); }
   async account(): Promise<AccountInfo> {

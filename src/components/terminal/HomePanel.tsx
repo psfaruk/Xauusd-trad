@@ -48,8 +48,10 @@ export function HomePanel({ analysis }: { analysis: AnalysisResponse | null }) {
 
   const connected = status?.connected ?? false;
   const source = status?.source ?? "mt5";
+  const offline = source === "disconnected" && !connected;
   const today = trader?.today;
   const hasTrade = !!today && (today.wins + today.losses) > 0;
+  const mem = trader?.memory;
 
   return (
     <div className="slim-scroll h-full overflow-y-auto">
@@ -64,19 +66,19 @@ export function HomePanel({ analysis }: { analysis: AnalysisResponse | null }) {
             <span
               className={cn(
                 "flex items-center gap-1.5 rounded border px-1.5 py-0.5 font-mono text-[9px] font-bold tracking-wider",
-                source === "sim"
-                  ? "border-amber-500/40 bg-amber-500/10 text-amber-500"
+                offline
+                  ? "border-red-500/40 bg-red-500/10 text-red-500"
                   : connected
                     ? "border-up/40 bg-up/10 text-up"
-                    : "border-border bg-muted/50 text-muted-foreground",
+                    : "border-amber-500/40 bg-amber-500/10 text-amber-500",
               )}
             >
-              {connected || source === "sim" ? (
+              {connected ? (
                 <ShieldCheck className="h-3 w-3" />
               ) : (
                 <ShieldAlert className="h-3 w-3" />
               )}
-              {source === "sim" ? t("simulated") : connected ? t("live") : t("connecting")}
+              {connected ? t("live") : offline ? t("mt5Offline") : t("connecting")}
             </span>
           </CardHeader>
           <CardContent className="grid grid-cols-2 gap-3 py-3 sm:grid-cols-4">
@@ -154,12 +156,12 @@ export function HomePanel({ analysis }: { analysis: AnalysisResponse | null }) {
               <div>
                 <div className="text-[10px] uppercase tracking-wider text-muted-foreground">{t("lifetimeWin")}</div>
                 <div className="tnum font-mono text-lg font-bold">
-                  {trader?.memory.tradesAnalyzed
-                    ? `${Math.round(trader.memory.winRate * 100)}%`
+                  {mem?.tradesAnalyzed
+                    ? `${Math.round(mem.winRate * 100)}%`
                     : "—"}
                 </div>
                 <div className="text-[10px] text-muted-foreground">
-                  {trader?.memory.tradesAnalyzed ?? 0} {t("learnedTrades")}
+                  {mem?.tradesAnalyzed ?? 0} {t("learnedTrades")}
                 </div>
               </div>
             </div>

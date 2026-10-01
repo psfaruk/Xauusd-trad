@@ -70,7 +70,9 @@ export interface FlowPayload {
 
 export interface FeedStatus {
   connected: boolean;
-  source: "mt5" | "sim";
+  /** v13: the simulator is gone — when MT5 is not connected the whole app
+   *  shows a disconnected/offline state (no fake prices ever). */
+  source: "mt5" | "disconnected";
   server: string;
   account: { balance: number; equity: number; currency: string } | null;
   latencyMs: number | null;
