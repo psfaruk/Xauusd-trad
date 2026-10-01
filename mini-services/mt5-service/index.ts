@@ -34,20 +34,41 @@ import { buildMarketRead } from "./src/market-read";
 import { Server } from "socket.io";
 import { Mt5Manager } from "./src/manager";
 import { AiTrader, type TraderConfig } from "./src/trader";
+import { authorizeTradingReq, authorizeHandshake, rateLimit, clientIp } from "./src/auth";
 
 const IO_PORT = 3030;
 const REST_PORT = 3031;
 const manager = new Mt5Manager();
 
 // ═════════════════════ REST (:3031) ═════════════════════
+// v12 SECURITY: no more Access-Control-Allow-Origin:* — the app talks to this
+// service SAME-ORIGIN through the gateway (/?XTransformPort=3031), so cross-
+// origin browser calls are now refused by the browser itself.
 function json(res: any, code: number, body: unknown) {
   const s = JSON.stringify(body);
   res.writeHead(code, {
     "Content-Type": "application/json",
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET,OPTIONS",
+    "Cache-Control": "no-store",
   });
   res.end(s);
+}
+
+/** v12: trading + private endpoints require the shared key (server proxy) or
+ *  the owner's session cookie; POSTs are rate-limited per IP (brute-force and
+ *  spam armor — the audit's Critical #1). */
+function guardTrading(req: any, res: any): boolean {
+  const rl = rateLimit(`trade:${clientIp(req)}`, 30, 60_000);
+  if (!rl.ok) {
+    res.writeHead(429, { "Content-Type": "application/json", "Retry-After": String(rl.retryAfter) });
+    res.end(JSON.stringify({ error: `rate limit — retry in ${rl.retryAfter}s` }));
+    return false;
+  }
+  const auth = authorizeTradingReq(req);
+  if (!auth.ok) {
+    json(res, 401, { error: "unauthorized — trading API is locked (login or server key required)" });
+    return false;
+  }
+  return true;
 }
 
 const TF_SEC: Record<string, number> = {
@@ -60,11 +81,14 @@ const restServer = createServer((req, res) => {
   try {
     if (req.method === "OPTIONS") return json(res, 204, {});
 
-    // ── AI trader (auto-trading brain) ──
+    // ── AI trader (auto-trading brain) — PRIVATE (v12: full state = positions,
+    //    tickets, journal; the audit's Critical #3 leak) ──
     if (url.pathname === "/api/trader") {
+      if (!guardTrading(req, res)) return;
       return json(res, 200, trader.state());
     }
     if (req.method === "POST" && url.pathname === "/api/trader/config") {
+      if (!guardTrading(req, res)) return;
       return readBody(req, res, (body) => {
         try {
           const patch = body as Partial<TraderConfig>;
@@ -76,6 +100,7 @@ const restServer = createServer((req, res) => {
       });
     }
     if (req.method === "POST" && url.pathname === "/api/trader/close") {
+      if (!guardTrading(req, res)) return;
       return readBody(req, res, async (body) => {
         const ticket = Number((body as any)?.ticket);
         if (!Number.isFinite(ticket) || ticket <= 0) return json(res, 400, { error: "ticket required" });
@@ -87,6 +112,7 @@ const restServer = createServer((req, res) => {
     //    manual/adopted) — {ticket, sl?, tp?} sets the levels, {ticket, be:true}
     //    moves the SL to entry (+small lock) in one click ──
     if (req.method === "POST" && url.pathname === "/api/trader/modify") {
+      if (!guardTrading(req, res)) return;
       return readBody(req, res, async (body) => {
         const b = body as any;
         const ticket = Number(b?.ticket);
@@ -103,6 +129,7 @@ const restServer = createServer((req, res) => {
       });
     }
     if (req.method === "POST" && url.pathname === "/api/trader/close-all") {
+      if (!guardTrading(req, res)) return;
       return readBody(req, res, async () => {
         const r = await trader.closeAll();
         return json(res, 200, r);
@@ -110,6 +137,7 @@ const restServer = createServer((req, res) => {
     }
     // ── v11: app→MT5 manual trading — market order, pending place/cancel ──
     if (req.method === "POST" && url.pathname === "/api/trader/order") {
+      if (!guardTrading(req, res)) return;
       return readBody(req, res, async (body) => {
         const b = body as any;
         const symbol = String(b?.symbol ?? "");
@@ -126,6 +154,7 @@ const restServer = createServer((req, res) => {
       });
     }
     if (req.method === "POST" && url.pathname === "/api/trader/pending") {
+      if (!guardTrading(req, res)) return;
       return readBody(req, res, async (body) => {
         const b = body as any;
         const symbol = String(b?.symbol ?? "");
@@ -143,6 +172,7 @@ const restServer = createServer((req, res) => {
       });
     }
     if (req.method === "POST" && url.pathname === "/api/trader/cancel-pending") {
+      if (!guardTrading(req, res)) return;
       return readBody(req, res, async (body) => {
         const ticket = Number((body as any)?.ticket);
         if (!Number.isFinite(ticket) || ticket <= 0) return json(res, 400, { error: "ticket required" });
@@ -150,8 +180,10 @@ const restServer = createServer((req, res) => {
         return json(res, r.ok ? 200 : 400, r);
       });
     }
-    // v11: closed-trades history (broker deals — brain AND manual)
+    // v11: closed-trades history (broker deals — brain AND manual) — PRIVATE
+    // (v12: real money P/L history must not be public)
     if (url.pathname === "/api/history") {
+      if (!guardTrading(req, res)) return;
       const hours = Math.min(72, Math.max(1, Number(url.searchParams.get("hours")) || 24));
       return json(res, 200, { hours, history: trader.state().recentHistory });
     }
@@ -163,11 +195,15 @@ const restServer = createServer((req, res) => {
       });
     }
     if (url.pathname === "/api/status") {
+      // v12: account numbers are PRIVATE — anonymous callers get connection
+      // health only (the owner's browser carries the session cookie and sees
+      // balance/equity; the audit's Critical #3)
+      const priv = authorizeTradingReq(req).ok;
       return json(res, 200, {
         connected: manager.connected,
         source: manager.source,
         server: manager.serverName,
-        account: manager.account
+        account: priv && manager.account
           ? {
               login: manager.login,
               balance: manager.account.balance,
@@ -379,7 +415,9 @@ const ioServer = createServer();
 const io = new Server(ioServer, {
   // DO NOT change the path — the sandbox gateway routes by it
   path: "/",
-  cors: { origin: "*", methods: ["GET", "POST"] },
+  // v12 SECURITY: no cross-origin sockets — the app connects SAME-ORIGIN via
+  // the gateway; a foreign origin now gets no CORS headers → browser blocks
+  cors: { origin: false, methods: ["GET", "POST"] },
   pingTimeout: 60000,
   pingInterval: 25000,
 });
@@ -413,6 +451,7 @@ const trader = new AiTrader({
   positions: () => manager.traderPositions(),
   pendingOrder: (s, orderType, lots, price, opts) => manager.traderPendingOrder(s, orderType, lots, price, opts),
   cancelOrder: (s, orderType, lots, price, ticket, opts) => manager.traderCancelOrder(s, orderType, lots, price, ticket, opts),
+  brokerNowSec: () => manager.nowSec() + manager.offsetSec,
   marketOrderAt: (s, side, lots, price, opts) => manager.traderMarketOrder(s, side, lots, price, opts),
   closePosition: (s, side, lots, price, ticket, opts) => manager.traderClose(s, side, lots, price, ticket, opts),
   modifyPosition: (s, side, lots, price, ticket, sl, tp, opts) => manager.traderModify(s, side, lots, price, ticket, sl, tp, opts),
@@ -422,10 +461,27 @@ trader.onState((s) => { try { io.to("trader").emit("trader", s); } catch {} });
 
 manager.onTick = (t) => { try { io.emit("tick", t); } catch { /* never die on a client error */ } };
 manager.onBar = (e) => { try { io.to(`${e.symbol}|${e.tf}`).emit("bar", e); } catch {} };
-manager.onStatus = (s) => { try { io.emit("status", s); } catch {} };
+// v12: the periodic status broadcast is PRIVACY-AWARE — anonymous sockets get
+// connection health without the account, the owner's sockets (session cookie
+// in the handshake) see balance/equity too.
+const privSockets = new Set<string>();
+manager.onStatus = (s) => {
+  try {
+    const pub = { ...s, account: null };
+    for (const [, sk] of io.sockets.sockets) {
+      try { sk.emit("status", privSockets.has(sk.id) ? s : pub); } catch {}
+    }
+  } catch {}
+};
 manager.onFlow = (p) => { try { io.to(`flow|${p.s}|${p.tf}`).emit("flow", p); } catch {} };
 
 io.on("connection", (socket) => {
+  // v12: is this socket the LOGGED-IN OWNER? (session cookie rides the
+  // same-origin handshake). Anonymous sockets still get market data, but
+  // account numbers and the trading brain stay private.
+  const socketPriv = authorizeHandshake(socket.handshake.headers);
+  if (socketPriv) privSockets.add(socket.id);
+
   // per-socket held rooms — makes sub/flowsub IDEMPOTENT (a client that
   // re-emits after reconnect, or StrictMode double-mounts, must not inflate
   // the server refcounts, which previously leaked trackers forever)
@@ -436,7 +492,7 @@ io.on("connection", (socket) => {
     connected: manager.connected,
     source: manager.source,
     server: manager.serverName,
-    account: manager.account
+    account: socketPriv && manager.account
       ? {
           balance: manager.account.balance,
           equity: manager.account.equity,
@@ -449,8 +505,13 @@ io.on("connection", (socket) => {
   });
   socket.emit("snapshot", { source: manager.source, quotes: manager.symbolList() });
 
-  // ── AI trader state stream ──
+  // ── AI trader state stream — OWNER ONLY (v12: positions/journal/tickets
+  //    are private; anonymous sockets are refused the room) ──
   socket.on("tradersub", () => {
+    if (!socketPriv) {
+      socket.emit("trader", { locked: true } as any);
+      return;
+    }
     socket.join("trader");
     try { socket.emit("trader", trader.state()); } catch {}
   });
@@ -504,6 +565,7 @@ io.on("connection", (socket) => {
 
   // socket disconnects → release every room it held (exactly once each)
   socket.on("disconnect", () => {
+    privSockets.delete(socket.id);
     for (const room of socket.data.heldBars ?? []) {
       const [symbol, tf] = room.split("|");
       if (symbol && tf) manager.removeSubscription(symbol, tf);
@@ -530,12 +592,16 @@ for (const srv of [ioServer, restServer]) {
   });
 }
 let restUp = false;
-ioServer.listen(IO_PORT, () => {
-  console.log(`[mt5-service] socket.io on :${IO_PORT} (path "/")`);
+// v12: bind BOTH services to localhost only — the gateway (Caddy) is the
+// single public door; nothing else may reach these ports even if the
+// container exposes them (the audit's "listen() → 0.0.0.0" finding).
+const BIND_HOST = "127.0.0.1";
+ioServer.listen(IO_PORT, BIND_HOST, () => {
+  console.log(`[mt5-service] socket.io on ${BIND_HOST}:${IO_PORT} (path "/")`);
 });
-restServer.listen(REST_PORT, () => {
+restServer.listen(REST_PORT, BIND_HOST, () => {
   restUp = true;
-  console.log(`[mt5-service] REST on :${REST_PORT}`);
+  console.log(`[mt5-service] REST on ${BIND_HOST}:${REST_PORT}`);
   manager.start();
   trader.start();
 });

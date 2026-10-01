@@ -9,6 +9,6 @@
   },
   "dependencies": {
     "socket.io": "^4.8.1",
-    "z-ai-web-dev-sdk": "latest"
+    "z-ai-web-dev-sdk": "0.0.18"
   }
 }

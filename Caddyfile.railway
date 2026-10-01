@@ -1,10 +1,18 @@
-:{$PORT} {
-	@transform_port_query {
-		query XTransformPort=*
-	}
+{$PORT} {
+	# ══════════════════════════════════════════════════════════════════
+	# v12 SECURITY: the XTransformPort reverse-proxy is now a WHITELIST.
+	# The old config forwarded to localhost:{arbitrary port} — an open
+	# SSRF/port-scan proxy into the container. Only the two services the
+	# app actually needs may be reached through the public door:
+	#   3030  mt5-service socket.io   (live ticks / bars / flow)
+	#   3031  mt5-service REST        (candles / quotes / trader API)
+	# Everything else (SQLite, internal tooling, anything that ever binds a
+	# port later) is unreachable from the internet.
+	# ══════════════════════════════════════════════════════════════════
 
-	handle @transform_port_query {
-		reverse_proxy localhost:{query.XTransformPort} {
+	@io_port query XTransformPort=3030
+	handle @io_port {
+		reverse_proxy localhost:3030 {
 			header_up Host {host}
 			header_up X-Forwarded-For {remote_host}
 			header_up X-Forwarded-Proto {scheme}
@@ -12,6 +20,17 @@
 		}
 	}
 
+	@rest_port query XTransformPort=3031
+	handle @rest_port {
+		reverse_proxy localhost:3031 {
+			header_up Host {host}
+			header_up X-Forwarded-For {remote_host}
+			header_up X-Forwarded-Proto {scheme}
+			header_up X-Real-IP {remote_host}
+		}
+	}
+
+	# any OTHER XTransformPort value (or none) → the Next.js app only
 	handle {
 		reverse_proxy localhost:3000 {
 			header_up Host {host}

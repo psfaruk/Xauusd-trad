@@ -266,6 +266,11 @@ export interface TraderHost {
   pendingOrder(symbol: string, orderType: 2 | 3 | 4 | 5, lots: number, price: number, opts: { sl?: number; tp?: number; digits?: number; comment?: string }): Promise<TradeResult>;
   /** v11: cancel a pending order from the app */
   cancelOrder(symbol: string, orderType: number, lots: number, price: number, ticket: number, opts: { digits?: number }): Promise<TradeResult>;
+  /** v12: BROKER clock (server now + broker offset) — the candle-age gate and
+   *  forming-bar flags must follow the broker's minute, not the container's
+   *  (a shifted container clock phased entries into the wrong part of the
+   *  M1 bar — the audit's High #10) */
+  brokerNowSec(): number;
   marketOrderAt(symbol: string, side: TradeSide, lots: number, price: number, opts: { sl: number; tp: number; digits: number; comment: string }): Promise<TradeResult>;
   closePosition(symbol: string, side: TradeSide, lots: number, price: number, ticket: number, opts: { digits: number; comment?: string }): Promise<TradeResult>;
   modifyPosition(symbol: string, side: TradeSide, lots: number, price: number, ticket: number, sl: number, tp: number, opts: { digits: number }): Promise<TradeResult>;
@@ -288,13 +293,13 @@ interface RiskProfile {
 }
 
 const RISK: Record<RiskMode, RiskProfile> = {
-  // ── v6 retune for $-target scalping: TP banks at +$tpUsd (default $0.50),
-  //    so the managed exits must NOT strangle winners early (the user's
-  //    complaint: tiny-loss closes, profit never taken). flipStrength raised
-  //    hard (only a STRONG counter-flow cuts a losing trade), adverse cut
-  //    tightened so a managed loss stays smaller than several $-targets. ──
+  // ── v12 RETUNE (the R:R math audit): TP is R-MULTIPLE by default now —
+  //    $0.50-style scalps were structurally −EV (TP ≈ spread×2 while SL was
+  //    ATR-sized ⇒ R:R ≈ 1:6, needing 85-90% wins to break even). In R-mode
+  //    conservative targets 1.6R with a later breakeven (0.8R — the old 0.6R
+  //    BE let gold wicks stop out winners that had barely started). ──
   conservative: {
-    minStrength: 0.55, slAtrMult: 1.8, tpR: 1.3, breakevenR: 0.6, trailR: 1.0,
+    minStrength: 0.55, slAtrMult: 1.8, tpR: 1.6, breakevenR: 0.8, trailR: 1.1,
     trailGive: 0.55, flipStrength: 0.72, maxHoldMs: 10 * 60_000, maxAdverseR: 0.7,
     cooldownMs: 100_000,
   },
@@ -310,24 +315,39 @@ const RISK: Record<RiskMode, RiskProfile> = {
   },
 };
 
+// v12 SAFETY CAPS (the audit's "lot 100 / 500 positions / unlimited trades"
+// blow-up surface): these are HARD limits — updateConfig() can never exceed
+// them, so even a compromised UI cannot set a 100-lot order.
+const MAX_LOT = 1.0;              // 1.00 lots on gold ≈ $100/point — plenty for a $500 account
+const MAX_POSITIONS_PER_SYMBOL = 5;
+const MAX_DAILY_TRADES_CAP = 100;
+const MIN_TP_USD = 3;             // $-mode TP below this is inside spread noise (0.01-lot gold ≈ $3–5)
+
 const DEFAULT_SYMBOLS: SymbolRule[] = [
-  { symbol: "XAUUSDm", enabled: true, lots: 0.01, maxPositions: 2 },
-  { symbol: "BTCUSDm", enabled: true, lots: 0.01, maxPositions: 2 },
-  { symbol: "USTEC_x100m", enabled: true, lots: 0.01, maxPositions: 1 },
-  { symbol: "USOILm", enabled: true, lots: 0.01, maxPositions: 1 },
+  // v12 SAFE DEFAULTS (the audit's step-by-step): ONE symbol, ONE position,
+  //  0.01 lots. The other majors stay in the list (user can flip them on)
+  //  but arrive DISABLED — arming four markets with the same $-target was a
+  //  documented loss machine.
+  { symbol: "XAUUSDm", enabled: true, lots: 0.01, maxPositions: 1 },
+  { symbol: "BTCUSDm", enabled: false, lots: 0.01, maxPositions: 1 },
+  { symbol: "USTEC_x100m", enabled: false, lots: 0.01, maxPositions: 1 },
+  { symbol: "USOILm", enabled: false, lots: 0.01, maxPositions: 1 },
   { symbol: "EURUSDm", enabled: false, lots: 0.01, maxPositions: 1 },
   { symbol: "GBPUSDm", enabled: false, lots: 0.01, maxPositions: 1 },
 ];
 
 // ── agentic constants ──
-const STATE_VERSION = 8;              // v8: final honest repair — today's counters rebuilt from
-                                      // EPISODIC MEMORY (the brain's own trades only; memorize()
-                                      // never records adopted positions, so phantom/user settles
+const STATE_VERSION = 9;              // v9: R:R-audit safety migration — $-mode TP < $3 switched to
+                                      // R-multiple mode, lots/positions/daily caps clamped to the new
+                                      // hard limits (see MAX_LOT etc.). v8: final honest repair — today's
+                                      // counters rebuilt from EPISODIC MEMORY (the brain's own trades only;
+                                      // memorize() never records adopted positions, so phantom/user settles
                                       // can never reach it). v7 armor: zombie pre-check + silent
                                       // settles + no adopted restore (the 09:28–09:32 storm).
 const SPREAD_BUDGET = 3.5;            // SL ≥ spread × 3.5 (spread ≤ ~29% of SL by construction)
 const SL_ATR_CAP = 3.6;               // SL never wider than ATR × 3.6
-const GLOBAL_MAX_POSITIONS = 50;      // v10: 8→50 — per-pair caps are user-owned now
+const GLOBAL_MAX_POSITIONS = 10;       // v12: 50→10 — the audit: 50 concurrent positions on a $500
+                                       // account with 0.01-lot gold is not risk, it is a blow-up
 const MIN_LOT_SPLIT = 0.02;           // partial profit needs at least this many lots
 const EDGE_EMA_ALPHA = 0.18;          // win-rate EMA speed
 const ADAPT_MIN = 0.85, ADAPT_MAX = 1.25; // adaptive min-strength multiplier bounds
@@ -472,12 +492,14 @@ export class AiTrader {
     this.host = host;
     this.cfg = {
       enabled: false, // user must consciously arm it
-      riskMode: "balanced",
-      tpUsd: 0.5,     // v6: bank profit at +$0.50 (the user's rule)
-      beUsd: 0,       // v9: AUTO breakeven (60% of the $ target)
-      beLockUsd: 0.05, // v9: lock a nickel above entry when BE fires
-      dailyLossLimitPct: 5,
-      maxDailyTrades: 40,
+      riskMode: "conservative", // v12: was "balanced" — safe default after the R:R audit
+      tpUsd: 0,       // v12: R-MULTIPLE mode by default (was $0.50 — structurally −EV:
+                       // TP ≈ spread×2 vs ATR-sized SL ⇒ R:R ≈ 1:6). $-mode is still
+                       // available but must be ≥ $3 (MIN_TP_USD).
+      beUsd: 0,       // AUTO (60% of tpUsd in $-mode; breakevenR in R-mode)
+      beLockUsd: 0.05, // lock a nickel above entry when BE fires
+      dailyLossLimitPct: 3, // v12: 5→3 — the audit's daily-loss guard
+      maxDailyTrades: 12,  // v12: 40→12 — fewer, better trades (was a churn machine)
       symbols: DEFAULT_SYMBOLS.map((s) => ({ ...s })),
     };
     // HOT-RELOAD SAFETY: bun --hot re-evaluates this module inside the SAME
@@ -539,6 +561,47 @@ export class AiTrader {
         }
       }
       const vSaved = raw?.version ?? 1;
+      if (vSaved < 9) {
+        // v9 R:R-AUDIT SAFETY MIGRATION (runs AFTER all raw fields are loaded
+        // so the journalLog→saveState inside can never truncate persisted
+        // state): the old config carried loss-machine settings — $0.50 TP
+        // (inside spread noise), lot caps up to 100, unlimited daily trades.
+        // Clamp EVERYTHING to the v12 safe limits and say it out loud. Runs
+        // once; explicit user choices after this point are respected (within
+        // the hard caps).
+        const before = { tpUsd: this.cfg.tpUsd, riskMode: this.cfg.riskMode, maxDailyTrades: this.cfg.maxDailyTrades };
+        if (this.cfg.tpUsd > 0 && this.cfg.tpUsd < MIN_TP_USD) this.cfg.tpUsd = 0;
+        this.cfg.riskMode = "conservative";
+        this.cfg.dailyLossLimitPct = Math.max(1, Math.min(10, this.cfg.dailyLossLimitPct));
+        this.cfg.maxDailyTrades = Math.max(1, Math.min(MAX_DAILY_TRADES_CAP, this.cfg.maxDailyTrades || 12));
+        this.cfg.symbols = this.cfg.symbols.map((s) => ({
+          ...s,
+          lots: Math.max(0.01, Math.min(MAX_LOT, s.lots ?? 0.01)),
+          maxPositions: Math.max(1, Math.min(MAX_POSITIONS_PER_SYMBOL, s.maxPositions ?? 1)),
+        }));
+        this.journalLog({
+          action: "info", symbol: "",
+          reason: `brain v12 R:R-audit migration — $TP ${before.tpUsd}→${this.cfg.tpUsd} (R-mode), risk ${before.riskMode}→conservative, daily ${before.maxDailyTrades}→${this.cfg.maxDailyTrades}, lots≤${MAX_LOT}, pos≤${MAX_POSITIONS_PER_SYMBOL}`,
+        });
+        this.think("🧠 v12 — R:R অডিট মাইগ্রেশন: ছোট-$ টার্গেট বন্ধ, R-মাল্টিপল মোড, লট/পজিশন/ডেইলি ক্যাপ সীমাবদ্ধ — আর ১:৬ R:R লস-মেশিন নয়", "good");
+      }
+      // ══ v12 PUBLIC-DEPLOY GUARD (always-on): on a PRODUCTION host with no
+      //    APP_PASSWORD configured and no explicit TRADER_ARMED=1 opt-in,
+      //    the brain must boot DISARMED — a public URL + armed brain without
+      //    auth was the audit's Critical #1 (anyone could flip it on and
+      //    drain the account). ══
+      if (
+        process.env.NODE_ENV === "production" &&
+        this.cfg.enabled &&
+        !process.env.APP_PASSWORD && process.env.TRADER_ARMED !== "1"
+      ) {
+        this.cfg.enabled = false;
+        this.journalLog({
+          action: "halt", symbol: "",
+          reason: "public-deploy guard: auto-trade DISARMED at boot (no APP_PASSWORD set; set TRADER_ARMED=1 to override)",
+        });
+        this.think("🔒 পাবলিক ডিপ্লয় গার্ড — APP_PASSWORD নেই, তাই বুটে অটো-ট্রেড ডিসআর্মড। অথ সেট করে আবার ARM করুন", "warn");
+      }
       if (vSaved < 8) {
         // v8 FINAL HONEST REPAIR — the phantom storm (v7 deployed mid-storm)
         // re-poisoned today's counters (56W/65L/−$211 while the brain's real
@@ -887,7 +950,15 @@ export class AiTrader {
     }
     if (patch.riskMode && RISK[patch.riskMode]) this.cfg.riskMode = patch.riskMode;
     if (typeof patch.tpUsd === "number") {
-      this.cfg.tpUsd = Math.max(0, Math.min(50, Math.round(patch.tpUsd * 100) / 100));
+      const want = Math.max(0, Math.min(50, Math.round(patch.tpUsd * 100) / 100));
+      // v12 R:R-audit rule: $-mode TP must clear the spread-noise floor.
+      // $0.50 on 0.01-lot gold ≈ 5 points vs a 20-40-point spread — the
+      // target sits INSIDE the spread (structurally −EV). 0 switches to
+      // R-multiple mode; anything else must be ≥ MIN_TP_USD ($3).
+      if (want > 0 && want < MIN_TP_USD) {
+        throw new Error(`$-target must be 0 (R-mode) or at least $${MIN_TP_USD} — smaller targets sit inside the spread (0.01-lot gold ≈ $${MIN_TP_USD}+ to clear spread+SL math)`);
+      }
+      this.cfg.tpUsd = want;
       this.think(this.cfg.tpUsd > 0
         ? `🎯 টার্গেট-প্রফিট $${this.cfg.tpUsd.toFixed(2)} — এই লাভে পৌঁছালেই ট্রেড বন্ধ করে প্রফিট নেব`
         : "টার্গেট-প্রফিট $-মোড বন্ধ — R-মাল্টিপল মোডে ফিরে গেলাম", "info");
@@ -907,9 +978,9 @@ export class AiTrader {
     if (typeof patch.dailyLossLimitPct === "number")
       this.cfg.dailyLossLimitPct = Math.max(1, Math.min(50, patch.dailyLossLimitPct));
     if (typeof patch.maxDailyTrades === "number") {
-      // v10: 0 = UNLIMITED (the user's "আমার যত মন চাই তত লিখতে পারি" rule);
-      // free input up to 10000 — the old hidden 500 cap is gone
-      this.cfg.maxDailyTrades = Math.max(0, Math.min(10000, Math.round(patch.maxDailyTrades)));
+      // v12: 0 stays UNLIMITED-by-choice but is capped at MAX_DAILY_TRADES_CAP
+      // (100) — the audit's "unlimited churn" surface. 8–12 is the sane range.
+      this.cfg.maxDailyTrades = Math.max(0, Math.min(MAX_DAILY_TRADES_CAP, Math.round(patch.maxDailyTrades)));
       this.think(this.cfg.maxDailyTrades > 0
         ? `📅 দৈনিক ট্রেড লিমিট ${this.cfg.maxDailyTrades} — এটাই আজকের সর্বোচ্চ`
         : "📅 দৈনিক ট্রেড লিমিট আনলিমিটেড — ব্যালেন্স-সুরক্ষা লিমিট বাকি আছে", "info");
@@ -928,9 +999,9 @@ export class AiTrader {
         .map((s) => ({
           symbol: s.symbol,
           enabled: !!s.enabled,
-          lots: Math.max(0.01, Math.min(100, Number(s.lots) || 0.01)),
-          // v10: free per-pair cap (was hard-clamped at 5 — the user's complaint)
-          maxPositions: Math.max(1, Math.min(500, Math.round(Number(s.maxPositions) || 1))),
+          // v12: hard caps — 100-lot / 500-position inputs are now impossible
+          lots: Math.max(0.01, Math.min(MAX_LOT, Number(s.lots) || 0.01)),
+          maxPositions: Math.max(1, Math.min(MAX_POSITIONS_PER_SYMBOL, Math.round(Number(s.maxPositions) || 1))),
         }));
       for (const s of this.cfg.symbols) this.tracker(s.symbol);
     }
@@ -1561,6 +1632,21 @@ export class AiTrader {
       const edge = this.edge(rule.symbol);
       const prio = PRIORITY_SYMBOLS.has(rule.symbol);
 
+      // ══ v12 SESSION / WEEKEND GATE (the audit's step-1 directive: trade
+      //    London+NY only, UTC 7–20; Asia and the weekend are OFF for the
+      //    brain — the thin Asia tape and weekend crypto drifts are where the
+      //    scalp edge dies). Manual user orders are NOT affected. ══
+      const brokerNow = this.host.brokerNowSec();
+      const gmt = new Date(brokerNow * 1000);
+      const h = gmt.getUTCHours();
+      const dow = gmt.getUTCDay(); // 0=Sun … 6=Sat
+      const weekend = dow === 6 || (dow === 0 && h < 21) || (dow === 5 && h >= 21); // FX/metals closed Sat + late-Fri/Sun
+      if (weekend || h < 7 || h >= 20) {
+        const why = weekend ? "weekend (market closed)" : `outside London+NY window (UTC ${h}h, window 7–20)`;
+        this.journalLog({ action: "skip", symbol: rule.symbol, reason: `session gate: ${why}` });
+        continue;
+      }
+
       // ── CANDIDATE (v6): the LAMP **or** decisive TICK MOMENTUM. The user's
       //    method — “tick momentum দেখে, market structure দেখে এন্ট্রি”: the
       //    lamp is one trigger (deliberately slow — hysteresis), a hard
@@ -1607,7 +1693,9 @@ export class AiTrader {
 
       // candle-age gate: only the first 8% (auction noise) and the last 5%
       // (exhaustion tail) are excluded — $-target scalps ride most of the candle.
-      const ageFrac = (Date.now() / 1000 % 60) / 60;
+      // v12: measured on the BROKER clock (server now + broker offset) — the
+      // M1 bar boundary belongs to the broker, not to the container clock.
+      const ageFrac = ((brokerNow % 60) + 60) % 60 / 60;
       if (ageFrac < 0.08 || ageFrac > 0.95) continue;
 
       // one judge question per symbol at a time + per-symbol judge cooldown
@@ -1645,6 +1733,12 @@ export class AiTrader {
 
       // spread budget comes AFTER we know the SL distance — compute both now
       const spread = q.ask - q.bid;
+      // v12: a dead/zero spread means the quote fell — risk sizing would be
+      // garbage (the spread floor silently vanished and INVALID_STOPS followed)
+      if (!(spread > 0)) {
+        this.journalLog({ action: "skip", symbol: rule.symbol, reason: "spread unavailable (quote fell) — cannot size risk" });
+        continue;
+      }
 
       // ══ THE 3-CHART CONFLUENCE (v6) — the user reads three charts together,
       //    and so must the brain. All three must agree BEFORE the AI judge is
@@ -2248,8 +2342,16 @@ export class AiTrader {
     if (symbol.startsWith("USOIL") || symbol.startsWith("UKOIL")) return 1000; // proven
     if (symbol.startsWith("USTEC")) return symbol.includes("x100") ? 100 : 1;  // BOTH proven by deals:
                                                          // x100 = 100 (the 100× bug), plain USTECm = 1
-    if (symbol.startsWith("US500")) return 10;
-    return 100_000;                                       // FX majors (proven: EUR/GBP/AUD)
+    // v12 (the audit's High #8): US500_x100m starts with "US500" and needs the
+    // SAME x100 rule as USTEC — a flat 10 put every $-gate 10× off. Unknown
+    // suffixes fall back to the plain contract size.
+    if (symbol.startsWith("US500")) return symbol.includes("x100") ? 100 : 10;
+    // v12: KNOWN FX majors keep the 100k contract; anything else (a typo like
+    // "XAUSDm") now returns 1 instead of 100_000 — a wrong symbol can no
+    // longer make P/L explode by five orders of magnitude. The broker-truth
+    // calibration (cmOf) locks the real value after 3 round-trips.
+    if (/^[A-Z]{6}(m|[a-z]{1,4})?$/.test(symbol)) return 100_000;   // classic FX pair (± suffix)
+    return 1;                                             // unknown — conservative, never explosive
   }
 
   /** v10 CALIBRATED multiplier — broker truth (cmCal) beats the static guess.
@@ -2468,7 +2570,10 @@ export class AiTrader {
     if (p.adopted) return; // we didn't open it — no entry features to learn from
     const win = pnl >= 0;
     const heldSec = Math.max(1, Math.round((Date.now() - p.openedAt) / 1000));
-    const ageFrac = (p.openedAt / 1000 % 60) / 60;
+    // v12: candle age at ENTRY on the BROKER clock (the container clock can be
+    // offset — the same bug fixed in decide()'s age gate, applied to memory)
+    const brokerOffset = this.host.brokerNowSec() - Math.floor(Date.now() / 1000);
+    const ageFrac = ((((p.openedAt / 1000 + brokerOffset) % 60) + 60) % 60) / 60;
     const strengthMatch = p.reason.match(/(?:lamp|⚡mom) (\d+)%/);
     const entryStrength = strengthMatch ? Number(strengthMatch[1]) / 100 : 0.5;
 
@@ -2972,14 +3077,42 @@ export class AiTrader {
       this.emit(true);
       return;
     }
-    if (this.dayStartEquity && this.acct.equity > 0) {
-      const lossPct = ((this.dayStartEquity - this.acct.equity) / this.dayStartEquity) * 100;
-      if (lossPct >= this.cfg.dailyLossLimitPct) {
-        this.haltedToday = true;
-        this.haltReason = `daily loss limit −${lossPct.toFixed(1)}% (cap ${this.cfg.dailyLossLimitPct}%)`;
-        this.journalLog({ action: "halt", symbol: "", reason: this.haltReason });
-        this.think(`⏸ ডেইলি লস লিমিট ছুঁয়েছে (−${lossPct.toFixed(1)}%) — আজ আর নতুন এন্ট্রি নেই`, "bad");
-        this.emit(true);
+    if (this.dayStartEquity) {
+      // v12 LIVE EQUITY (the audit's Medium #18): the probe account snapshot
+      // can lag seconds behind — when positions are open, compute equity as
+      // balance + Σ floating P/L (monitor() refreshes p.pnl from live quotes
+      // every beat), and use the WORST of probe/live so a fast bleed can't
+      // hide behind a stale probe.
+      let equity = this.acct.equity;
+      if (this.positions.size > 0) {
+        let floating = 0;
+        for (const p of this.positions.values()) floating += p.pnl;
+        const live = this.acct.balance + floating;
+        if (live > 0 && this.acct.balance > 0) equity = Math.min(equity, live);
+      }
+      if (equity > 0) {
+        const lossPct = ((this.dayStartEquity - equity) / this.dayStartEquity) * 100;
+        if (lossPct >= this.cfg.dailyLossLimitPct) {
+          this.haltedToday = true;
+          this.haltReason = `daily loss limit −${lossPct.toFixed(1)}% (cap ${this.cfg.dailyLossLimitPct}%)`;
+          this.journalLog({ action: "halt", symbol: "", reason: this.haltReason });
+          this.think(`⏸ ডেইলি লস লিমিট ছুঁয়েছে (−${lossPct.toFixed(1)}%) — আজ আর নতুন এন্ট্রি নেই`, "bad");
+          this.emit(true);
+          // v12: the halt also FLATTENS the brain's own positions — the audit:
+          // "halt only blocks new entries; open positions keep bleeding".
+          // The USER's manual positions are respected; only origin=brain
+          // positions are cut, best-effort (a failed close retries next beat
+          // via monitor's own guards).
+          void (async () => {
+            for (const p of [...this.positions.values()]) {
+              if (p.origin === "brain") {
+                try {
+                  await this.closeManaged(p, `daily loss halt — flatten brain position`, "AI");
+                } catch { /* monitor retries */ }
+              }
+            }
+          })();
+        }
       }
     }
   }

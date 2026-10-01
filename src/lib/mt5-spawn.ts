@@ -81,7 +81,10 @@ export async function ensureMt5Service(
   }
 
   try {
-    const child = spawn("bun", ["run", "dev"], {
+    // v12: production NEVER spawns with --hot (a file-save race mid-trade was
+    // the duplicate-brain incident path); dev keeps hot-reload convenience.
+    const prod = process.env.NODE_ENV === "production";
+    const child = spawn("bun", prod ? ["index.ts"] : ["run", "dev"], {
       cwd: svcDir,
       detached: true, // survives if the Next server restarts
       stdio: logFd !== undefined ? ["ignore", logFd, logFd] : "ignore",

@@ -145,6 +145,7 @@ function buildOp(opts: {
   order?: number;          // order ticket (cancel/modify-order)
   position?: number;       // position/order ticket (close/modify-deal)
   comment?: string;
+  deviation?: number;      // v12: max slippage in POINTS (0 = broker default)
 }): Buffer {
   const op = Buffer.alloc(OP_SIZE);
   op.writeUInt32LE(0, 0);                                         // action_id = 0 (ALWAYS for new orders — non-zero → 10013)
@@ -162,7 +163,7 @@ function buildOp(opts: {
   op.writeDoubleLE(0, 120);                                       // price_trigger
   op.writeDoubleLE(opts.sl, 128);                                 // SL
   op.writeDoubleLE(opts.tp, 136);                                 // TP
-  op.writeUInt32LE(0, 144);                                       // deviation
+  op.writeUInt32LE(Math.max(0, Math.min(1000, Math.round(opts.deviation ?? 0))), 144); // deviation (v12)
   op.writeDoubleLE(0, 148);                                       // price_top
   op.writeDoubleLE(0, 156);                                       // price_bottom
   if (opts.comment) Buffer.from(opts.comment.slice(0, 31), "utf16le").copy(op, 164); // comment 64B
@@ -249,13 +250,26 @@ export class Mt5WsClient {
 
   static async connect(host: string, timeoutMs = 8000): Promise<Mt5WsClient> {
     const url = `wss://${host}:443/terminal`;
+    // v12 SECURITY (the audit's Critical #4): we used to dial the gateway by
+    // IP with rejectUnauthorized:false — a MITM on the path could harvest the
+    // MT5 login/password and silently rewrite trades. The gateways present a
+    // *.exwebterm.com certificate, so we now send an SNI inside that domain
+    // and VERIFY the chain. Escape hatch (only if a gateway ever serves a
+    // mismatched cert): MT5_TLS_INSECURE=1 re-enables the old behaviour and
+    // logs a loud warning.
+    const insecure = process.env.MT5_TLS_INSECURE === "1";
+    if (insecure) {
+      console.warn("[mt5-client] ⚠ MT5_TLS_INSECURE=1 — certificate verification DISABLED (emergency mode)");
+    }
     const ws = new WebSocket(url, {
       headers: {
         Origin: `https://${host}:443`,
         "User-Agent":
           "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
       },
-      tls: { rejectUnauthorized: false }, // cert is *.exwebterm.com; we dial by IP
+      ...(insecure
+        ? { tls: { rejectUnauthorized: false } }
+        : { servername: "mt5.exwebterm.com", tls: { rejectUnauthorized: true } }),
     } as any) as WebSocket;
     ws.binaryType = "arraybuffer";
 
@@ -658,18 +672,9 @@ export class Mt5WsClient {
     opts?: { sl?: number; tp?: number; comment?: string; digits?: number },
   ): Promise<TradeResult> {
     const digits = opts?.digits ?? 2;
-    const op = buildOp({
-      action: 3, symbol,
-      volumeRaw: Math.round(lots * LOTS_RAW),
-      digits,
-      type: side === "buy" ? 0 : 1,
-      filling: 0, // FOK — market
-      price: 0,   // caller should use marketOrderAt with a live price
-      sl: opts?.sl ?? 0,
-      tp: opts?.tp ?? 0,
-      comment: opts?.comment,
-    });
-    return this.sendTradeAndWait(op);
+    // v12: FOK is rejected by Exness on fast markets (10030) — send IOC with a
+    // 50-point deviation budget, then fall back FOK → RETURN if unsupported.
+    return this.sendMarketWithFillLadder(symbol, side, lots, 0, opts, digits, "market");
   }
 
   /** Market order at an explicit price (ask for buy, bid for sell). */
@@ -678,38 +683,61 @@ export class Mt5WsClient {
     opts?: { sl?: number; tp?: number; comment?: string; digits?: number },
   ): Promise<TradeResult> {
     const digits = opts?.digits ?? 2;
-    const op = buildOp({
-      action: 3, symbol,
-      volumeRaw: Math.round(lots * LOTS_RAW),
-      digits,
-      type: side === "buy" ? 0 : 1,
-      filling: 0,
-      price,
-      sl: opts?.sl ?? 0,
-      tp: opts?.tp ?? 0,
-      comment: opts?.comment,
-    });
-    return this.sendTradeAndWait(op, 12000, `open:${symbol}:${side}:${lots}`);
+    return this.sendMarketWithFillLadder(symbol, side, lots, price, opts, digits, `open:${symbol}:${side}:${lots}`);
+  }
+
+  /** v12 — market order / close with a FILLING-MODE LADDER:
+   *  IOC(1) → FOK(0) → RETURN(2). A 10030 (unsupported filling) on one mode
+   *  retries the next, so a "close failed, position burning" (the audit's
+   *  High #9) can no longer happen because the broker disliked FOK. All
+   *  attempts carry a 50-point deviation so gold's spread-widening doesn't
+   *  reject our own exit. */
+  private async sendMarketWithFillLadder(
+    symbol: string, side: TradeSide, lots: number, price: number,
+    opts: { sl?: number; tp?: number; comment?: string; position?: number } | undefined,
+    digits: number, label: string,
+  ): Promise<TradeResult> {
+    const ladder: number[] = [1, 0, 2]; // IOC → FOK → RETURN
+    let last: TradeResult = { retcode: -1, deal: 0, order: 0, volumeRaw: 0, price: 0, comment: "no attempt" };
+    for (const filling of ladder) {
+      const op = buildOp({
+        action: 3, symbol,
+        volumeRaw: Math.round(lots * LOTS_RAW),
+        digits,
+        type: side === "buy" ? 0 : 1,
+        filling,
+        price,
+        sl: opts?.sl ?? 0,
+        tp: opts?.tp ?? 0,
+        comment: opts?.comment,
+        deviation: 50,
+        ...(opts?.position ? { position: opts.position } : {}),
+      });
+      last = await this.sendTradeAndWait(op, 12000, `${label}:fill${filling}`);
+      if (last.retcode !== 10030) return last; // filled / real error → done
+      // 10030 = this filling mode unsupported → try the next mode
+    }
+    return last;
   }
 
   /** Close an open position: MARKET order in the OPPOSITE direction with the
-   *  position's order ticket (trade_action=3, NOT 10 — 10 returns 10030). */
+   *  position's order ticket (trade_action=3, NOT 10 — 10 returns 10030).
+   *  v12: close rides the SAME filling ladder + deviation as opens — a close
+   *  must never be stranded by an FOK rejection on a fast market. The
+   *  position ticket rides EVERY ladder attempt (without it the broker would
+   *  OPEN a hedge instead of closing — that must be impossible). */
   async closePosition(
     symbol: string, side: TradeSide, lots: number, price: number,
     positionTicket: number, opts?: { digits?: number; comment?: string },
   ): Promise<TradeResult> {
-    const op = buildOp({
-      action: 3, symbol,
-      volumeRaw: Math.round(lots * LOTS_RAW),
-      digits: opts?.digits ?? 2,
-      type: side === "buy" ? 1 : 0, // opposite direction
-      filling: 0,
-      price,
-      sl: 0, tp: 0,
-      position: positionTicket,
-      comment: opts?.comment ?? "close",
-    });
-    return this.sendTradeAndWait(op, 12000, `close:${symbol}#${positionTicket}:${lots}`);
+    const digits = opts?.digits ?? 2;
+    const opposite: TradeSide = side === "buy" ? "sell" : "buy";
+    return this.sendMarketWithFillLadder(
+      symbol, opposite, lots, price,
+      { comment: opts?.comment ?? "close", position: positionTicket },
+      digits,
+      `close:${symbol}#${positionTicket}:${lots}`,
+    );
   }
 
   /** Modify SL/TP of an open position (trade_action=6).
