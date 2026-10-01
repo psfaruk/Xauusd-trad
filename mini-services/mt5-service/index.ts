@@ -82,6 +82,29 @@ function guardTrading(req: any, res: any): boolean {
   return true;
 }
 
+/** v15: read-only market data (status/symbols/quote/ticks/flow/ai-chart/
+ *  candles) — SAME auth, but its OWN generous bucket. The v14 blanket
+ *  guardTrading on these routes shared the 30/min `trade:` bucket with
+ *  every trading call — yet a single /api/analysis poll fans out to ~6
+ *  candle fetches every 15s (≈28 req/min from the Next.js server IP),
+ *  so the app rate-limited ITSELF into 429 → fetchCandles [] → the
+ *  intermittent "no candle data" 503s. 300/min is still 10× the app's
+ *  need and starves anonymous scrapers (they hit auth regardless). */
+function guardMarket(req: any, res: any): boolean {
+  const rl = rateLimit(`market:${clientIp(req)}`, 300, 60_000);
+  if (!rl.ok) {
+    res.writeHead(429, { "Content-Type": "application/json", "Retry-After": String(rl.retryAfter) });
+    res.end(JSON.stringify({ error: `rate limit — retry in ${rl.retryAfter}s` }));
+    return false;
+  }
+  const auth = authorizeTradingReq(req);
+  if (!auth.ok) {
+    json(res, 401, { error: "unauthorized — trading API is locked (login or server key required)" });
+    return false;
+  }
+  return true;
+}
+
 const TF_SEC: Record<string, number> = {
   M1: 60, M5: 300, M15: 900, M30: 1800,
   H1: 3600, H4: 14400, D1: 86400, W1: 604800, MN1: 2592000,
@@ -315,10 +338,11 @@ const restServer = createServer((req, res) => {
       // v12: account numbers are PRIVATE — anonymous callers get connection
       // health only (the owner's browser carries the session cookie and sees
       // balance/equity; the audit's Critical #3)
-      // v14: guardTrading added (market REST was an open door behind Caddy);
+      // v14: guarded (market REST was an open door behind Caddy);
       // `login` REMOVED from the payload — masked login lives in
       // /api/mt5-account.loginMasked only (the audit's full-login leak).
-      if (!guardTrading(req, res)) return;
+      // v15: guardMarket — read-only, own bucket (was guardTrading).
+      if (!guardMarket(req, res)) return;
       const priv = authorizeTradingReq(req).ok;
       return json(res, 200, {
         connected: manager.connected,
@@ -342,18 +366,19 @@ const restServer = createServer((req, res) => {
       // v14: market REST now requires the session/key (the audit's dual-door
       // finding) — the app's own browser reaches these through the Next.js
       // proxy which attaches x-trader-key server-side.
-      if (!guardTrading(req, res)) return;
+      // v15: guardMarket — read-only, own bucket (was guardTrading).
+      if (!guardMarket(req, res)) return;
       return json(res, 200, { source: manager.source, list: manager.symbolList() });
     }
     if (url.pathname === "/api/quote") {
-      if (!guardTrading(req, res)) return;
+      if (!guardMarket(req, res)) return;
       const symbol = url.searchParams.get("symbol") ?? "XAUUSDm";
       const q = manager.getQuote(symbol);
       if (!q) return json(res, 404, { error: "no quote yet" });
       return json(res, 200, { symbol, ...q, spread: q.ask - q.bid });
     }
     if (url.pathname === "/api/ticks") {
-      if (!guardTrading(req, res)) return;
+      if (!guardMarket(req, res)) return;
       const symbol = url.searchParams.get("symbol") ?? "XAUUSDm";
       const sec = Number(url.searchParams.get("sec") ?? 180);
       const q = manager.getQuote(symbol);
@@ -365,7 +390,7 @@ const restServer = createServer((req, res) => {
       });
     }
     if (url.pathname === "/api/flow") {
-      if (!guardTrading(req, res)) return;
+      if (!guardMarket(req, res)) return;
       const symbol = url.searchParams.get("symbol") ?? "XAUUSDm";
       const tf = url.searchParams.get("tf") ?? "M1";
       // peek-only: returns data if a tracker exists (a socket flowsub creates it)
@@ -378,7 +403,7 @@ const restServer = createServer((req, res) => {
     }
     // ── AI live chart analysis — what the brain "sees" when it looks at the chart ──
     if (url.pathname === "/api/ai-chart") {
-      if (!guardTrading(req, res)) return;
+      if (!guardMarket(req, res)) return;
       const symbol = url.searchParams.get("symbol") ?? "XAUUSDm";
       const tf = url.searchParams.get("tf") ?? "M15";
       manager.getCandles(symbol, tf, 260).then(
@@ -511,7 +536,9 @@ const restServer = createServer((req, res) => {
       return;
     }
     if (url.pathname === "/api/candles") {
-      if (!guardTrading(req, res)) return;
+      // v15: guardMarket — the analysis route fans out ~6 of these per 15s
+      // poll; sharing the trading bucket made the app 429 itself.
+      if (!guardMarket(req, res)) return;
       const symbol = url.searchParams.get("symbol") ?? "XAUUSDm";
       const tf = url.searchParams.get("tf") ?? "M15";
       const limit = Number(url.searchParams.get("limit") ?? 500);

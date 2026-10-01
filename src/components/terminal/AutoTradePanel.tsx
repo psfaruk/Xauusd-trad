@@ -138,6 +138,73 @@ function LiveSyncChip({ lastSyncAt }: { lastSyncAt: number }) {
   );
 }
 
+// ── v15 SESSION GATE, made visible — the brain only takes entries during
+//    London+NY (Mon–Fri 07:00–24:00 UTC + Sat 00:00–01:00 NY tail — mirrors
+//    trader.ts exactly). Before, a gated brain just showed a journal full of
+//    "session gate" SKIPs and the user had to guess why nothing was coming
+//    ("সিগন্যাল তো আসছে না, কেনো?"). Now the cockpit says it outright:
+//    window OPEN, or a live opens-in countdown. ──
+function useSessionWindow(tickMs = 30_000) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), tickMs);
+    return () => clearInterval(id);
+  }, [tickMs]);
+  return useMemo(() => {
+    const d = new Date(now);
+    const h = d.getUTCHours();
+    const dow = d.getUTCDay(); // 0=Sun … 6=Sat
+    const open = (dow >= 1 && dow <= 5 && h >= 7) || (dow === 6 && h < 1);
+    // Sat past the 01:00 tail, or Sunday → weekend closure; Mon–Fri h<7 → daily gap
+    const weekend = !open && (dow === 0 || (dow === 6 && h >= 1));
+    let nextOpenAt: number | null = null;
+    if (!open) {
+      nextOpenAt = dow >= 1 && dow <= 5 && h < 7
+        // weekday pre-open → today 07:00 UTC
+        ? Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), 7, 0, 0)
+        // weekend → next Monday 07:00 UTC
+        : Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + (dow === 6 ? 2 : 1), 7, 0, 0);
+    }
+    return { open, weekend, nextOpenAt, now };
+  }, [now]);
+}
+
+/** compact countdown — 4m / 1h 32m / 2d 5h (bn: মি / ঘ / দিন) */
+function fmtSessionDur(ms: number, bn = false) {
+  const m = Math.max(1, Math.round(ms / 60_000));
+  if (m < 60) return bn ? `${m} মি` : `${m}m`;
+  const h = Math.floor(m / 60);
+  if (h < 48) return bn ? `${h} ঘ ${m % 60} মি` : `${h}h ${m % 60}m`;
+  return bn ? `${Math.floor(h / 24)} দিন ${h % 24} ঘ` : `${Math.floor(h / 24)}d ${h % 24}h`;
+}
+
+/** the London+NY window state as a scannable chip — green when hunting,
+ *  amber with a live countdown when the gate is shut. */
+function SessionGateChip({ session }: { session: ReturnType<typeof useSessionWindow> }) {
+  const { t, locale } = useI18n();
+  if (session.open) {
+    return (
+      <Badge
+        variant="outline"
+        className="h-4 border-up/40 bg-up/5 px-1.5 text-[8px] font-bold text-up"
+        title={t("sessionChipOpenTitle")}
+      >
+        {t("sessionChipOpen")}
+      </Badge>
+    );
+  }
+  const ms = session.nextOpenAt ? Math.max(0, session.nextOpenAt - session.now) : 0;
+  return (
+    <Badge
+      variant="outline"
+      className="h-4 border-gold/50 bg-gold/5 px-1.5 font-mono text-[8px] font-bold text-gold"
+      title={t("sessionChipClosedTitle")}
+    >
+      ⏳ {fmtSessionDur(ms, locale === "bn")}
+    </Badge>
+  );
+}
+
 // ── v11 WHO opened it — the mystery-order answer on every trade: the AI
 //    brain (violet, Bot) vs the user's own hand (muted, User) ──
 function OriginChip({ origin }: { origin: "brain" | "manual" }) {
@@ -476,6 +543,7 @@ export function AutoTradePanel() {
   const { t, locale } = useI18n();
   const state = useTrader();
   const symbols = useSymbolList();
+  const session = useSessionWindow();
   const [confirmArm, setConfirmArm] = useState(false);
   const [newSymbol, setNewSymbol] = useState("");
   const [pending, setPending] = useState(false);
@@ -741,9 +809,30 @@ export function AutoTradePanel() {
               ) : (
                 <Badge variant="outline" className="h-4 border-down/40 px-1.5 text-[8px] font-bold text-down">OFFLINE</Badge>
               )}
+              <SessionGateChip session={session} />
             </div>
-            <p className="mt-0.5 truncate text-[10px] text-muted-foreground">
-              {state.enabled ? t("traderArmedHint") : t("traderDisarmedHint")}
+            <p
+              className={cn(
+                "mt-0.5 truncate text-[10px]",
+                state.enabled && !session.open ? "font-semibold text-gold" : "text-muted-foreground",
+              )}
+            >
+              {!state.enabled
+                ? t("traderDisarmedHint")
+                : !session.open
+                  ? (() => {
+                      // v15: the gate reason as a full sentence — local-time open,
+                      // live countdown; the "why is nothing happening" answer.
+                      const timeTxt = session.nextOpenAt
+                        ? new Date(session.nextOpenAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+                        : "";
+                      const durTxt = session.nextOpenAt
+                        ? fmtSessionDur(session.nextOpenAt - session.now, locale === "bn")
+                        : "";
+                      const tpl = t(session.weekend ? "sessionHintWeekend" : "sessionHintWait");
+                      return tpl.replace("{time}", timeTxt).replace("{dur}", durTxt);
+                    })()
+                  : t("traderArmedHint")}
             </p>
           </div>
 

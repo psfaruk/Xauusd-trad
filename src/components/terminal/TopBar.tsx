@@ -30,7 +30,10 @@ export function BrandMark({ className }: { className?: string }) {
         <rect x="15" y="8" width="3" height="6" rx="0.5" fill="var(--color-gold)" opacity="0.95" />
         <line x1="16.5" y1="5.5" x2="16.5" y2="18" stroke="var(--color-gold)" strokeWidth="0.8" opacity="0.95" />
       </svg>
-      <span className="text-sm font-black tracking-[0.14em] text-foreground">
+      {/* v15 mobile fix: the wordmark (font-black + 0.14em tracking ≈ 86px)
+          pushed the right button group 35px off-screen at 390px — below sm the
+          SVG mark alone identifies the brand; full wordmark returns ≥ 640px. */}
+      <span className="hidden text-sm font-black tracking-[0.14em] text-foreground sm:inline">
         AURUM<span className="text-primary">·</span>T
       </span>
     </span>
