@@ -11,7 +11,7 @@
  * chart while the user believed they were watching the real market).
  */
 
-import { Mt5WsClient, TF_CODE, type SymbolInfo, type AccountInfo, type Mt5Position, type Mt5Order, type Mt5Deal, type TradeResult, type TradeSide } from "./mt5-client";
+import { Mt5WsClient, TF_CODE, type SymbolInfo, type AccountInfo, type Mt5Position, type Mt5Order, type Mt5Deal, type TradeResult, type TradeSide, type BrokerPush } from "./mt5-client";
 import { FlowTracker, TickRecorder, type FlowPayload } from "./flow";
 import fs from "node:fs";
 import path from "node:path";
@@ -120,6 +120,17 @@ export class Mt5Manager {
   latencyMs: number | null = null;
   reason = "not configured";
 
+  // ── v16 EVENT-FIRST ACCOUNT MIRROR ──
+  /** trader hook: a broker push (cmd 14/19/22) just landed — the trader
+   *  re-syncs positions/history instantly instead of waiting for its poll. */
+  onTradePush: ((ev: BrokerPush) => void) | null = null;
+  /** ms-timestamp of the last broker push — the poll paths consult this to
+   *  short-circuit their deliberate waiting when the broker already spoke. */
+  lastTradePushAt = 0;
+  /** account refresh cadence (the status snapshot stays fresh even without pushes) */
+  private acctTimer: ReturnType<typeof setInterval> | null = null;
+  private acctRefreshAt = 0;
+
   // ── internal ──
   private client: Mt5WsClient | null = null;
   private _login = 0;
@@ -220,6 +231,39 @@ export class Mt5Manager {
   async traderAccount(): Promise<AccountInfo | null> {
     if (!this.connected || this.source !== "mt5" || !this.client) return null;
     try { return await this.client.account(); } catch { return null; }
+  }
+
+  // ═══════════════ v16 EVENT-FIRST ACCOUNT MIRROR ═══════════════
+  // The broker pushes cmd 14/19/22 the MOMENT account state changes (any
+  // connection — this app, the user's MT5 terminal, the server's own SL/TP
+  // execution). The old app ignored these and polled; balance/equity went
+  // stale for seconds and closes were invisible for 30s. Now every push
+  // refreshes the account snapshot immediately (one cmd-3 round-trip) and
+  // nudges the trader to re-sync positions/history at push latency.
+  /**
+   * Bound in connectLoop() to client.onTradeEvent. Coalesces bursts (a
+   * close often lands as 19+22+14 within a few ms) into ONE account
+   * refetch per 250ms — a single push still reflects in one round-trip. */
+  private handleTradePush(ev: BrokerPush) {
+    this.lastTradePushAt = Date.now();
+    const now = Date.now();
+    if (now - this.acctRefreshAt >= 250) {
+      this.acctRefreshAt = now;
+      this.refreshAccount().catch(() => { /* transient — the 5s timer retries */ });
+    }
+    try { this.onTradePush?.(ev); } catch { /* never let a consumer error kill the socket handler */ }
+  }
+
+  /** fresh cmd-3 → this.account → status broadcast (top bar / status bar /
+   *  settings all read from the status event, so one broadcast updates them). */
+  async refreshAccount() {
+    if (!this.connected || this.source !== "mt5" || !this.client) return;
+    try {
+      const acct = await this.client.account();
+      if (!Number.isFinite(acct.equity) || acct.equity <= 0) acct.equity = acct.balance;
+      this.account = { ...acct, login: this.login };
+      this.emitStatus();
+    } catch { /* not connected anymore — reconnect path handles it */ }
   }
   async traderPositions(): Promise<{ positions: Mt5Position[]; pendingOrders: number; orders: Mt5Order[] }> {
     if (!this.connected || this.source !== "mt5" || !this.client) return { positions: [], pendingOrders: 0, orders: [] };
@@ -338,6 +382,7 @@ export class Mt5Manager {
   /** Close the broker socket + its heartbeat without touching the rest. */
   private stopClient(): void {
     if (this.hbTimer) { clearInterval(this.hbTimer); this.hbTimer = null; }
+    if (this.acctTimer) { clearInterval(this.acctTimer); this.acctTimer = null; }
     try { this.client?.close(); } catch { /* already closed */ }
     this.client = null;
   }
@@ -389,6 +434,7 @@ export class Mt5Manager {
     this.reason = "recycling session";
     this.emitStatus();
     try { this.client?.close(); } catch { /* already closed */ }
+    if (this.acctTimer) { clearInterval(this.acctTimer); this.acctTimer = null; }
     // NEVER rely on onClose firing: a silently-dead socket never emits it and
     // the manager stayed "recycling session" forever (wedge timer disarmed
     // because firstFailAt was reset on the last successful connect). Schedule
@@ -403,6 +449,7 @@ export class Mt5Manager {
     this.stopped = true;
     this.client?.close();
     if (this.hbTimer) clearInterval(this.hbTimer);
+    if (this.acctTimer) clearInterval(this.acctTimer);
     if (this.retryTimer) clearTimeout(this.retryTimer);
     if (this.wedgeTimer) clearInterval(this.wedgeTimer);
   }
@@ -506,6 +553,10 @@ export class Mt5Manager {
         this.scheduleRetry("closed");
       });
       client.onQuotes((q) => this.handleQuote(q.symbolId, q.timeSec, q.bidRaw, q.askRaw));
+      // v16 EVENT-FIRST: bind the broker's account/trade pushes (cmd 14/19/22).
+      // The old app created these events in the client but NEVER bound the
+      // handler here — balance went stale, closes invisible for 30s.
+      client.onTradeEvent((ev) => this.handleTradePush(ev));
 
       // subscribe watch symbols
       const ids = w.map((s) => symbols.get(s)!.id);
@@ -523,6 +574,17 @@ export class Mt5Manager {
         }
         try { c.heartbeat(); } catch { /* closed */ }
       }, 4000);
+
+      // v16: periodic account refresh (~5s) — the status snapshot (balance/
+      // equity in the top bar/status bar/Settings) stays fresh even on a
+      // broker that does not push cmd-14, and deposits/withdrawals land
+      // within seconds instead of never (the old code read the account
+      // exactly ONCE, at connect).
+      if (this.acctTimer) clearInterval(this.acctTimer);
+      this.acctTimer = setInterval(() => {
+        if (this.connected && this.source === "mt5") this.refreshAccount().catch(() => {});
+      }, 5000);
+      this.acctTimer.unref?.();
 
       // preload day-close for change% + latency estimate
       this.preloadDayCloses().catch(() => {});

@@ -28,7 +28,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { FlowTracker, FlowPayload } from "./flow";
-import type { Mt5Position, TradeResult, TradeSide, AccountInfo, Mt5Deal, Mt5Order } from "./mt5-client";
+import type { Mt5Position, TradeResult, TradeSide, AccountInfo, Mt5Deal, Mt5Order, BrokerPush } from "./mt5-client";
 import { ORDER_TYPE_NAMES } from "./mt5-client";
 import type { MarketRead } from "./market-read";
 import { AiJudge } from "./ai-judge";
@@ -271,6 +271,10 @@ export interface TraderHost {
    *  (a shifted container clock phased entries into the wrong part of the
    *  M1 bar — the audit's High #10) */
   brokerNowSec(): number;
+  /** v16 EVENT-FIRST: register for the broker's own account/trade pushes
+  *  (cmd 14/19/22). Optional — older hosts / unit tests without a live
+  *  manager simply keep polling. */
+  onTradePush?(cb: (ev: BrokerPush) => void): void;
   marketOrderAt(symbol: string, side: TradeSide, lots: number, price: number, opts: { sl: number; tp: number; digits: number; comment: string }): Promise<TradeResult>;
   closePosition(symbol: string, side: TradeSide, lots: number, price: number, ticket: number, opts: { digits: number; comment?: string }): Promise<TradeResult>;
   modifyPosition(symbol: string, side: TradeSide, lots: number, price: number, ticket: number, sl: number, tp: number, opts: { digits: number }): Promise<TradeResult>;
@@ -425,7 +429,7 @@ export class AiTrader {
   private haltedToday = false;
   private haltReason = "";
   private noFunds = false;
-  private noFundsCheckedAt = 0;
+  // (v16: noFundsCheckedAt retired — the probe runs on its own 1s timer now)
   private acct: { balance: number; equity: number; currency: string } | null = null;
   // ── v9 account follow-up: session baseline + balance trend + external-move watch ──
   private sessionStartBalance: number | null = null;
@@ -444,6 +448,23 @@ export class AiTrader {
   private cmCalNoted = new Set<string>();
   private cmCalTried = new Set<string>();
   private syncBusy = false;           // v10: 1s sync cadence must never overlap
+  /** v16.2: sync pass counter — schedules the periodic deals-truth sweep */
+  private syncCount = 0;
+  // ── v16 EVENT-FIRST MIRROR ──
+  /** a push-triggered sync arrived while one was running — re-run after
+   *  (QUEUED, never dropped: a push means the broker's state CHANGED) */
+  private syncQueued: "push" | null = null;
+  /** ms of the last broker push — poll paths consult this to skip their
+   *  deliberate waiting (the anti-phantom armor stays armed ONLY for
+   *  push-silent polls, exactly as designed) */
+  private lastBrokerPushAt = 0;
+  /** coalesce gate for push-triggered refetch storms (180ms) */
+  private pushSyncAt = 0;
+  /** v16.2: per-position gate for cmd-19 targeted adopt/reconcile (1s) */
+  private pushReconcileAt = new Map<number, number>();
+  /** v16: account probe on its OWN timer — the AI judge's 4.5s busy window
+   *  must never freeze the balance strip (the old probe lived inside tick()) */
+  private acctTimer: ReturnType<typeof setInterval> | null = null;
   // v9 $-lock trail: ticket → last $ amount whose lock was JOURNALED (anti-spam)
   private trailLocks = new Map<number, number>();
   private loopTimer: ReturnType<typeof setInterval> | null = null;
@@ -523,6 +544,14 @@ export class AiTrader {
     }
     G.__aiTrader = this;
     this.loadState();
+    // v16 EVENT-FIRST: the broker pushes cmd 14/19/22 the MOMENT anything
+    // changes on the account (any connection: this app, the user's MT5
+    // terminal, the server's own SL/TP execution). Mirror immediately —
+    // account + positions + history at push latency; the polls stay as
+    // backup for missed pushes only.
+    try {
+      this.host.onTradePush?.((ev) => this.onBrokerPush(ev));
+    } catch { /* host without push support — polling covers it */ }
   }
 
   // ── persistence ──
@@ -843,6 +872,10 @@ export class AiTrader {
     this.syncTimer = setInterval(() => this.syncPositions().catch((e) => {
       console.error("[trader] syncPositions failed:", (e as Error)?.message ?? e);
     }), POS_SYNC_MS);
+    // v16: account probe on its OWN 1s timer — decoupled from tick()'s busy
+    // window so an AI-judge deliberation can never freeze the balance strip
+    // (the old probe lived inside tick() behind `if (this.busy) return`).
+    this.acctTimer = setInterval(() => { this.probeAccount().catch(() => {}); }, 1_000);
     this.think("ব্রেইন বুট হলো — প্রতি টিকে চিন্তা করছি, পজিশন দেখছি, শিক্ষা মনে রাখছি", "info");
     this.probeAccount().catch(() => {});
     setTimeout(() => this.syncPositions().catch((e) =>
@@ -852,7 +885,8 @@ export class AiTrader {
     this.generation++;
     if (this.loopTimer) clearInterval(this.loopTimer);
     if (this.syncTimer) clearInterval(this.syncTimer);
-    this.loopTimer = this.syncTimer = null;
+    if (this.acctTimer) clearInterval(this.acctTimer);
+    this.loopTimer = this.syncTimer = this.acctTimer = null;
     this.saveState();
   }
   onState(cb: (s: TraderState) => void) { this.onStateCb = cb; }
@@ -1173,6 +1207,23 @@ export class AiTrader {
         this.journalLog({ action: "error", symbol, reason: `manual order rejected: ${r.retcode} ${r.comment}` });
         return { ok: false, error: `${r.retcode} ${r.comment}` };
       }
+      // v16.2: register the position DIRECTLY from the trade result (same
+      // as the brain's open path). The old code relied on sync adoption —
+      // but cmd-4 on an established session is a login-time snapshot
+      // (VERIFIED LIVE), so a manual app order could go UNTRACKED (no SL
+      // management, invisible in the UI) until a session recycle.
+      const entry = r.price || price;
+      const pos: TraderPosition = {
+        ticket: r.order, symbol, side, lots,
+        lots0: lots,
+        entry, sl: opts.sl ?? 0, tp: opts.tp ?? 0, openedAt: Date.now(),
+        reason: "user order from app", price: entry, pnl: 0, pnlR: 0,
+        slDist: opts.sl && opts.sl > 0 ? Math.abs(entry - opts.sl) : 0,
+        peakR: 0, beMoved: false, partialDone: false, adopted: true, origin: "manual", bankedPnl: 0,
+      };
+      this.positions.set(pos.ticket, pos);
+      this.nextReviewAt.set(pos.ticket, Date.now() + REVIEW_FIRST_MS);
+      this.aiCloseVotes.set(pos.ticket, 0);
       this.journalLog({
         action: "open", symbol, side,
         reason: `user order from app · ${side.toUpperCase()} ${lots} @ ${r.price || price}${opts.sl ? ` · SL ${opts.sl}` : ""}${opts.tp ? ` · TP ${opts.tp}` : ""}`,
@@ -1336,6 +1387,9 @@ export class AiTrader {
             });
             this.think(`💰 ব্যালেন্স বদলেছে ${prevBalance.toFixed(2)} → ${a.balance.toFixed(2)} (${delta >= 0 ? "+" : "−"}$${Math.abs(delta).toFixed(2)}) — MT5-এ বাইরে কিছু হয়েছে, ফলো করছি`, "info");
           }
+          // v16: a balance MOVE pushes to the UI immediately — the strip must
+          // not wait for the next 400ms-throttled beat
+          this.emit(true);
         }
         this.rollDay(equity);
         if (a.balance <= 2) {
@@ -1356,12 +1410,8 @@ export class AiTrader {
     if (this.busy) return;
     this.busy = true;
     try {
-      // fresh account every ~1s (v11: was 3s — balance moves land in ~a
-      // second; positions/equity/floating update every beat via monitor())
-      if (Date.now() - this.noFundsCheckedAt > 1_000) {
-        this.noFundsCheckedAt = Date.now();
-        await this.probeAccount();
-      }
+      // v16: the account probe moved to its OWN timer (start()) — the old
+      // in-tick probe meant a 4.5s AI-judge deliberation froze the balance.
       // pre-warm the structural reads for every enabled symbol (decide()
       // then answers in tick-time, not fetch-time — the user's speed demand)
       if (Date.now() - this.lastMrWarm > 30_000) {
@@ -2536,7 +2586,13 @@ export class AiTrader {
     this.trailLocks.delete(p.ticket);
     // v9: refresh the account right after a close — the balance/equity strip
     // and the trend history update within a second of the trade landing
-    setTimeout(() => { this.probeAccount().catch(() => {}); }, 700);
+    // v16.2: the HISTORY refresh rides along (a settle is exactly when the
+    // deals changed — the E2E measured history rows at 5.8s on the push
+    // gate alone; at settle-time it lands in ~1s)
+    setTimeout(() => {
+      this.probeAccount().catch(() => {});
+      this.refreshHistory().catch(() => {});
+    }, 700);
     if (this.settled.size > TOMBSTONE_MAX) {
       const keys = [...this.settled.keys()].sort((a, b) => this.settled.get(a)! - this.settled.get(b)!);
       for (const k of keys.slice(0, Math.floor(keys.length / 3))) this.settled.delete(k);
@@ -2750,10 +2806,115 @@ export class AiTrader {
     try { this.host.recycleSession(); } catch { /* host handles */ }
   }
 
-  /** broker truth-sync: adopt positions we don't know, drop gone ones (phantom-proof) */
-  private async syncPositions() {
+  // ═══════════════ v16 EVENT-FIRST MIRROR ═══════════════
+  /** The broker itself just said "something changed on the account" (cmd 14
+   *  / 19 / 22 — a trade from ANY connection: this app, the user's MT5
+   *  terminal, the server's own SL/TP execution, a deposit). This is the
+   *  path the old app never had — it polled and waited instead.
+   *  Order of operations: (1) targeted instant close-check — a cmd-19 naming
+   *  a KNOWN position with a tp/sl/so/close comment goes straight to the
+   *  deal-proof reconcile (no vanish streak, no 30s age gate); (2) a
+   *  coalesced full re-sync (positions + pendings + account + history).
+   *  Bursts coalesce at 180ms — a close lands as 19+22+14 within a few ms
+   *  and must trigger ONE mirror pass, not three. */
+  private onBrokerPush(ev: BrokerPush) {
     if (!this.host.connected || this.host.source !== "mt5") return;
-    if (this.syncBusy) return; // v10: 1s cadence — never overlap syncs
+    const now = Date.now();
+    this.lastBrokerPushAt = now;
+    // ── (1) targeted instant paths. VERIFIED LIVE (Oct-01): the broker's
+    //    cmd-4 position list on an established session is a LOGIN-TIME
+    //    SNAPSHOT — positions opened after login NEVER appear in it (a
+    //    fresh connection sees them instantly; cmd-5 deals are live too).
+    //    So the sync mirror alone can adopt nothing new — the PUSH + the
+    //    DEALS are the truth. Every cmd-19 (retcode 10009) naming a
+    //    position gets dealt with RIGHT HERE:
+    //      · UNTRACKED position → adopt it from its opening deal (~300ms)
+    //      · TRACKED position → deal-proof reconcile (a close from ANY
+    //        source — phone MT5, server SL/TP, another terminal — settles
+    //        with its TP/SL badge immediately; a modify harmlessly
+    //        re-verifies) ──
+    if (ev.kind === "trade" && ev.positionId && ev.retcode === 10009) {
+      const pid = ev.positionId;
+      const tracked = this.positions.get(pid);
+      const lastAt = this.pushReconcileAt.get(pid) ?? 0;
+      if (now - lastAt > 1_000) { // per-position 1s gate — modify bursts stay cheap
+        this.pushReconcileAt.set(pid, now);
+        if (tracked) {
+          if (now - tracked.openedAt >= 3_000) { // give a just-opened ticket a breath
+            this.reconcileMissing(tracked, "cmd19 push", true).catch(() => {});
+          }
+        } else if (!this.settled.has(pid)) {
+          this.adoptFromDeal(pid).catch(() => {});
+        }
+      }
+    }
+    // ── (2) coalesced full re-sync ──
+    if (now - this.pushSyncAt < 180) return;
+    this.pushSyncAt = now;
+    this.syncPositions("push").catch(() => {});
+    this.probeAccount().catch(() => {});   // balance/equity at push latency
+    // v16.1: history refresh on push is GATED at 2s — cmd-5 requests share
+    // one FIFO queue, and an ungated 24h-deals fetch per push starved the
+    // zombie pre-check behind it (new-position adoption fell past 12s).
+    // A close still lands in history within ~2s — vs the old 5s cadence.
+    if (now - this.historyAt > 2_000) {
+      this.historyAt = now;
+      this.refreshHistory().catch(() => {});
+    }
+  }
+
+  /** v16.2 PUSH-DRIVEN ADOPTION — bypass the frozen cmd-4 snapshot: the
+   *  DEALS (cmd-5) are live, so a position the broker just told us about
+   *  (cmd-19, any connection — this app, the phone MT5 terminal, another
+   *  terminal) is adopted from its OPENING DEAL at push latency. SL/TP are
+   * unknown from the deal — the next honest cmd-4 that lists the position
+   * fills them (the refresh branch). */
+  private async adoptFromDeal(positionId: number) {
+    try {
+      const deals = await this.host.deals(Math.floor(Date.now() / 1000) - 900, 0);
+      const inn = deals.find((d) => d.positionId === positionId && d.entry === "in");
+      if (!inn) return;                       // no opening deal in 15min — stale echo, ignore
+      if (this.positions.has(positionId) || this.settled.has(positionId)) return; // raced the sync
+      const outs = deals.filter((d) => d.positionId === positionId && d.entry === "out");
+      const outVol = outs.reduce((a, d) => a + d.volume, 0);
+      if (inn.volume > 0 && outVol >= inn.volume * 0.9) return; // already fully closed — nothing to adopt
+      const slDist = 0; // deals carry no SL — filled by the next sync that lists it
+      this.positions.set(positionId, {
+        ticket: positionId, symbol: inn.symbol, side: inn.side, lots: inn.volume,
+        lots0: inn.volume,
+        // inn.time is MILLISECONDS-epoch UTC (the deals parser emits ms —
+        // verified live). Multiplying by 1000 once put openedAt in the year
+        // 58719: every age gate went negative and the close reconcile's
+        // deals window came back empty forever (the E2E catch).
+        entry: inn.price, sl: 0, tp: 0, openedAt: inn.time,
+        reason: "adopted (broker push)", price: inn.price, pnl: 0, pnlR: 0,
+        slDist, peakR: 0, beMoved: false, partialDone: false, adopted: true, origin: "manual", bankedPnl: 0,
+      });
+      this.nextReviewAt.set(positionId, Date.now() + REVIEW_FIRST_MS);
+      this.aiCloseVotes.set(positionId, 0);
+      this.vanish.delete(positionId);
+      this.think(`${inn.symbol} পজিশন অ্যাডপ্ট (পুশ-ট্রিগার্ড, ${inn.side} ${inn.volume} @ ${inn.price}) — cmd-4 ল্যাগ বাইপাস`, "info");
+      this.journalLog({ action: "info", symbol: inn.symbol, reason: `adopted ${inn.side} ${inn.volume} @ ${inn.price} (push-driven — cmd-4 login-snapshot lag bypassed)` });
+      this.emit(true);
+    } catch { /* deals unavailable — the 500ms sync adopts it if/when cmd-4 catches up */ }
+  }
+
+  /** broker truth-sync: adopt positions we don't know, drop gone ones (phantom-proof).
+   *  v16: trigger="push" when a broker push kicked this sync off — the
+   *  deliberate waiting (vanish streaks, 30s age gate, empty-list counters)
+   *  was armor against PUSH-SILENT lies (wedged lists); when the broker
+   *  itself just spoke, absence from the list is real evidence and the
+   *  deal-proof reconcile runs immediately. Settling still REQUIRES the
+   *  broker's own closing deal (requireProof) on every push path. */
+  private async syncPositions(trigger: "poll" | "push" = "poll") {
+    if (!this.host.connected || this.host.source !== "mt5") return;
+    if (this.syncBusy) {
+      // v16: a push-triggered sync is QUEUED, never dropped — the broker's
+      // state changed while the previous snapshot was in flight, so that
+      // snapshot is already outdated. Polls still back off (v10 semantics).
+      if (trigger === "push") this.syncQueued = "push";
+      return; // v10: cadence — never overlap syncs
+    }
     this.syncBusy = true;
     try {
       const { positions, orders } = await this.host.positions();
@@ -2765,6 +2926,11 @@ export class AiTrader {
       // while positions are truly open (the Sep-29 phantom-close incident).
       // An empty list proves NOTHING — only a non-empty list can prove absence.
       const emptyList = positions.length === 0;
+      // v16: a broker push landed within the last 4s (or triggered this very
+      // sync) — the empty list / missing rows are then the EXPECTED aftermath
+      // of real closes, not wedge symptoms. The waiting armors stand down;
+      // the DEAL-PROOF armor does not (requireProof on every settle path).
+      const pushRecent = trigger === "push" || (now - this.lastBrokerPushAt < 4_000);
       // ── v11 PENDING-ORDERS MIRROR — every limit/stop order on the account
       //    (opened in MT5 by hand or from this app) is reflected in the state
       //    on EVERY sync (500ms). Disappearances journal WHY (filled → the
@@ -2789,12 +2955,150 @@ export class AiTrader {
       if (this.pendingOrders.length !== orders.length || this.pendingOrders.some((o, i) => orders[i] && o.ticket !== orders[i].ticket)) {
         this.emit(true);
       }
-      // history refresh (5s cadence — deals are heavier than the sync)
-      if (Date.now() - this.historyAt > 5_000) {
+      // the whole list is clean of settled tickets → reset the stale counter
+      let anySettled = false;
+      for (const bp of positions) {
+        if (this.settled.has(bp.order || bp.id)) { anySettled = true; break; }
+      }
+      if (!anySettled) this.staleListHits = 0;
+      for (const bp of positions) {
+        // position id (Exness fills trade_order=0 in this record — use the id)
+        const key = bp.order || bp.id;
+        live.add(key);
+        // ══ PHANTOM ARMOR (v5) ══ — a settled ticket can NEVER come back. If
+        // the broker lists one, the cmd-4 list is STALE (wedged session), not
+        // a real position: skip it, count the stale hit, recycle on repeat.
+        if (this.settled.has(key)) {
+          this.staleListHits++;
+          if (this.staleListHits === 1) {
+            this.think(`⚠️ sync একটি সেটেল-হওয়া টিকিট (#${key}) দেখাচ্ছে — লিস্ট পুরোনো হতে পারে, রি-অ্যাডপ্ট করছি না`, "warn");
+          }
+          // ══ v10.3 TOMBSTONE SELF-HEAL — the livelock core ══
+          // If the SAME ticket is listed again AFTER a recycle, the list is
+          // probably NOT stale — OUR TOMBSTONE is wrong (a live position
+          // falsely settled during a wedged session, e.g. by a garbage deals
+          // window). Verify against the deal history: still-open (in-volume
+          // > out-volume) → un-settle, persist, and let the next sync adopt
+          // the live position again. Without this the armor itself becomes
+          // an infinite recycle loop (the Sep-30 storm: 79 recycles).
+          const seen = (this.staleTicketRecycles.get(key) ?? 0) + 1;
+          this.staleTicketRecycles.set(key, seen);
+          if (seen === 2 || (seen > 2 && seen % 10 === 0)) { // first check + backoff retry if deals were unavailable
+            let inVol = 0, outVol = 0, healed = false;
+            try {
+              const dh = await this.host.deals(Math.floor(now / 1000) - 86400, 0);
+              for (const d of dh) {
+                if (d.positionId !== key) continue;
+                if (d.entry === "in") inVol += d.volume;
+                else if (d.entry === "out") outVol += d.volume;
+              }
+              healed = inVol > 0 && outVol < inVol * 0.9; // deals prove it is STILL OPEN
+            } catch { /* deals unavailable — keep the tombstone, storm breaker caps the damage */ }
+            if (healed) {
+              this.settled.delete(key);
+              this.staleTicketRecycles.delete(key);
+              this.staleListHits = 0;
+              this.think(`🔄 #${key} আসলে এখনও খোলা (ডিল: ইন ${inVol.toFixed(2)} / আউট ${outVol.toFixed(2)}) — ভুল টম্বস্টোন সরালাম, আবার ট্র্যাক করছি`, "good");
+              this.journalLog({ action: "info", symbol: bp.symbol, reason: `tombstone #${key} was WRONG (deals: in ${inVol.toFixed(2)} > out ${outVol.toFixed(2)}) — un-settled, re-tracking live position` });
+              continue; // next sync re-adopts it through the normal path
+            }
+          }
+          if (this.staleListHits >= STALE_LIST_RECYCLE) {
+            this.staleListHits = 0;
+            this.think("⚠️ ব্রোকার পজিশন-লিস্ট বারবার পুরোনো দেখাচ্ছে — সেশন রিসাইকল করছি (ফ্যান্টম লুপ আর্মার)", "warn");
+            this.requestRecycle("stale cmd-4 list", [key]);
+          }
+          continue;
+        }
+        this.vanish.delete(key);
+        this.reconcileTries.delete(key); // it's back — restore a clean slate for its next close
+        if (!this.positions.has(key)) {
+          // ══ v6.1 ZOMBIE PRE-CHECK ══ — a wedged cmd-4 keeps listing
+          // positions that are ALREADY CLOSED on the server (the 09:28 storm:
+          // 83 phantom closes in one burst). An unknown position whose deals
+          // show a full out-volume is a stale-list relic: tombstone it
+          // silently, NEVER adopt, and count the stale hit — the list itself
+          // is provably old, so recycle the session on repeat.
+          // v16.1: a position YOUNGER than 60s skips the check — a relic is
+          // by definition OLD, and the check's cmd-5 deals query serializes
+          // behind every other cmd-5 (a 24h history fetch made fresh manual
+          // positions wait 12s+ to adopt — the exact latency this version
+          // exists to kill). Young = adopt NOW.
+          let zombie = false;
+          if (now - (bp.openTime || now) >= 60_000) {
+            try {
+              const dz = await this.host.deals(Math.floor((bp.openTime || now) / 1000) - 5, 0);
+              const outz = dz.filter((d) => d.positionId === key && d.entry === "out");
+              const volz = outz.reduce((a, d) => a + d.volume, 0);
+              zombie = outz.length > 0 && bp.lots > 0 && volz >= bp.lots * 0.9;
+            } catch { /* deals unavailable — fall through to normal adoption */ }
+          }
+          if (zombie) {
+            this.settled.set(key, now);
+            this.staleListHits++;
+            if (this.staleListHits <= 3 || this.staleListHits % 10 === 1) {
+              this.think(`⚠️ sync এ বন্ধ-হয়ে-যাওয়া পুরোনো পজিশন (#${key}) দেখাচ্ছে — লিস্ট পুরোনো, অ্যাডপ্ট করছি না`, "warn");
+            }
+            if (this.staleListHits >= STALE_LIST_RECYCLE) {
+              this.staleListHits = 0;
+              this.think("⚠️ ব্রোকার পজিশন-লিস্ট বারবার পুরোনো দেখাচ্ছে — সেশন রিসাইকল করছি (ফ্যান্টম-স্টর্ম আর্মার)", "warn");
+              this.requestRecycle("stale cmd-4 list (zombie relic)", [key]);
+            }
+            continue;
+          }
+          // adopted (opened before restart / by hand) — brain watches it too
+          const slDist = bp.sl > 0
+            ? Math.abs(bp.openPrice - bp.sl)
+            : (bp.tp > 0 ? Math.abs(bp.tp - bp.openPrice) / 2 : 0);
+          this.positions.set(key, {
+            ticket: key, symbol: bp.symbol, side: bp.side, lots: bp.lots,
+            lots0: bp.lots,
+            entry: bp.openPrice, sl: bp.sl, tp: bp.tp, openedAt: bp.openTime || now,
+            reason: "adopted (existing position)", price: bp.openPrice, pnl: bp.profit, pnlR: 0,
+            slDist, peakR: 0, beMoved: bp.sl > 0 && Math.abs(bp.sl - bp.openPrice) < 1e-9,
+            partialDone: false, adopted: true, origin: "manual", bankedPnl: 0,
+          });
+          this.nextReviewAt.set(key, now + REVIEW_FIRST_MS);
+          this.aiCloseVotes.set(key, 0);
+          this.calibrateCmFromDeals(bp.symbol).catch(() => {}); // v10: lock the symbol's true $-scale from its closed deals
+          this.think(`${bp.symbol} পজিশন অ্যাডপ্ট করা হলো (${bp.side} ${bp.lots}) — নজরদারি শুরু`, "info");
+          this.journalLog({ action: "info", symbol: bp.symbol, reason: `adopted ${bp.side} ${bp.lots} @ ${bp.openPrice}` });
+          this.emit(true);
+        } else {
+          // refresh broker-side SL/TP (manual edits respected)
+          const mine = this.positions.get(key)!;
+          if (bp.sl > 0) mine.sl = bp.sl;
+          if (bp.tp > 0) mine.tp = bp.tp;
+          mine.lots = bp.lots;
+          mine.pnl = bp.profit;        // the broker's own P/L — exactly what MT5 shows
+          this.calibrateCmFromDeals(bp.symbol).catch(() => {}); // v10: keep the symbol's $-scale locked to broker truth
+        }
+      }
+      // history refresh (15s cadence — v16.2: was 5s. Deals (cmd-5) share
+      // one FIFO response order at the broker; the poll's 24h fetches were
+      // queue-jamming the small push-time queries (adoption once measured
+      // 4.9s behind one). Real events are covered at push latency: the push
+      // gate (2s) + the settle-time refresh; this poll is only a safety net
+      // for missed pushes.)
+      if (Date.now() - this.historyAt > 15_000) {
         this.historyAt = Date.now();
         this.refreshHistory().catch(() => {});
       }
-      if (emptyList && this.positions.size > 0) {
+      if (emptyList && this.positions.size > 0 && pushRecent) {
+        // ══ v16 PUSH-EXPLAINED EMPTY LIST ══ the broker JUST pushed a trade
+        // event and now the position list is empty — that is the EXPECTED
+        // aftermath of "everything closed", not a wedge. Prove each tracked
+        // position against the deal history immediately (no 3-empty-sync
+        // wait; a 3s fresh-open grace replaces the 15s poll-mode one — a
+        // just-opened position CAN legitimately hit SL within seconds and
+        // the app must show that close, not 30 seconds of fake live P/L).
+        // Deal-proof still REQUIRED — this is not the old phantom path.
+        for (const p of [...this.positions.values()]) {
+          if (now - p.openedAt < 3_000) continue;
+          if ((this.reconcileTries.get(p.ticket) ?? 0) >= 12) continue;
+          await this.reconcileMissing(p, "push-empty proof", true);
+        }
+      } else if (emptyList && this.positions.size > 0) {
         this.emptySyncs = (this.emptySyncs ?? 0) + 1;
         if (this.emptySyncs === 2) {
           this.think("⚠️ ব্রোকার sync খালি তালিকা দিচ্ছে কিন্তু আমার পজিশন আছে — ডেটা সন্দেহজনক, কিছু বন্ধ করছি না", "warn");
@@ -2880,127 +3184,27 @@ export class AiTrader {
         if (positions.some((bp) => (bp.order || bp.id) === p.ticket)) continue; // broker lists it — wait
         const tries = (this.reconcileTries.get(p.ticket) ?? 0);
         if (tries >= 12) continue;                           // checked enough — keep watching
-        if (tries % 3 === 0) await this.reconcileMissing(p, "ghost-check", true);
-      }
-      // the whole list is clean of settled tickets → reset the stale counter
-      let anySettled = false;
-      for (const bp of positions) {
-        if (this.settled.has(bp.order || bp.id)) { anySettled = true; break; }
-      }
-      if (!anySettled) this.staleListHits = 0;
-      for (const bp of positions) {
-        // position id (Exness fills trade_order=0 in this record — use the id)
-        const key = bp.order || bp.id;
-        live.add(key);
-        // ══ PHANTOM ARMOR (v5) ══ — a settled ticket can NEVER come back. If
-        // the broker lists one, the cmd-4 list is STALE (wedged session), not
-        // a real position: skip it, count the stale hit, recycle on repeat.
-        if (this.settled.has(key)) {
-          this.staleListHits++;
-          if (this.staleListHits === 1) {
-            this.think(`⚠️ sync একটি সেটেল-হওয়া টিকিট (#${key}) দেখাচ্ছে — লিস্ট পুরোনো হতে পারে, রি-অ্যাডপ্ট করছি না`, "warn");
-          }
-          // ══ v10.3 TOMBSTONE SELF-HEAL — the livelock core ══
-          // If the SAME ticket is listed again AFTER a recycle, the list is
-          // probably NOT stale — OUR TOMBSTONE is wrong (a live position
-          // falsely settled during a wedged session, e.g. by a garbage deals
-          // window). Verify against the deal history: still-open (in-volume
-          // > out-volume) → un-settle, persist, and let the next sync adopt
-          // the live position again. Without this the armor itself becomes
-          // an infinite recycle loop (the Sep-30 storm: 79 recycles).
-          const seen = (this.staleTicketRecycles.get(key) ?? 0) + 1;
-          this.staleTicketRecycles.set(key, seen);
-          if (seen === 2 || (seen > 2 && seen % 10 === 0)) { // first check + backoff retry if deals were unavailable
-            let inVol = 0, outVol = 0, healed = false;
-            try {
-              const dh = await this.host.deals(Math.floor(now / 1000) - 86400, 0);
-              for (const d of dh) {
-                if (d.positionId !== key) continue;
-                if (d.entry === "in") inVol += d.volume;
-                else if (d.entry === "out") outVol += d.volume;
-              }
-              healed = inVol > 0 && outVol < inVol * 0.9; // deals prove it is STILL OPEN
-            } catch { /* deals unavailable — keep the tombstone, storm breaker caps the damage */ }
-            if (healed) {
-              this.settled.delete(key);
-              this.staleTicketRecycles.delete(key);
-              this.staleListHits = 0;
-              this.think(`🔄 #${key} আসলে এখনও খোলা (ডিল: ইন ${inVol.toFixed(2)} / আউট ${outVol.toFixed(2)}) — ভুল টম্বস্টোন সরালাম, আবার ট্র্যাক করছি`, "good");
-              this.journalLog({ action: "info", symbol: bp.symbol, reason: `tombstone #${key} was WRONG (deals: in ${inVol.toFixed(2)} > out ${outVol.toFixed(2)}) — un-settled, re-tracking live position` });
-              continue; // next sync re-adopts it through the normal path
-            }
-          }
-          if (this.staleListHits >= STALE_LIST_RECYCLE) {
-            this.staleListHits = 0;
-            this.think("⚠️ ব্রোকার পজিশন-লিস্ট বারবার পুরোনো দেখাচ্ছে — সেশন রিসাইকল করছি (ফ্যান্টম লুপ আর্মার)", "warn");
-            this.requestRecycle("stale cmd-4 list", [key]);
-          }
-          continue;
-        }
-        this.vanish.delete(key);
-        this.reconcileTries.delete(key); // it's back — restore a clean slate for its next close
-        if (!this.positions.has(key)) {
-          // ══ v6.1 ZOMBIE PRE-CHECK ══ — a wedged cmd-4 keeps listing
-          // positions that are ALREADY CLOSED on the server (the 09:28 storm:
-          // 83 phantom closes in one burst). An unknown position whose deals
-          // show a full out-volume is a stale-list relic: tombstone it
-          // silently, NEVER adopt, and count the stale hit — the list itself
-          // is provably old, so recycle the session on repeat.
-          let zombie = false;
-          try {
-            const dz = await this.host.deals(Math.floor((bp.openTime || now) / 1000) - 5, 0);
-            const outz = dz.filter((d) => d.positionId === key && d.entry === "out");
-            const volz = outz.reduce((a, d) => a + d.volume, 0);
-            zombie = outz.length > 0 && bp.lots > 0 && volz >= bp.lots * 0.9;
-          } catch { /* deals unavailable — fall through to normal adoption */ }
-          if (zombie) {
-            this.settled.set(key, now);
-            this.staleListHits++;
-            if (this.staleListHits <= 3 || this.staleListHits % 10 === 1) {
-              this.think(`⚠️ sync এ বন্ধ-হয়ে-যাওয়া পুরোনো পজিশন (#${key}) দেখাচ্ছে — লিস্ট পুরোনো, অ্যাডপ্ট করছি না`, "warn");
-            }
-            if (this.staleListHits >= STALE_LIST_RECYCLE) {
-              this.staleListHits = 0;
-              this.think("⚠️ ব্রোকার পজিশন-লিস্ট বারবার পুরোনো দেখাচ্ছে — সেশন রিসাইকল করছি (ফ্যান্টম-স্টর্ম আর্মার)", "warn");
-              this.requestRecycle("stale cmd-4 list (zombie relic)", [key]);
-            }
-            continue;
-          }
-          // adopted (opened before restart / by hand) — brain watches it too
-          const slDist = bp.sl > 0
-            ? Math.abs(bp.openPrice - bp.sl)
-            : (bp.tp > 0 ? Math.abs(bp.tp - bp.openPrice) / 2 : 0);
-          this.positions.set(key, {
-            ticket: key, symbol: bp.symbol, side: bp.side, lots: bp.lots,
-            lots0: bp.lots,
-            entry: bp.openPrice, sl: bp.sl, tp: bp.tp, openedAt: bp.openTime || now,
-            reason: "adopted (existing position)", price: bp.openPrice, pnl: bp.profit, pnlR: 0,
-            slDist, peakR: 0, beMoved: bp.sl > 0 && Math.abs(bp.sl - bp.openPrice) < 1e-9,
-            partialDone: false, adopted: true, origin: "manual", bankedPnl: 0,
-          });
-          this.nextReviewAt.set(key, now + REVIEW_FIRST_MS);
-          this.aiCloseVotes.set(key, 0);
-          this.calibrateCmFromDeals(bp.symbol).catch(() => {}); // v10: lock the symbol's true $-scale from its closed deals
-          this.think(`${bp.symbol} পজিশন অ্যাডপ্ট করা হলো (${bp.side} ${bp.lots}) — নজরদারি শুরু`, "info");
-          this.journalLog({ action: "info", symbol: bp.symbol, reason: `adopted ${bp.side} ${bp.lots} @ ${bp.openPrice}` });
-          this.emit(true);
-        } else {
-          // refresh broker-side SL/TP (manual edits respected)
-          const mine = this.positions.get(key)!;
-          if (bp.sl > 0) mine.sl = bp.sl;
-          if (bp.tp > 0) mine.tp = bp.tp;
-          mine.lots = bp.lots;
-          mine.pnl = bp.profit;        // the broker's own P/L — exactly what MT5 shows
-          this.calibrateCmFromDeals(bp.symbol).catch(() => {}); // v10: keep the symbol's $-scale locked to broker truth
-        }
+        // v16.1: fire-and-forget — an awaited ghost-check cmd-5 once blocked
+        // every sync pass and starved adoption behind it
+        if (tries % 3 === 0) this.reconcileMissing(p, "ghost-check", true).catch(() => {});
       }
       for (const p of [...this.positions.values()]) {
         if (live.has(p.ticket)) continue;
         if (emptyList) continue; // no evidence — keep watching (quotes still mark price)
-        // ── ANTI-PHANTOM: require 2 consecutive missing syncs AND age > 30s
         const streak = (this.vanish.get(p.ticket) ?? 0) + 1;
         const age = now - p.openedAt;
-        if (streak >= 2 && age > 30_000) {
+        if (pushRecent) {
+          // ── v16 PUSH-TRIGGERED CLOSE PATH: the broker said something
+          //    changed and this position is no longer in the broker's list.
+          //    The old 2-streak + 30s-age gate existed to survive push-silent
+          //    wedged lists lying to us; when the broker itself just spoke,
+          //    the absence is real evidence. reconcile with requireProof:
+          //    the closing DEAL must confirm — no deal → keep watching
+          //    (armor intact), deal → settle + TP/SL badge + emit(true) now. ──
+          this.vanish.delete(p.ticket);
+          await this.reconcileMissing(p, "broker-push", true);
+        } else if (streak >= 2 && age > 30_000) {
+          // ── ANTI-PHANTOM (poll-only): require 2 consecutive missing syncs AND age > 30s
           this.vanish.delete(p.ticket);
           await this.reconcileMissing(p, "sync");
         } else {
@@ -3030,6 +3234,25 @@ export class AiTrader {
       }
     } finally {
       this.syncBusy = false;
+      // v16.2 PERIODIC DEALS-TRUTH SWEEP: on a session whose cmd-4 list is
+      // frozen (login-time snapshot — VERIFIED LIVE on Exness), a close that
+      // produced NO cmd-19 push (missed during a reconnect window) would
+      // never leave the frozen list and the position would show open
+      // forever. Every ~30s of syncs, settle anything the DEALS prove
+      // closed (requireProof — the armor is not negotiable).
+      this.syncCount++;
+      if (this.positions.size > 0 && this.syncCount % 60 === 0) {
+        this.dealsTruthSweep().catch(() => {});
+      }
+      // v16: a push arrived while this sync was running — its state change
+      // was newer than the snapshot we just processed; run one more pass so
+      // it is never dropped (the 180ms coalesce in onBrokerPush bounds the
+      // re-run rate)
+      if (this.syncQueued) {
+        const t = this.syncQueued;
+        this.syncQueued = null;
+        setTimeout(() => { this.syncPositions(t).catch(() => {}); }, 30);
+      }
     }
   }
 

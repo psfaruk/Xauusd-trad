@@ -612,6 +612,9 @@ const trader = new AiTrader({
   closePosition: (s, side, lots, price, ticket, opts) => manager.traderClose(s, side, lots, price, ticket, opts),
   modifyPosition: (s, side, lots, price, ticket, sl, tp, opts) => manager.traderModify(s, side, lots, price, ticket, sl, tp, opts),
   deals: (f, t) => manager.traderDeals(f, t),
+  // v16 EVENT-FIRST: the trader mirrors account/positions/history the moment
+  // the broker pushes cmd 14/19/22 — polls are backup only.
+  onTradePush: (cb) => { manager.onTradePush = cb; },
 });
 trader.onState((s) => { try { io.to("trader").emit("trader", s); } catch {} });
 

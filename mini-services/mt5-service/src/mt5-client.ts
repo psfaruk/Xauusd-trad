@@ -41,6 +41,26 @@ export interface Mt5Candle {
 }
 export interface LiveQuote { symbolId: number; timeSec: number; bidRaw: number; askRaw: number; }
 export interface SymbolInfo { id: number; digits: number; name: string; }
+
+/** v16 — broker-side account/trade push (cmd 14 / 19 / 22). These arrive the
+ *  MOMENT something changes at the broker (any connection: this app, the
+ *  MT5 terminal, the server's own SL/TP execution). kind="trade" carries the
+ *  parsed cmd-19 result (Exness stamps "sl"/"tp" in the closing deal's
+ *  comment — classification is possible at push latency); the other two are
+ *  bare "something changed" pokes. */
+export interface BrokerPush {
+  kind: "trade" | "pos_update" | "acct_update";
+  retcode?: number;
+  order?: number;
+  positionId?: number;
+  deal?: number;
+  symbol?: string;
+  volume?: number;
+  price?: number;
+  comment?: string;
+  sl?: number;
+  tp?: number;
+}
 export interface AccountInfo {
   login: number; balance: number; equity: number;
   currency: string; group: string; server: string;
@@ -238,7 +258,7 @@ export class Mt5WsClient {
   private onCloseCb: (() => void) | null = null;
   // trading: cmd-19 trade events matched FIFO (trades are serialized)
   private pendingTrades: PendingTrade[] = [];
-  private tradeEventHandler: ((ev: { kind: "trade" | "pos_update" | "acct_update"; retcode?: number; order?: number; positionId?: number; symbol?: string; side?: TradeSide; volume?: number; price?: number; profit?: number }) => void) | null = null;
+  private tradeEventHandler: ((ev: BrokerPush) => void) | null = null;
   closed = false;
   readonly host: string;
   lastRecvAt = Date.now();
@@ -324,7 +344,13 @@ export class Mt5WsClient {
   get isOpen() { return !this.closed && this.ws.readyState === WebSocket.OPEN; }
   onClose(cb: () => void) { this.onCloseCb = cb; }
   onQuotes(h: (q: LiveQuote) => void) { this.quoteHandler = h; }
-  onTradeEvent(h: (ev: { kind: "trade" | "pos_update" | "acct_update"; retcode?: number; order?: number; positionId?: number; symbol?: string; side?: TradeSide; volume?: number; price?: number; profit?: number }) => void) { this.tradeEventHandler = h; }
+  /** v16: the full broker push payload — everything already parsed off the
+   *  cmd-19 Op/Ap echo, forwarded so the manager/trader can mirror account
+   *  state on the BROKER'S word (event-first) instead of polling.
+   *  kind="trade"   → cmd 19 (a trade executed: open/close/modify, ANY connection)
+   *  kind="pos_update" → cmd 22 (position list changed at the broker)
+   *  kind="acct_update" → cmd 14 (account state changed: balance/equity) */
+  onTradeEvent(h: (ev: BrokerPush) => void) { this.tradeEventHandler = h; }
 
   /** cmd 19 push — 380B: [seq u32][Op 248B][Ap 128B].
    *
@@ -402,9 +428,20 @@ export class Mt5WsClient {
       } else if (this.pendingTrades.length && MT5_DEBUG) {
         console.log(`[mt5] cmd19 FOREIGN (no identity match) — pending kept: ${this.pendingTrades.map((t) => t.label).join(",")}`);
       }
+      // v16: forward the RICH payload — the trader can classify TP/SL from
+      // the deal comment at the push's own latency (one round-trip), not at
+      // the next poll. positionId prefers the Op echo's position ticket
+      // (the `order` field is the ORDER id, not the position id).
       this.tradeEventHandler?.({
         kind: "trade", retcode, order,
-        positionId: order,
+        positionId: ev.position || order,
+        deal: result.deal,
+        symbol: ev.symbol || undefined,
+        volume: result.volumeRaw > 0 ? result.volumeRaw / 1e8 : undefined,
+        price: result.price || undefined,
+        comment: result.comment || undefined,
+        sl: ev.sl || undefined,
+        tp: ev.tp || undefined,
       });
     } catch { /* never die on a malformed trade event */ }
   }

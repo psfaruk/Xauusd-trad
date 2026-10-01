@@ -357,12 +357,14 @@ class FeedStore {
         })
         .catch(() => {});
     } else if (this.traderState) fn();
+    // v16: the trader stream stays LIVE for the whole app lifetime — never
+    // traderunsub. The old cleanup (unsub when the last listener left) meant
+    // switching to the Chart tab KILLED the account mirror: a trade closing
+    // on MT5 while the user watched the chart went unseen, and returning to
+    // Home showed a stale REST snapshot. The socket room costs nothing; the
+    // reconnect handler re-emits tradersub because traderLive stays true.
     return () => {
       this.traderSubs.delete(fn);
-      if (!this.traderSubs.size) {
-        this.traderLive = false;
-        this.socket?.emit("traderunsub");
-      }
     };
   }
   getTraderSnapshot(): TraderState | null { return this.traderState; }

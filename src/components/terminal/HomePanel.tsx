@@ -85,14 +85,20 @@ export function HomePanel({ analysis }: { analysis: AnalysisResponse | null }) {
             <div>
               <div className="text-[10px] uppercase tracking-wider text-muted-foreground">{t("balance")}</div>
               <div className="tnum font-mono text-lg font-bold text-foreground">
-                {trader?.balance != null ? trader.balance.toFixed(2) : "—"}
-                <span className="ml-1 text-[10px] font-normal text-muted-foreground">{trader?.currency ?? "USD"}</span>
+                {/* v16: trader stream is the freshest (push-driven); the status
+                    event's account fills the gap while the stream boots */}
+                {(trader?.balance ?? status?.account?.balance) != null
+                  ? (trader?.balance ?? status?.account?.balance)!.toFixed(2)
+                  : "—"}
+                <span className="ml-1 text-[10px] font-normal text-muted-foreground">{trader?.currency ?? status?.account?.currency ?? "USD"}</span>
               </div>
             </div>
             <div>
               <div className="text-[10px] uppercase tracking-wider text-muted-foreground">{t("equity")}</div>
               <div className="tnum font-mono text-lg font-bold text-foreground">
-                {trader?.equity != null ? trader.equity.toFixed(2) : "—"}
+                {(trader?.equity ?? status?.account?.equity) != null
+                  ? (trader?.equity ?? status?.account?.equity)!.toFixed(2)
+                  : "—"}
               </div>
             </div>
             <div>
