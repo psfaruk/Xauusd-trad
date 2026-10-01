@@ -1,4 +1,11 @@
-{$PORT} {
+# v15.1 CRITICAL: the site address is ":{$PORT}" — WITH the leading colon.
+# The old "{$PORT}" expanded to a bare token like "8080", which Caddy
+# parsed as a DOMAIN NAME: it tried to issue a public ACME certificate
+# for the literal domain "8080" (failing forever: "could not get
+# certificate from issuer") and bound :80/:443 instead of $PORT — so the
+# Railway healthcheck and the generated domain had no listener at all.
+# ":{$PORT}" binds exactly $PORT, plain HTTP, no ACME, no auto-HTTPS.
+:{$PORT} {
         # ══════════════════════════════════════════════════════════════════
         # v14 SECURITY: the public door is now SINGLE-PURPOSE.
         #   ?XTransformPort=3030 → mt5-service socket.io (live ticks/bars/flow)
@@ -14,8 +21,6 @@
         handle @io_port {
                 reverse_proxy localhost:3030 {
                         header_up Host {host}
-                        header_up X-Forwarded-For {remote_host}
-                        header_up X-Forwarded-Proto {scheme}
                         header_up X-Real-IP {remote_host}
                 }
         }
@@ -24,8 +29,6 @@
         handle {
                 reverse_proxy localhost:3000 {
                         header_up Host {host}
-                        header_up X-Forwarded-For {remote_host}
-                        header_up X-Forwarded-Proto {scheme}
                         header_up X-Real-IP {remote_host}
                 }
         }

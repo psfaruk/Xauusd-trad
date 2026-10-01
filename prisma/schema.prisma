@@ -1,5 +1,13 @@
+// binaryTargets — Railway deploy crash fix (v15.1):
+// `prisma generate` runs under BUN in the Docker builder, and Bun reports
+// its own linked OpenSSL (1.1.x) → "native" resolved to
+// debian-openssl-1.1.x. At runtime the client detects the SYSTEM libssl
+// (debian-openssl-3.0.x on bookworm) → "Query Engine not found" →
+// PrismaClientInitializationError on every DB call. Ship every Debian
+// engine so whichever side the detection lands on, the .so is there.
 generator client {
-  provider = "prisma-client-js"
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "debian-openssl-3.0.x", "debian-openssl-1.1.x"]
 }
 
 datasource db {

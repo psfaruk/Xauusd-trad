@@ -103,11 +103,12 @@ else
 fi
 
 PIDS=()
+NAMES=()
 
 echo "[start] mt5-service…"
 cd /app/mini-services/mt5-service
 bun index.ts &
-PIDS+=($!)
+PIDS+=("$!"); NAMES+=("mt5-service")
 
 echo "[start] next.js…"
 cd /app
@@ -118,14 +119,20 @@ cd /app
 # 0.0.0.0 listener) proxies to it at localhost:3000.
 PORT=3000 HOSTNAME=127.0.0.1 NODE_ENV=production DATABASE_URL="$DATABASE_URL" \
   MT5_SERVICE_URL="$MT5_SERVICE_URL" bun server.js &
-PIDS+=($!)
+PIDS+=("$!"); NAMES+=("next.js")
 
 echo "[start] caddy gateway on :${PORT}…"
 caddy run --config /app/Caddyfile.railway --adapter caddyfile &
-PIDS+=($!)
+PIDS+=("$!"); NAMES+=("caddy")
 
-# ── bounded readiness probes (diagnostics only; healthcheck is Railway's) ──
+# ── bounded readiness probe (diagnostics only; healthcheck is Railway's) ──
+# v15.1 CRITICAL: this subshell must NEVER exit. Its old `exit 0` on
+# success was reaped by `wait -n` below and misread as an app crash —
+# the container "crashed" 2s after every healthy boot, 11 restart loops
+# in 25s on Railway. After reporting (or timing out) it parks forever,
+# so `wait -n` only ever fires for a REAL app process (mt5/next/caddy).
 (
+  REPORTED=0
   for i in $(seq 1 60); do
     sleep 2
     REST=0; NEXT=0
@@ -133,16 +140,37 @@ PIDS+=($!)
     curl -sf -m 2 http://127.0.0.1:3000/ >/dev/null 2>&1 && NEXT=1
     if [ "$REST" = 1 ] && [ "$NEXT" = 1 ]; then
       echo "[ready] mt5-service REST ✓ + Next.js ✓ (after $((i*2))s)"
-      exit 0
+      REPORTED=1
+      break
     fi
     [ $((i % 15)) = 0 ] && echo "[boot] still waiting… rest=$REST next=$NEXT ($((i*2))s)"
   done
-  echo "[boot] readiness wait timed out — container stays up, Railway healthcheck decides"
+  [ "$REPORTED" = 0 ] && echo "[boot] readiness wait timed out — container stays up, Railway healthcheck decides"
+  # park forever: stay a child that never terminates on its own
+  while true; do sleep 3600; done
 ) &
+PROBE_PID=$!
 
-# ── supervisor: first child that dies takes the container down ──
-trap 'kill "${PIDS[@]}" 2>/dev/null; exit 1' SIGTERM SIGINT
-wait -n
-echo "⚠️  a process exited (code $?) — shutting container down for a fresh restart"
-kill "${PIDS[@]}" 2>/dev/null || true
+# ── supervisor: first APP process that dies takes the container down ──
+trap 'kill "${PIDS[@]}" "$PROBE_PID" 2>/dev/null; exit 1' SIGTERM SIGINT
+while true; do
+  set +e
+  wait -n
+  CODE=$?
+  set -e
+  # A child exited — was it an APP process or just the probe subshell?
+  # Only tear the container down if an app process is actually dead.
+  ALL_ALIVE=1
+  for i in "${!PIDS[@]}"; do
+    kill -0 "${PIDS[$i]}" 2>/dev/null || ALL_ALIVE=0
+  done
+  [ "$ALL_ALIVE" = 1 ] && continue   # probe/stray child died — apps fine, keep waiting
+  break
+done
+# name the fallen process(es) for the deploy log
+for i in "${!PIDS[@]}"; do
+  kill -0 "${PIDS[$i]}" 2>/dev/null || echo "⚠️  ${NAMES[$i]} (pid ${PIDS[$i]}) exited"
+done
+echo "⚠️  a process exited (code ${CODE}) — shutting container down for a fresh restart"
+kill "${PIDS[@]}" "$PROBE_PID" 2>/dev/null || true
 exit 1
