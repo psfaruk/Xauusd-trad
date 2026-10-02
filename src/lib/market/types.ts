@@ -293,12 +293,15 @@ export type AutoDrawing =
       kind: "zone";
       side: "supply" | "demand" | "ob_bull" | "ob_bear" | "fvg_bull" | "fvg_bear";
       lo: number; hi: number; t: number; source_tf?: string; state?: "active" | "faded";
+      /** v16.5: the zone's origin bar had a ≥1.5σ tick-volume spike — an
+       * institutional footprint; the label carries an INST tag */
+      institutional?: boolean;
     }
   | { kind: "channel"; dir: "up" | "down"; upper: { t1: number; p1: number; t2: number; p2: number }; lower: { t1: number; p1: number; t2: number; p2: number } }
   | { kind: "trendline"; t1: number; p1: number; t2: number; p2: number; tone: Tone; broken?: boolean; state?: "active" | "faded" }
   | { kind: "fib"; t0: number; p0: number; t1: number; p1: number; dir: "up" | "down"; levels: { ratio: number; price: number }[]; ote?: [number, number] }
   | { kind: "sweep"; t: number; price: number; side: "high" | "low" }
-  | { kind: "structure"; t: number; price: number; dir: "up" | "down"; label: "BOS" | "CHoCH"; fromT?: number }
+  | { kind: "structure"; t: number; price: number; dir: "up" | "down"; label: "BOS" | "CHoCH"; fromT?: number; source_tf?: string }
   /** market-structure zigzag — connects the confirmed swings (HH/HL/LH/LL path) */
   | { kind: "zigzag"; points: { t: number; p: number; side: "high" | "low" }[] }
   | { kind: "arrow"; t: number; price: number; dir: "up" | "down"; tone?: Tone }
@@ -311,7 +314,20 @@ export type AutoDrawing =
   | { kind: "magnet"; price: number; source: string; dist_atr: number }
   | { kind: "liq"; side: "BSL" | "SSL"; price: number; t: number; state: "untouched" | "swept" | "run" }
   | { kind: "path"; dir: "up" | "down"; from_price: number; to_price: number }
-  | { kind: "pattern"; name: string; family: "reversal" | "continuation"; points: { t: number; price: number; n: number }[]; neckline?: { t1: number; p1: number; t2: number; p2: number }; target?: number };
+  | { kind: "pattern"; name: string; family: "reversal" | "continuation"; points: { t: number; price: number; n: number }[]; neckline?: { t1: number; p1: number; t2: number; p2: number }; target?: number }
+  // ── v16.5 — the market-structure narrative layer (user spec) ──
+  /** a consolidation range: where price coiled before its next decision */
+  | { kind: "range"; t0: number; t1: number; hi: number; lo: number; state: "forming" | "broken_up" | "broken_down"; source_tf?: string }
+  /** one AMD phase segment (accumulation / manipulation / distribution) */
+  | { kind: "amd"; phase: "accumulation" | "manipulation" | "distribution"; t0: number; t1: number; hi: number; lo: number; dir: "up" | "down"; done: boolean; source_tf?: string }
+  /** big-player footprint: volume-spiked impulse candle */
+  | { kind: "instit"; t: number; price: number; side: "buy" | "sell"; volZ: number; source_tf?: string }
+  /** the forward map: projected legs to the roadmap targets + the alternate scenario */
+  | {
+      kind: "forecast"; from: number;
+      primary: { dir: "up" | "down"; legs: { price: number; label: string }[]; note: string };
+      alternate: { dir: "up" | "down"; legs: { price: number; label: string }[]; note: string } | null;
+    };
 
 /** User-created drawings (persisted). */
 export interface UserDrawing {

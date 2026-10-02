@@ -4,15 +4,16 @@
  * trendlines → fib → structure → swings → liquidity → magnets → path).
  */
 
-import type { AutoDrawing, Candle, Tone } from "./types";
+import type { AutoDrawing, Candle, RoadmapData, Tone } from "./types";
 import { atr, ema, swings } from "./indicators";
 import {
   detectStructure, detectOrderBlocks, detectFvg, detectLiquidity, detectSupplyDemand,
   premiumDiscount, type LiquidityPool, type StructureRead, type Zone,
 } from "./smc";
 import type { SignalPayload } from "./types";
+import type { AmdPhase, ConsolidationRange, InstitutionalMark } from "./phases";
 
-const MAX_DRAWINGS = 60;
+const MAX_DRAWINGS = 96;
 
 export function buildDrawings(
   bars: Candle[],
@@ -24,7 +25,12 @@ export function buildDrawings(
     signal: SignalPayload | null;
     projection?: ProjectedSetup | null;
   },
-  higherTfZones: Zone[] = [],
+  /** v16.5: HTF zones arrive as {tf, zones} groups so EVERY group is labeled
+   * with its true source timeframe (H1 + H4 — audit §2.6). */
+  htfZoneGroups: { tf: string; zones: Zone[] }[] = [],
+  /** v16.5: bar-time → tick-volume z (≥1.5) — zone origin bars with a spike
+   * get the INST (institutional) tag on their label. */
+  volSpikes: Map<number, number> = new Map(),
 ): AutoDrawing[] {
   const out: AutoDrawing[] = [];
   if (bars.length < 30) return out;
@@ -79,24 +85,28 @@ export function buildDrawings(
     });
   }
 
-  // 3. zones (this TF + higher TF bonus, capped) — only ALIVE zones
+  // 3. zones (this TF + HTF context groups, capped) — only ALIVE zones
   // (the detectors now keep broken zones in the universe for as-of use)
   const alive = (z: Zone) => z.brokenT == null;
-  const zoneKinds: Zone[] = [
-    ...ctx.zones.filter((z) => alive(z) && ["demand", "supply"].includes(z.side)).slice(-4),
-    ...ctx.zones.filter((z) => alive(z) && z.side.startsWith("ob")).slice(-3),
-    ...ctx.zones.filter((z) => alive(z) && z.side.startsWith("fvg") && !z.filled && (z.gapAtr ?? 0) >= 0.3).slice(-3),
-    ...higherTfZones.filter((z) => z.brokenT == null && ["demand", "supply"].includes(z.side)).slice(-2),
+  const inst = (t: number) => (volSpikes.get(t) ?? 0) >= 1.5;
+  const zoneKinds: { z: Zone; src: string }[] = [
+    ...ctx.zones.filter((z) => alive(z) && ["demand", "supply"].includes(z.side)).slice(-4).map((z) => ({ z, src: tf })),
+    ...ctx.zones.filter((z) => alive(z) && z.side.startsWith("ob")).slice(-3).map((z) => ({ z, src: tf })),
+    ...ctx.zones.filter((z) => alive(z) && z.side.startsWith("fvg") && !z.filled && (z.gapAtr ?? 0) >= 0.3).slice(-3).map((z) => ({ z, src: tf })),
+    ...htfZoneGroups.flatMap((g) =>
+      g.zones.filter((z) => alive(z) && ["demand", "supply"].includes(z.side)).slice(-2).map((z) => ({ z, src: g.tf })),
+    ),
   ];
-  for (const z of zoneKinds) {
+  for (const { z, src } of zoneKinds) {
     out.push({
       kind: "zone",
       side: z.side as any,
       lo: z.lo, hi: z.hi, t: z.t,
-      // v16.4 (audit §2.6/§6): HTF zones carry their TRUE source timeframe
-      // (H1 supply/demand computed from bars.H1 in the analysis route) — the
-      // old `${tf}·HTF` label implied the ACTIVE timeframe owned them.
-      source_tf: higherTfZones.includes(z) ? "H1" : tf,
+      // v16.4 (audit §2.6/§6): zones carry their TRUE source timeframe —
+      // HTF groups are labeled H1/H4, local zones get the active tf.
+      // v16.5: a ≥1.5σ volume-spiked origin ⇒ INST (institutional) tag.
+      source_tf: src,
+      institutional: inst(z.t),
       state: z.mitT ? "faded" : "active",
     });
   }
@@ -142,7 +152,7 @@ export function buildDrawings(
 
   // 6. structure events (BOS/CHoCH break lines + diamonds)
   for (const ev of ctx.structure.events.slice(-4)) {
-    out.push({ kind: "structure", t: ev.t, price: ev.price, dir: ev.dir, label: ev.label, fromT: ev.fromT });
+    out.push({ kind: "structure", t: ev.t, price: ev.price, dir: ev.dir, label: ev.label, fromT: ev.fromT, source_tf: tf });
   }
 
   // 6b. market-structure zigzag — the swing map, connected
@@ -325,6 +335,105 @@ export function magnetsToDrawings(
 export function pathToDrawing(path: { dir: "up" | "down"; target: number } | null, price: number): AutoDrawing | null {
   if (!path) return null;
   return { kind: "path", dir: path.dir, from_price: price, to_price: path.target };
+}
+
+// ═══════════════ v16.5 — the market-structure narrative builders ═══════════════
+
+export interface PhaseRead {
+  ranges: ConsolidationRange[];
+  amd: AmdPhase[];
+  instit: InstitutionalMark[];
+}
+
+/**
+ * Phase ink — consolidation ranges (active tf + the freshest H1/H4 ranges
+ * for the multi-timeframe story), AMD sequences and big-player footprints.
+ * Every item carries its source timeframe (audit §2.6 identity contract).
+ */
+export function buildPhaseDrawings(
+  tf: string,
+  ph: PhaseRead,
+  htfRanges: { tf: string; range: ConsolidationRange | null }[] = [],
+): AutoDrawing[] {
+  const out: AutoDrawing[] = [];
+  // ranges whose t0 collides with an AMD accumulation are skipped — the AMD
+  // label already tells that story (no double boxes)
+  const amdT0 = new Set(ph.amd.filter((p) => p.phase === "accumulation").map((p) => p.t0));
+  const local = ph.ranges.slice(-2).filter((r) => !amdT0.has(r.t0));
+  for (const r of local) {
+    out.push({ kind: "range", t0: r.t0, t1: r.t1, hi: r.hi, lo: r.lo, state: r.state, source_tf: tf });
+  }
+  for (const g of htfRanges) {
+    if (g.range && !amdT0.has(g.range.t0)) {
+      out.push({ kind: "range", t0: g.range.t0, t1: g.range.t1, hi: g.range.hi, lo: g.range.lo, state: g.range.state, source_tf: g.tf });
+    }
+  }
+  for (const p of ph.amd) {
+    out.push({ kind: "amd", phase: p.phase, t0: p.t0, t1: p.t1, hi: p.hi, lo: p.lo, dir: p.dir, done: p.done, source_tf: tf });
+  }
+  for (const m of ph.instit) {
+    out.push({ kind: "instit", t: m.t, price: m.price, side: m.side, volZ: m.volZ, source_tf: tf });
+  }
+  return out;
+}
+
+/** HTF structure events (H1/H4 BOS/CHoCH) drawn on the active chart,
+ *  source-labeled — the MTF continuation/reversal context. */
+export function buildMtfStructureDrawings(mtf: {
+  h1: StructureRead | null;
+  h4: StructureRead | null;
+}): AutoDrawing[] {
+  const out: AutoDrawing[] = [];
+  const groups: [string, StructureRead | null][] = [["H1", mtf.h1], ["H4", mtf.h4]];
+  for (const [tf, read] of groups) {
+    if (!read) continue;
+    for (const ev of read.events.slice(-2)) {
+      out.push({ kind: "structure", t: ev.t, price: ev.price, dir: ev.dir, label: ev.label, fromT: ev.fromT, source_tf: tf });
+    }
+  }
+  return out;
+}
+
+/**
+ * The forward map — WHERE the market can go next: the roadmap's primary
+ * scenario (direction verdict) as projected legs to its real targets
+ * (liquidity pools / zone edges), plus the alternate scenario dimmed.
+ * Labels carry prices so the map answers "কোথায় যেতে পারে" at a glance.
+ */
+export function buildForecastDrawing(
+  rm: RoadmapData,
+  price: number,
+  digits: number,
+): AutoDrawing | null {
+  if (!rm || rm.direction === "NEUTRAL") {
+    // neutral: both sides equally live — show both, neither primary
+    if (!rm) return null;
+    const fmt = (p: number) => p.toFixed(digits);
+    return {
+      kind: "forecast",
+      from: price,
+      primary: { dir: "up", legs: rm.bullScenario.targets.slice(0, 2).map((tp, i) => ({ price: tp, label: `BULL T${i + 1} ${fmt(tp)}` })), note: rm.bullScenario.note },
+      alternate: { dir: "down", legs: rm.bearScenario.targets.slice(0, 2).map((tp, i) => ({ price: tp, label: `BEAR T${i + 1} ${fmt(tp)}` })), note: rm.bearScenario.note },
+    };
+  }
+  const bull = rm.direction === "BULL";
+  const primary = bull ? rm.bullScenario : rm.bearScenario;
+  const alternate = bull ? rm.bearScenario : rm.bullScenario;
+  const fmt = (p: number) => p.toFixed(digits);
+  return {
+    kind: "forecast",
+    from: price,
+    primary: {
+      dir: bull ? "up" : "down",
+      legs: primary.targets.slice(0, 3).map((tp, i) => ({ price: tp, label: `T${i + 1} ${fmt(tp)}` })),
+      note: rm.directionWhy,
+    },
+    alternate: {
+      dir: bull ? "down" : "up",
+      legs: alternate.targets.slice(0, 2).map((tp, i) => ({ price: tp, label: `ALT T${i + 1} ${fmt(tp)}` })),
+      note: alternate.note,
+    },
+  };
 }
 
 function lastAtrOf(bars: Candle[]): number {

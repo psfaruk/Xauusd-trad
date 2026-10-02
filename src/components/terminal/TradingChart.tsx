@@ -692,9 +692,11 @@ export default function TradingChart(props: Props) {
         hardText(ctx, text, x - padX, y + 0.5, fg, size, "right");
       };
       // per-kind layer gating (D-058-style granular hide/show)
+      // v16.5: the narrative kinds — range→zones, amd/instit/forecast→structure
       const LAYER_OF: Record<string, keyof Layers> = {
         setup: "setup",
         zone: "zones",
+        range: "zones",
         hline: "levels",
         liq: "levels",
         magnet: "levels",
@@ -707,6 +709,9 @@ export default function TradingChart(props: Props) {
         sweep: "structure",
         pattern: "structure",
         arrow: "structure",
+        amd: "structure",
+        instit: "structure",
+        forecast: "structure",
         path: "structure",
       };
       for (const d of autoRef.current) {
@@ -729,7 +734,7 @@ export default function TradingChart(props: Props) {
             if (y === null) return;
             const tone = TONES[d.tone] ?? TONES.neutral;
             const faded = d.style === "dash";
-            hardSeg(ctx, 0, y, rightEdge, y, tone.line(faded ? 0.45 : 0.9), tone.halo(0.08), 0.85, faded ? [4, 4] : []);
+            hardSeg(ctx, 0, y, rightEdge, y, tone.line(faded ? 0.45 : 0.9), tone.halo(0.08), 0.6, faded ? [4, 4] : []);
             if (tryLabel(rightEdge - 4, y - 8, d.label, 8.5, "right")) {
               pillLabel(ctx, d.label, rightEdge - 4, y - 8, tone.text, tone.line(0.5), "right", 8.5);
             }
@@ -747,13 +752,15 @@ export default function TradingChart(props: Props) {
             ctx.globalAlpha = alphaMul;
             ctx.fillStyle = st.fill;
             ctx.fillRect(x0, Math.min(y1, y2), rightEdge - x0, Math.abs(y2 - y1));
-            hardSeg(ctx, x0, y1, rightEdge, y1, st.border, st.halo, 0.9);
-            hardSeg(ctx, x0, y2, rightEdge, y2, st.border, st.halo, 0.9);
+            hardSeg(ctx, x0, y1, rightEdge, y1, st.border, st.halo, 0.62);
+            hardSeg(ctx, x0, y2, rightEdge, y2, st.border, st.halo, 0.62);
             const sideName: Record<string, string> = {
               supply: "SUPPLY", demand: "DEMAND", ob_bull: "OB+", ob_bear: "OB−",
               fvg_bull: "FVG+", fvg_bear: "FVG−",
             };
-            const zl = `${sideName[d.side] ?? d.side}${d.source_tf ? " · " + d.source_tf : ""}`;
+            // v16.5: INST tag — the zone's origin bar carried a ≥1.5σ volume
+            // spike (institutional footprint: banks/funds were active there)
+            const zl = `${sideName[d.side] ?? d.side}${d.source_tf ? " · " + d.source_tf : ""}${d.institutional ? " · INST" : ""}`;
             if (tryLabel(x0 + 4, Math.min(y1, y2) + 9, zl, 8.5, "left")) {
               pillLabel(ctx, zl, x0 + 4, Math.min(y1, y2) + 9, st.border, st.border, "left", 8.5);
             }
@@ -773,7 +780,7 @@ export default function TradingChart(props: Props) {
             const slope = (y2! - y1!) / Math.max(1, x2! - x1!);
             const xe = rightEdge;
             const ye = y1! + slope * (xe - x1!);
-            hardSeg(ctx, x1!, y1!, xe, ye, tone.line(alpha), tone.halo(0.07), 0.7, faded ? [3, 4] : []);
+            hardSeg(ctx, x1!, y1!, xe, ye, tone.line(alpha), tone.halo(0.07), 0.55, faded ? [3, 4] : []);
             break;
           }
           case "channel": {
@@ -782,7 +789,7 @@ export default function TradingChart(props: Props) {
               if ([x1, x2, y1, y2].some((v) => v === null)) return;
               const slope = (y2! - y1!) / Math.max(1, x2! - x1!);
               const ye = y1! + slope * (rightEdge - x1!);
-              hardSeg(ctx, x1!, y1!, rightEdge, ye, TONES.neutral.line(0.6), TONES.neutral.halo(0.06), 0.55);
+              hardSeg(ctx, x1!, y1!, rightEdge, ye, TONES.neutral.line(0.6), TONES.neutral.halo(0.06), 0.48);
             };
             draw(d.upper);
             draw(d.lower);
@@ -795,7 +802,7 @@ export default function TradingChart(props: Props) {
             const y0 = yOfPrice(d.p0);
             const yA = yOfPrice(d.p1);
             if ([x0, xA, y0, yA].some((v) => v === null)) return;
-            hardSeg(ctx, x0!, y0!, xA!, yA!, TONES.gold.line(0.5), TONES.gold.halo(0.05), 0.6);
+            hardSeg(ctx, x0!, y0!, xA!, yA!, TONES.gold.line(0.5), TONES.gold.halo(0.05), 0.5);
             const golden = [0.618, 0.786];
             const gp: number[] = [];
             for (const lv of d.levels) {
@@ -805,7 +812,7 @@ export default function TradingChart(props: Props) {
               hardSeg(
                 ctx, Math.max(x0!, xA!), y, rightEdge, y,
                 TONES.gold.line(isGolden ? 0.75 : 0.42),
-                TONES.gold.halo(isGolden ? 0.07 : 0.04), isGolden ? 0.7 : 0.5,
+                TONES.gold.halo(isGolden ? 0.07 : 0.04), isGolden ? 0.55 : 0.45,
               );
               hardText(ctx, `${lv.ratio.toFixed(3)}  ${lv.price.toFixed(digits)}`, rightEdge - 4, y - 7, isGolden ? TONES.gold.text : "rgba(148,163,158,0.7)", 8, "right");
               if (isGolden) gp.push(y);
@@ -830,7 +837,12 @@ export default function TradingChart(props: Props) {
             const x = xOfTime(d.t);
             const y = yOfPrice(d.price);
             if (x === null || y === null) return;
-            const color = d.label === "BOS" ? "rgba(52,211,153,0.9)" : "rgba(245,158,11,0.92)";
+            // v16.5: EVERY event carries its source tf — "BOS · H1" reads as
+            // H1 context on any chart, "BOS · M15" = the active tf's own
+            // (audit §2.6: overlay must say where each drawing came from)
+            const tag = d.source_tf ? `${d.label} · ${d.source_tf}` : d.label;
+            const isBos = d.label.startsWith("BOS");
+            const color = isBos ? "rgba(52,211,153,0.9)" : "rgba(245,158,11,0.92)";
             // the break line: from the swing origin to the breaking candle
             // (classic SMC structure-break ink, reads at a glance)
             if (d.fromT != null) {
@@ -839,14 +851,14 @@ export default function TradingChart(props: Props) {
                 const xa = clamp(x0, -2, rightEdge);
                 const xb = clamp(x + 6, xa, rightEdge);
                 if (xb > xa) {
-                  const bc = d.label === "BOS" ? "52,211,153" : "245,158,11";
-                  hardSeg(ctx, xa, y, xb, y, `rgba(${bc},0.55)`, `rgba(${bc},0.04)`, 0.9, [4, 3]);
+                  const bc = isBos ? "52,211,153" : "245,158,11";
+                  hardSeg(ctx, xa, y, xb, y, `rgba(${bc},0.55)`, `rgba(${bc},0.04)`, 0.6, [4, 3]);
                 }
               }
             }
             diamond(ctx, x, y, color, 4.5, color.replace("0.9", "0.25"), true);
-            if (tryLabel(x, y + (d.dir === "up" ? 12 : -12), d.label, 7.5, "center")) {
-              hardText(ctx, d.label, x, y + (d.dir === "up" ? 12 : -12), color, 7.5, "center");
+            if (tryLabel(x, y + (d.dir === "up" ? 12 : -12), tag, 7.5, "center")) {
+              hardText(ctx, tag, x, y + (d.dir === "up" ? 12 : -12), color, 7.5, "center");
             }
             break;
           }
@@ -859,7 +871,7 @@ export default function TradingChart(props: Props) {
             if (pts.length < 2) return;
             ctx.save();
             ctx.strokeStyle = "rgba(196,205,214,0.8)";
-            ctx.lineWidth = 1.4;
+            ctx.lineWidth = 1.0;
             ctx.setLineDash([]);
             ctx.shadowColor = "rgba(10,12,16,0.7)";
             ctx.shadowBlur = 2.5;
@@ -942,10 +954,10 @@ export default function TradingChart(props: Props) {
             ctx.save();
             ctx.shadowColor = "rgba(212,175,55,0.55)";
             ctx.shadowBlur = 5;
-            hardSeg(ctx, xs, yE, rightEdge, yE, `rgba(230,190,70,${(0.98 * inkM).toFixed(2)})`, "rgba(212,175,55,0.1)", 1.3, waiting ? [2, 3] : []);
+            hardSeg(ctx, xs, yE, rightEdge, yE, `rgba(230,190,70,${(0.98 * inkM).toFixed(2)})`, "rgba(212,175,55,0.1)", 0.95, waiting ? [2, 3] : []);
             ctx.restore();
-            hardSeg(ctx, xs, yS, rightEdge, yS, `rgba(255,120,132,${(0.92 * inkM).toFixed(2)})`, "rgba(248,113,113,0.07)", 1.0, [5, 4]);
-            hardSeg(ctx, xs, yT, rightEdge, yT, `rgba(52,211,153,${(0.92 * inkM).toFixed(2)})`, "rgba(52,211,153,0.07)", 1.0, [5, 4]);
+            hardSeg(ctx, xs, yS, rightEdge, yS, `rgba(255,120,132,${(0.92 * inkM).toFixed(2)})`, "rgba(248,113,113,0.07)", 0.72, [5, 4]);
+            hardSeg(ctx, xs, yT, rightEdge, yT, `rgba(52,211,153,${(0.92 * inkM).toFixed(2)})`, "rgba(52,211,153,0.07)", 0.72, [5, 4]);
             // right-edge contract badges (setup labels always win — force register)
             const verb = projected ? "PLAN" : waiting ? "WAIT" : "ENTRY";
             const lE = `${d.dir} ${verb} ${d.entry.toFixed(digits)}`;
@@ -983,10 +995,129 @@ export default function TradingChart(props: Props) {
             }
             break;
           }
+          // ═══════ v16.5 — the market-structure narrative (user spec) ═══════
+          case "range": {
+            // WHERE the market consolidated — the coil before the decision
+            const y1 = yOfPrice(d.hi);
+            const y2 = yOfPrice(d.lo);
+            const x1 = xOfTime(d.t0);
+            if (y1 === null || y2 === null || x1 === null) return;
+            const x2raw = d.state === "forming" ? rightEdge : xOfTime(d.t1);
+            const rx = clamp(x1, -2, rightEdge);
+            const x2 = clamp(x2raw ?? rightEdge, rx, rightEdge);
+            if (x2 - rx < 3) return;
+            const broken = d.state !== "forming";
+            const ry = Math.min(y1, y2);
+            const rh = Math.max(Math.abs(y2 - y1), 2);
+            ctx.save();
+            if (broken) ctx.setLineDash([3, 3]);
+            ctx.strokeStyle = broken ? "rgba(148,163,158,0.35)" : "rgba(178,190,185,0.8)";
+            ctx.lineWidth = 0.6;
+            ctx.fillStyle = "rgba(148,163,158,0.025)";
+            ctx.fillRect(rx, ry, x2 - rx, rh);
+            ctx.strokeRect(rx + 0.25, ry + 0.25, x2 - rx - 0.5, rh - 0.5);
+            ctx.restore();
+            const stTxt = d.state === "forming" ? "FORMING" : d.state === "broken_up" ? "BROKEN ↑" : "BROKEN ↓";
+            const rl = `CONSOLIDATION · ${d.source_tf ?? ""}${d.source_tf ? " · " : ""}${stTxt}`;
+            if (tryLabel(rx + 4, ry + 8, rl, 8, "left")) {
+              pillLabel(ctx, rl, rx + 4, ry + 8, "rgba(200,210,205,0.95)", "rgba(148,163,158,0.5)", "left", 8);
+            }
+            break;
+          }
+          case "amd": {
+            // the smart-money sequence: ACCUMULATION → MANIPULATION → DISTRIBUTION
+            const y1 = yOfPrice(d.hi);
+            const y2 = yOfPrice(d.lo);
+            const x1 = xOfTime(d.t0);
+            const x2raw = d.done ? xOfTime(d.t1) : rightEdge;
+            if (y1 === null || y2 === null || x1 === null) return;
+            const xa = clamp(x1, -2, rightEdge);
+            const xb = clamp(Math.max(x1 + 3, x2raw ?? rightEdge), xa, rightEdge);
+            if (xb - xa < 2) return;
+            const AMD_STYLE: Record<string, { stroke: (a: number) => string; fill: string; text: string }> = {
+              accumulation: { stroke: (a) => `rgba(45,212,191,${a})`, fill: "rgba(45,212,191,0.03)", text: "rgba(153,246,228,0.95)" },
+              manipulation: { stroke: (a) => `rgba(167,139,250,${a})`, fill: "rgba(167,139,250,0.045)", text: "rgba(196,181,253,0.95)" },
+              distribution: { stroke: (a) => `rgba(245,158,11,${a})`, fill: "rgba(245,158,11,0.03)", text: "rgba(251,191,36,0.95)" },
+            };
+            const st = AMD_STYLE[d.phase];
+            const ry = Math.min(y1, y2);
+            const rh = Math.max(Math.abs(y2 - y1), 3);
+            ctx.save();
+            ctx.setLineDash(d.phase === "manipulation" ? [2, 3] : [4, 3]);
+            ctx.strokeStyle = st.stroke(d.done ? 0.38 : 0.85);
+            ctx.lineWidth = 0.55;
+            ctx.fillStyle = st.fill;
+            ctx.fillRect(xa, ry, xb - xa, rh);
+            ctx.strokeRect(xa + 0.25, ry + 0.25, xb - xa - 0.5, rh - 0.5);
+            ctx.restore();
+            const arrowTxt = d.dir === "up" ? "↑" : "↓";
+            const label =
+              d.phase === "accumulation" ? `ACCUMULATION ${arrowTxt}${d.done ? "" : " · LIVE"}`
+              : d.phase === "manipulation" ? `MANIPULATION — hunt ${d.dir === "up" ? "SSL ↓" : "BSL ↑"}${d.done ? "" : " · LIVE"}`
+              : `DISTRIBUTION ${arrowTxt}${d.done ? "" : " · LIVE"}`;
+            if (tryLabel(xa + 4, ry - 7, label, 8, "left")) {
+              pillLabel(ctx, label, xa + 4, ry - 7, st.text, st.stroke(0.5), "left", 8);
+            }
+            break;
+          }
+          case "instit": {
+            // big players were HERE — volume-spiked impulse candle
+            const x = xOfTime(d.t);
+            const y = yOfPrice(d.price);
+            if (x === null || y === null) return;
+            const bull = d.side === "buy";
+            const ay = y + (bull ? 17 : -17);
+            arrow(ctx, x, ay, bull ? "up" : "down", bull ? "rgba(52,211,153,0.95)" : "rgba(248,113,113,0.95)", "transparent", 5);
+            const il = `${bull ? "BIG BUYERS" : "BIG SELLERS"} · z${d.volZ.toFixed(1)}`;
+            if (tryLabel(x, ay + (bull ? 13 : -13), il, 7.5, "center")) {
+              hardText(ctx, il, x, ay + (bull ? 13 : -13), bull ? "rgba(110,231,183,0.95)" : "rgba(252,165,165,0.95)", 7.5, "center");
+            }
+            break;
+          }
+          case "forecast": {
+            // WHERE the market can go — projected legs to the roadmap targets
+            const xNow = xOfTime(bs[bs.length - 1].t) ?? rightEdge - 10;
+            const yFrom = yOfPrice(d.from);
+            if (yFrom === null) return;
+            const drawScenario = (
+              legs: { price: number; label: string }[],
+              primary: boolean,
+            ) => {
+              if (!legs.length) return;
+              const step = Math.max(16, barSpacing * 7);
+              let px = xNow;
+              let py = yFrom;
+              legs.forEach((leg, i) => {
+                const ty = yOfPrice(leg.price);
+                if (ty === null) return;
+                const tx = Math.min(rightEdge - 2, xNow + step * (i + 1));
+                if (tx <= px + 2 || Math.abs(ty - py) < 2) return;
+                hardSeg(
+                  ctx, px, py, tx, ty,
+                  primary ? "rgba(251,191,36,0.85)" : "rgba(148,163,158,0.4)",
+                  "transparent", primary ? 0.7 : 0.5, [4, 3],
+                );
+                arrow(ctx, tx, ty, ty < py ? "up" : "down", primary ? "rgba(251,191,36,0.95)" : "rgba(178,190,185,0.6)", "transparent", 4.5);
+                if (primary && tryLabel(tx, ty + (ty < py ? -11 : 11), leg.label, 7.5, "center", true)) {
+                  pillLabel(ctx, leg.label, tx, ty + (ty < py ? -11 : 11), "rgba(251,191,36,0.95)", "rgba(245,158,11,0.5)", "center", 7.5);
+                }
+                px = tx;
+                py = ty;
+              });
+            };
+            drawScenario(d.primary.legs, true);
+            drawScenario(d.alternate?.legs ?? [], false);
+            // the map header at the origin — direction verdict in one glance
+            const hd = `MAP ${d.primary.dir === "up" ? "▲" : "▼"}${d.primary.note ? "" : ""}`;
+            if (tryLabel(xNow, yFrom + (d.primary.dir === "up" ? -14 : 14), hd, 8, "center", true)) {
+              pillLabel(ctx, hd, xNow, yFrom + (d.primary.dir === "up" ? -14 : 14), "rgba(251,191,36,0.95)", "rgba(245,158,11,0.55)", "center", 8);
+            }
+            break;
+          }
           case "magnet": {
             const y = yOfPrice(d.price);
             if (y === null) return;
-            hardSeg(ctx, rightEdge - 220, y, rightEdge, y, "rgba(251,191,36,0.6)", "rgba(245,158,11,0.06)", 0.8, [2, 4]);
+            hardSeg(ctx, rightEdge - 220, y, rightEdge, y, "rgba(251,191,36,0.6)", "rgba(245,158,11,0.06)", 0.6, [2, 4]);
             const ml = `MAGNET · ${d.source}`;
             if (tryLabel(rightEdge - 4, y - 8, ml, 8, "right")) {
               pillLabel(ctx, ml, rightEdge - 4, y - 8, "rgba(251,191,36,0.92)", "rgba(251,191,36,0.45)", "right", 8);
@@ -998,7 +1129,7 @@ export default function TradingChart(props: Props) {
             if (y === null) return;
             const faded = d.state !== "untouched";
             const color = d.side === "BSL" ? "rgba(255,120,132," : "rgba(52,211,153,";
-            hardSeg(ctx, 0, y, rightEdge, y, color + (faded ? "0.32)" : "0.72)"), color + "0.06)", 0.85, faded ? [3, 4] : []);
+            hardSeg(ctx, 0, y, rightEdge, y, color + (faded ? "0.32)" : "0.72)"), color + "0.06)", 0.62, faded ? [3, 4] : []);
             const state = d.state === "untouched" ? "" : d.state === "swept" ? " · SWEPT" : " · RUN";
             const ll = `${d.side} ${d.price.toFixed(digits)}${state}`;
             if (tryLabel(6, y - 8, ll, 8.5, "left")) {
@@ -1102,11 +1233,11 @@ export default function TradingChart(props: Props) {
                 ex = 0;
                 ey = pts[0].y! + (dy / dx) * (0 - pts[0].x!);
               }
-              hardSeg(ctx, pts[0].x!, pts[0].y!, ex, ey, color, "rgba(226,232,230,0.08)", 0.9);
+              hardSeg(ctx, pts[0].x!, pts[0].y!, ex, ey, color, "rgba(226,232,230,0.08)", 0.7);
               // keep original segment solid
-              hardSeg(ctx, pts[0].x!, pts[0].y!, pts[1].x!, pts[1].y!, color, "rgba(226,232,230,0.08)", 0.9);
+              hardSeg(ctx, pts[0].x!, pts[0].y!, pts[1].x!, pts[1].y!, color, "rgba(226,232,230,0.08)", 0.7);
             } else {
-              hardSeg(ctx, pts[0].x!, pts[0].y!, pts[1].x!, pts[1].y!, color, "rgba(226,232,230,0.08)", 0.9);
+              hardSeg(ctx, pts[0].x!, pts[0].y!, pts[1].x!, pts[1].y!, color, "rgba(226,232,230,0.08)", 0.7);
             }
             hit.pts.push({ x: pts[0].x!, y: pts[0].y! }, { x: pts[1].x!, y: pts[1].y! });
             break;
@@ -1114,7 +1245,7 @@ export default function TradingChart(props: Props) {
           case "hline": {
             if (pts.length < 1 || pts[0].y === null) break;
             const y = pts[0].y!;
-            hardSeg(ctx, 0, y, rightEdge, y, color, "rgba(226,232,230,0.08)", 0.9);
+            hardSeg(ctx, 0, y, rightEdge, y, color, "rgba(226,232,230,0.08)", 0.7);
             hardText(ctx, `${pts[0].p.toFixed(digits)}`, rightEdge - 4, y - 7, color, 8, "right");
             hit.pts.push({ x: 80, y });
             hit.rects.push({ x1: 0, y1: y - 5, x2: rightEdge, y2: y + 5 });
@@ -1123,7 +1254,7 @@ export default function TradingChart(props: Props) {
           case "vline": {
             if (pts.length < 1 || pts[0].x === null) break;
             const x = pts[0].x!;
-            hardSeg(ctx, x, 0, x, h, color, "rgba(226,232,230,0.08)", 0.9);
+            hardSeg(ctx, x, 0, x, h, color, "rgba(226,232,230,0.08)", 0.7);
             hit.pts.push({ x, y: 60 });
             hit.rects.push({ x1: x - 5, y1: 0, x2: x + 5, y2: h });
             break;
@@ -1138,7 +1269,7 @@ export default function TradingChart(props: Props) {
             ctx.fillStyle = ud.kind === "measure" ? "rgba(245,158,11,0.07)" : "rgba(226,232,230,0.05)";
             ctx.fillRect(rx, ry, rw, rh);
             ctx.strokeStyle = color;
-            ctx.lineWidth = 0.8;
+            ctx.lineWidth = 0.7;
             ctx.strokeRect(rx, ry, rw, rh);
             hit.pts.push({ x: pts[0].x!, y: pts[0].y! }, { x: pts[1].x!, y: pts[1].y! });
             hit.rects.push({ x1: rx, y1: ry, x2: rx + rw, y2: ry + rh });
@@ -1155,11 +1286,11 @@ export default function TradingChart(props: Props) {
               const golden = r === 0.618 || r === 0.786;
               hardSeg(ctx, Math.min(pts[0].x!, pts[1].x!), y, rightEdge, y,
                 golden ? "rgba(245,158,11,0.8)" : "rgba(226,232,230,0.4)",
-                "rgba(226,232,230,0.05)", golden ? 0.8 : 0.6);
+                "rgba(226,232,230,0.05)", golden ? 0.65 : 0.5);
               hardText(ctx, `${r.toFixed(3)}  ${price.toFixed(digits)}`, rightEdge - 4, y - 7,
                 golden ? "rgba(251,191,36,0.9)" : "rgba(178,190,185,0.7)", 8, "right");
             }
-            hardSeg(ctx, pts[0].x!, pts[0].y!, pts[1].x!, pts[1].y!, "rgba(226,232,230,0.5)", "rgba(226,232,230,0.04)", 0.7);
+            hardSeg(ctx, pts[0].x!, pts[0].y!, pts[1].x!, pts[1].y!, "rgba(226,232,230,0.5)", "rgba(226,232,230,0.04)", 0.55);
             hit.pts.push({ x: pts[0].x!, y: pts[0].y! }, { x: pts[1].x!, y: pts[1].y! });
             break;
           }

@@ -46,11 +46,13 @@ export const ZONE_STYLE: Record<string, { fill: string; border: string; halo: st
 
 export const FONT_FAMILY = "var(--font-geist-mono), ui-monospace, monospace";
 
-/** Hard thin line: halo underlay then crisp core stroke. */
+/** Hard thin line: halo underlay then crisp core stroke.
+ *  v16.5 (user spec: আরও চিকন ও স্পষ্ট): halo spread tightened +0.9 → +0.65
+ *  so every line reads crisp-thin instead of soft-thick. */
 export function hardSeg(
   ctx: CanvasRenderingContext2D,
   x1: number, y1: number, x2: number, y2: number,
-  color: string, halo: string, width = 0.7, dash: number[] = [],
+  color: string, halo: string, width = 0.6, dash: number[] = [],
 ) {
   ctx.save();
   // halo
@@ -58,7 +60,7 @@ export function hardSeg(
   ctx.moveTo(x1, y1);
   ctx.lineTo(x2, y2);
   ctx.strokeStyle = halo;
-  ctx.lineWidth = width + 0.9;
+  ctx.lineWidth = width + 0.65;
   if (dash.length) ctx.setLineDash([]); // halo always solid
   ctx.stroke();
   // core
@@ -187,7 +189,7 @@ export function xMark(
 ) {
   ctx.save();
   ctx.strokeStyle = color;
-  ctx.lineWidth = 1.1;
+  ctx.lineWidth = 0.9;
   ctx.beginPath();
   ctx.moveTo(x - r, y - r);
   ctx.lineTo(x + r, y + r);

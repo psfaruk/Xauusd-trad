@@ -4,9 +4,10 @@ import { evaluate } from "@/lib/market/engine";
 import { SIGNAL_EXPIRY_BARS } from "@/lib/market/engine";
 import { seedSignals } from "@/lib/market/seed";
 import { atr } from "@/lib/market/indicators";
-import { buildDrawings, magnetsToDrawings, pathToDrawing, projectSetup } from "@/lib/market/drawings";
+import { buildDrawings, magnetsToDrawings, projectSetup, buildPhaseDrawings, buildMtfStructureDrawings, buildForecastDrawing } from "@/lib/market/drawings";
 import { buildRoadmap } from "@/lib/market/roadmap";
-import { detectSupplyDemand } from "@/lib/market/smc";
+import { detectStructure, detectSupplyDemand } from "@/lib/market/smc";
+import { detectConsolidations, detectAmdPhases, detectInstitutionalActivity } from "@/lib/market/phases";
 import type { AnalysisResponse, Candle, SignalPayload } from "@/lib/market/types";
 import { svcHeaders, getBrokerOffsetSec, spreadFor } from "@/lib/svc";
 
@@ -373,13 +374,31 @@ export async function GET(req: Request) {
     biasScore: result.biasScore,
   });
 
-  const htfZones = bars.H1?.length
-    ? detectSupplyDemand(bars.H1.filter((b) => !b.f).slice(-240))
-    : [];
-
   const activeSignal = signals.find((s) => s.status === "active" || s.status === "pending") ?? null;
   const closedBars = bars[tf].filter((b) => !b.f);
   const liveSignal = activeSignal ?? result.signal;
+  const price = bars[tf][bars[tf].length - 1].c;
+
+  // ── v16.5 market phases: consolidation ranges / AMD sequences /
+  //    institutional footprints — on the ACTIVE tf's closed bars (walk-forward
+  //    safe, no look-ahead; refreshes on every poll/bar close = real-time) ──
+  const ranges = detectConsolidations(closedBars);
+  const amd = detectAmdPhases(closedBars, ranges);
+  const { marks, volSpikes } = detectInstitutionalActivity(closedBars);
+
+  // ── HTF context (H1 + H4): zones, structure events and the freshest
+  //    consolidation range per tf — every drawing source-labeled (§2.6) ──
+  const h1Closed = bars.H1?.length ? bars.H1.filter((b) => !b.f).slice(-240) : [];
+  const h4Closed = bars.H4?.length ? bars.H4.filter((b) => !b.f).slice(-240) : [];
+  const htfZoneGroups = [
+    { tf: "H1", zones: h1Closed.length ? detectSupplyDemand(h1Closed) : [] },
+    { tf: "H4", zones: h4Closed.length ? detectSupplyDemand(h4Closed) : [] },
+  ];
+  const h1Read = h1Closed.length >= 30 ? detectStructure(bars.H1!.filter((b) => !b.f).slice(-300)) : null;
+  const h4Read = h4Closed.length >= 30 ? detectStructure(bars.H4!.filter((b) => !b.f).slice(-300)) : null;
+  const h1Ranges = h1Closed.length ? detectConsolidations(h1Closed) : [];
+  const h4Ranges = h4Closed.length ? detectConsolidations(h4Closed) : [];
+
   // no live signal → the planned NEXT entry (entry/SL/TP projection) so the
   // chart always answers: কোন প্রাইসে এন্ট্রি / SL / TARGET
   const projection = !liveSignal
@@ -402,14 +421,24 @@ export async function GET(req: Request) {
         signal: liveSignal,
         projection,
       },
-      htfZones,
+      htfZoneGroups,
+      volSpikes,
     ),
+    ...buildPhaseDrawings(
+      tf,
+      { ranges, amd, instit: marks },
+      [
+        { tf: "H1", range: h1Ranges[h1Ranges.length - 1] ?? null },
+        { tf: "H4", range: h4Ranges[h4Ranges.length - 1] ?? null },
+      ],
+    ),
+    ...buildMtfStructureDrawings({ h1: h1Read, h4: h4Read }),
     ...magnetsToDrawings(roadmap.magnets),
   ];
-  const pathD = pathToDrawing(roadmap.path, bars[tf][bars[tf].length - 1].c);
-  if (pathD) drawings.push(pathD);
-
-  const price = bars[tf][bars[tf].length - 1].c;
+  // v16.5: the forward map — projected legs to the roadmap's real targets
+  // (supersedes the old single-arrow path drawing)
+  const forecast = buildForecastDrawing(roadmap, price, digits);
+  if (forecast) drawings.push(forecast);
   // v16.4 (audit §4/§10): data identity + freshness on every payload
   const lastCandleTime = lastClosedT;
   const tfSecMap: Record<string, number> = { M1: 60, M5: 300, M15: 900, M30: 1800, H1: 3600, H4: 14400 };
