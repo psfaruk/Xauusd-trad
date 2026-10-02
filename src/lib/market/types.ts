@@ -356,6 +356,16 @@ export type AutoDrawing =
       kind: "forecast"; from: number;
       primary: { dir: "up" | "down"; legs: { price: number; label: string }[]; note: string };
       alternate: { dir: "up" | "down"; legs: { price: number; label: string }[]; note: string } | null;
+    }
+  /** v16.7 — one OTHER timeframe's price-anchored entry setup (the active
+   *  TF keeps its hero setup box; every other TF answers with its own
+   *  thin entry/SL/TP rail + a TF-tagged badge). User spec: each TF's
+   *  setup must live on the chart, labeled by its TF. */
+  | {
+      kind: "tf_setup"; tf: string; dir: "BUY" | "SELL";
+      entry: number; sl: number; tp: number; rr: number;
+      status: "signal" | "planned"; source: string; reason?: string;
+      price: number; distAtr: number; entryType: "market" | "limit";
     };
 
 /** User-created drawings (persisted). */
@@ -438,6 +448,30 @@ export interface IndicatorSnapshot {
   whale: { bias: string; note: string } | null;
 }
 
+/** v16.7 — one timeframe's own entry setup (signal or planned projection).
+ *  `price`/`distAtr` prove the price-anchor: the entry sits within 0.6 ATR
+ *  of where that TF's market IS when the setup was computed. */
+export interface TfSetup {
+  tf: string;
+  /** "signal" = a live/pending engine signal on this TF; "planned" = the
+   *  price-anchored projection from this TF's own structure/zones/pools. */
+  kind: "signal" | "planned";
+  dir: "BUY" | "SELL";
+  entry: number;
+  sl: number;
+  tp: number;
+  rr: number;
+  confidence?: number;
+  status: string;
+  source: string;
+  reason: string;
+  price: number;
+  distAtr: number;
+  entryType: "market" | "limit";
+  atr: number;
+  trigger?: string;
+}
+
 export interface AnalysisResponse {
   symbol: string;
   timeframe: string;
@@ -450,7 +484,9 @@ export interface AnalysisResponse {
    *  DATA_UNAVAILABLE so the UI can tell outage from quiet market. */
   status: "OK" | "NO_SETUP";
   signal: SignalPayload | null;
-  /** planned next entry when no live signal exists (entry/SL/TP projection) */
+  /** planned next entry when no live signal exists (entry/SL/TP projection) —
+   *  v16.7 PRICE-ANCHORED: entry sits at/below 0.6 ATR from the live price
+   *  (near-zone limit or confirmation market entry); `price` is the anchor. */
   nextSetup: {
     dir: "BUY" | "SELL";
     entry: number;
@@ -459,7 +495,16 @@ export interface AnalysisResponse {
     rr: number;
     reason: string;
     source: string;
+    price: number;
+    distAtr: number;
+    entryType: "market" | "limit";
+    atr: number;
   } | null;
+  /** v16.7 — per-timeframe entry setups (user spec: "প্রত্যেক টাইম ফ্রেমের
+   *  জন্য আলাদা আলাদা এন্ট্রি সেটাপ"): every supported TF's OWN setup — a
+   *  live signal if one is active on that TF, else that TF's own projected
+   *  plan. Every entry is price-anchored (≤0.6 ATR from that TF's price). */
+  tfSetups: TfSetup[];
   nearMiss: string[];
   drawings: AutoDrawing[];
   roadmap: RoadmapData;

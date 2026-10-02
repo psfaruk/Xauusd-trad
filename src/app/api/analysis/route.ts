@@ -4,19 +4,19 @@ import { evaluate } from "@/lib/market/engine";
 import { SIGNAL_EXPIRY_BARS } from "@/lib/market/engine";
 import { seedSignals } from "@/lib/market/seed";
 import { atr } from "@/lib/market/indicators";
-import { buildDrawings, magnetsToDrawings, projectSetup, buildPhaseDrawings, buildMtfStructureDrawings, buildForecastDrawing } from "@/lib/market/drawings";
+import { buildDrawings, magnetsToDrawings, projectSetup, localBias, buildPhaseDrawings, buildMtfStructureDrawings, buildForecastDrawing } from "@/lib/market/drawings";
 import { buildRoadmap } from "@/lib/market/roadmap";
-import { detectStructure, detectSupplyDemand } from "@/lib/market/smc";
+import { detectStructure, detectSupplyDemand, detectOrderBlocks, detectFvg, detectLiquidity } from "@/lib/market/smc";
 import { detectConsolidations, detectAmdPhases, detectInstitutionalActivity } from "@/lib/market/phases";
 import { detectPatterns } from "@/lib/market/patterns";
-import type { AnalysisResponse, Candle, SignalPayload } from "@/lib/market/types";
+import type { AnalysisResponse, Candle, SignalPayload, TfSetup } from "@/lib/market/types";
 import { svcHeaders, getBrokerOffsetSec, spreadFor } from "@/lib/svc";
 
 const MT5_URL = process.env.MT5_SERVICE_URL ?? "http://127.0.0.1:3031";
 const CACHE_TTL = 8_000;
 /** v16.4 (audit §10): the strategy build identity carried in every
  *  response so consumers/caches can compare across deploys. */
-const STRATEGY_VERSION = "v16.6";
+const STRATEGY_VERSION = "v16.7";
 /** v16.4 (audit §10): a candle older than 3× its timeframe (plus a
  *  market-closed weekend allowance) means the FEED is stale — surfaced
  *  via dataFreshness.fresh=false instead of passing silently. */
@@ -409,8 +409,106 @@ export async function GET(req: Request) {
         zones: result.context.zones,
         biasDir: result.biasDir,
         biasScore: result.biasScore,
+        spread,
       })
     : null;
+
+  // ── v16.7 — PER-TIMEFRAME ENTRY SETUPS (user spec: "প্রত্যেক টাইম ফ্রেমের
+  //    জন্য আলাদা আলাদা এন্ট্রি সেটাপ"): every TF answers with its OWN
+  //    setup — a live signal if one is active on that TF (and still near
+  //    price), else that TF's own price-anchored projection built from ITS
+  //    structure/zones/pools and ITS local bias. The active TF reuses the
+  //    hero projection/signal so the chart never shows two different
+  //    setups for the same TF. ──
+  const tfSecFull: Record<string, number> = { M1: 60, M5: 300, M15: 900, M30: 1800, H1: 3600, H4: 14400 };
+  const openAll = await db.signalRecord
+    .findMany({
+      where: { symbol, status: { in: ["active", "pending"] } },
+      orderBy: { barTime: "desc" },
+    })
+    .catch(() => []);
+  const openByTf = new Map<string, (typeof openAll)[number]>();
+  for (const s of openAll) if (!openByTf.has(s.timeframe)) openByTf.set(s.timeframe, s);
+
+  const tfSetups: TfSetup[] = [];
+  for (const t of ENGINE_TFS) {
+    const closed = (bars[t] ?? []).filter((b) => !b.f);
+    if (closed.length < 60) continue;
+    const lastBarT = closed[closed.length - 1];
+    const priceT = lastBarT.c;
+    const atrT = ((arr: (number | null)[]) => {
+      for (let i = arr.length - 1; i >= 0; i--) if (arr[i] != null) return arr[i] as number;
+      return 0;
+    })(atr(closed, 14)) || priceT * 0.001;
+
+    // the ACTIVE tf reuses the hero answers (never a second opinion)
+    if (t === tf) {
+      if (liveSignal) {
+        tfSetups.push({
+          tf: t, kind: "signal", dir: liveSignal.direction, entry: liveSignal.entry,
+          sl: liveSignal.sl, tp: liveSignal.tp, rr: liveSignal.rr,
+          confidence: liveSignal.confidence, status: liveSignal.status,
+          source: liveSignal.trigger.toUpperCase(), reason: liveSignal.entryNote ?? "",
+          price: priceT, distAtr: Math.abs(liveSignal.entry - priceT) / atrT,
+          entryType: liveSignal.entryType, atr: atrT, trigger: liveSignal.trigger,
+        });
+      } else if (projection) {
+        tfSetups.push({
+          tf: t, kind: "planned", dir: projection.dir, entry: projection.entry,
+          sl: projection.sl, tp: projection.tp, rr: projection.rr,
+          status: "planned", source: projection.source, reason: projection.reason,
+          price: projection.price, distAtr: projection.distAtr,
+          entryType: projection.entryType, atr: projection.atr,
+        });
+      }
+      continue;
+    }
+
+    // live signal on THIS tf — but only while it is still near the market
+    // (a 25-bar-old entry the market left behind is not a tradeable setup)
+    const sig = openByTf.get(t);
+    const fresh =
+      sig != null &&
+      Date.now() / 1000 - sig.barTime <= SIGNAL_EXPIRY_BARS * (tfSecFull[t] ?? 900) &&
+      Math.abs(sig.entry - priceT) <= 1.2 * atrT;
+    if (sig && fresh) {
+      tfSetups.push({
+        tf: t, kind: "signal", dir: sig.direction as "BUY" | "SELL", entry: sig.entry,
+        sl: sig.sl, tp: sig.tp, rr: sig.rr, confidence: sig.confidence,
+        status: sig.status, source: sig.trigger.toUpperCase(),
+        reason: `live ${sig.trigger} signal`,
+        price: priceT, distAtr: Math.abs(sig.entry - priceT) / atrT,
+        entryType: sig.entryType as "market" | "limit", atr: atrT, trigger: sig.trigger,
+      });
+      continue;
+    }
+
+    // else — THIS tf's own price-anchored projection (its structure, its
+    // zones, its pools, its local bias — no cross-tf contamination)
+    const zonesT = [
+      ...detectSupplyDemand(closed.slice(-240)),
+      ...detectOrderBlocks(closed.slice(-240)),
+      ...detectFvg(closed.slice(-240)),
+    ];
+    const poolsT = detectLiquidity(closed, 0.15, 3, brokerOffsetSec);
+    const lb = localBias(closed);
+    const pT = projectSetup(closed, {
+      structure: detectStructure(closed.slice(-150)),
+      pools: poolsT,
+      zones: zonesT,
+      biasDir: lb.biasDir,
+      biasScore: lb.biasScore,
+      spread,
+    });
+    if (pT) {
+      tfSetups.push({
+        tf: t, kind: "planned", dir: pT.dir, entry: pT.entry, sl: pT.sl,
+        tp: pT.tp, rr: pT.rr, status: "planned", source: pT.source,
+        reason: pT.reason, price: pT.price, distAtr: pT.distAtr,
+        entryType: pT.entryType, atr: pT.atr,
+      });
+    }
+  }
   const drawings = [
     ...buildDrawings(
       closedBars,
@@ -454,6 +552,17 @@ export async function GET(req: Request) {
   // (supersedes the old single-arrow path drawing)
   const forecast = buildForecastDrawing(roadmap, price, digits);
   if (forecast) drawings.push(forecast);
+  // v16.7: every OTHER timeframe's price-anchored setup rides along as thin
+  // TF-tagged rails (the active tf keeps its hero setup box — no duplicate)
+  for (const s of tfSetups) {
+    if (s.tf === tf) continue;
+    drawings.push({
+      kind: "tf_setup", tf: s.tf, dir: s.dir,
+      entry: s.entry, sl: s.sl, tp: s.tp, rr: s.rr,
+      status: s.kind, source: s.source, reason: s.reason,
+      price: s.price, distAtr: s.distAtr, entryType: s.entryType,
+    });
+  }
   // v16.4 (audit §4/§10): data identity + freshness on every payload
   const lastCandleTime = lastClosedT;
   const tfSecMap: Record<string, number> = { M1: 60, M5: 300, M15: 900, M30: 1800, H1: 3600, H4: 14400 };
@@ -477,6 +586,7 @@ export async function GET(req: Request) {
     status: liveSignal ? "OK" : "NO_SETUP",
     signal: liveSignal,
     nextSetup: projection,
+    tfSetups,
     nearMiss: result.nearMiss,
     drawings,
     roadmap,

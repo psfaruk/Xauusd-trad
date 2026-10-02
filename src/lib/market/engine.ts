@@ -266,6 +266,14 @@ const TP_MIN_RR = 0.8;
 const TP_FLOOR_RR = 1.0;
 const MAX_RISK_ATR = 1.8;
 const MIN_RISK_ATR = 0.28;
+/** v16.7 — the PRICE-ANCHORED ENTRY CONTRACT (user spec):
+ *  "প্রাইস যেই কারেন্ট প্রাইসে আছে, সেই প্রাইস লেভেল থেকে কনফার্মেশন
+ *  অনুযায়ী এন্ট্রি বসাতে হবে" — an entry the trader can actually take from
+ *  where the market IS. A limit may sit at most this far (in ATR) from the
+ *  current price; beyond it the trigger bar IS the confirmation and the
+ *  entry is the current price (market). Distant zone-edge wishes like
+ *  "4210 গেলে buy নাও" while price sits at 4170 are gone — permanently. */
+export const MAX_ENTRY_DIST_ATR = 0.75;
 
 export interface Geometry {
   entry: number;
@@ -273,6 +281,9 @@ export interface Geometry {
   tp: number;
   rr: number;
   targetNote: string;
+  /** v16.7: |entry − price| / ATR at trigger time — the price-anchored
+   *  contract's proof metric (backtest asserts max ≤ MAX_ENTRY_DIST_ATR). */
+  entryDistAtr: number;
 }
 
 /** pools/zones usable as-of `asOfT` (no lookahead — P9) */
@@ -301,12 +312,16 @@ export function setupGeometry(
   if (trig.zone) {
     const z = trig.zone!;
     const inside = price >= z.lo && price <= z.hi;
-    if (inside) {
-      // deep retest in progress → EQ entry (better price than the edge)
-      entry = (z.lo + z.hi) / 2;
-    } else {
-      entry = bull ? z.hi : z.lo; // proximal edge — limit order at the retest
-    }
+    // v16.7 PRICE-ANCHOR: pick the entry candidate CLOSEST to the live
+    // price (EQ inside the zone, proximal edge outside) — then clamp: if
+    // even the closest candidate is farther than MAX_ENTRY_DIST_ATR, the
+    // trigger bar's rejection close IS the confirmation and entry = price.
+    // (The old `entry = z.hi / z.lo` blind edge-limit produced entries the
+    // market would never come back to touch — the user's core complaint.)
+    const edge = bull ? z.hi : z.lo;
+    const mid = (z.lo + z.hi) / 2;
+    const cand = inside ? mid : edge; // EQ inside · proximal edge outside
+    entry = Math.abs(cand - price) <= MAX_ENTRY_DIST_ATR * a ? cand : price;
     sl = bull ? z.lo - SL_PAD_ATR * a : z.hi + SL_PAD_ATR * a;
   } else if (trig.kind === "sfp" && trig.sweepExtreme != null) {
     entry = price;
@@ -366,7 +381,7 @@ export function setupGeometry(
   if (rrRaw < TP_FLOOR_RR) tp = bull ? entry + TP_FLOOR_RR * risk : entry - TP_FLOOR_RR * risk;
   if (rrRaw > capR) tp = bull ? entry + capR * risk : entry - capR * risk;
   const rr = Math.abs(tp - entry) / risk;
-  return { entry, sl, tp, rr, targetNote };
+  return { entry, sl, tp, rr, targetNote, entryDistAtr: Math.abs(entry - price) / (a || 1) };
 }
 
 // ═══════════════════════ soft-check bundle ═══════════════════════

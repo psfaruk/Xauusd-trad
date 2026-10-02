@@ -14,6 +14,7 @@ import {
   Zap,
   Activity,
   Crosshair,
+  Layers,
 } from "lucide-react";
 
 const STATUS_STYLE: Record<string, string> = {
@@ -170,6 +171,54 @@ export function SignalsPanel({ analysis }: { analysis: AnalysisResponse | null }
               ) : null}
             </div>
           )}
+
+          {analysis?.tfSetups?.length ? (
+            // v16.7 — PER-TIMEFRAME ENTRY SETUPS (user spec): every TF's own
+            // plan — live signal if active on that TF, else its price-anchored
+            // projection. Entries sit near the live price by contract.
+            <div className="rounded-lg border border-border bg-muted/20 p-2.5">
+              <div className="mb-1.5 flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-wider text-muted-foreground">
+                <Layers className="h-3 w-3" />
+                {t("tfSetups")}
+              </div>
+              <div className="max-h-44 space-y-1 overflow-y-auto slim-scroll pr-0.5">
+                {analysis.tfSetups.map((s) => (
+                  <div key={s.tf} className="flex items-center gap-1.5 text-[10px] leading-none">
+                    <span className="w-8 shrink-0 rounded bg-muted px-1 py-1 text-center font-mono text-[9px] font-bold text-foreground/80">
+                      {s.tf}
+                    </span>
+                    <span
+                      className={cn(
+                        "shrink-0 font-mono text-[11px] font-bold",
+                        s.dir === "BUY" ? "text-up" : "text-down",
+                      )}
+                    >
+                      {s.dir === "BUY" ? "▲" : "▼"} {s.entry.toFixed(digits)}
+                    </span>
+                    <span className="truncate font-mono text-[9px] text-muted-foreground">
+                      SL {s.sl.toFixed(digits)} · TP {s.tp.toFixed(digits)}
+                    </span>
+                    <span className="ml-auto flex shrink-0 items-center gap-1">
+                      <span className="font-mono text-[9px] text-muted-foreground/80">
+                        {s.rr.toFixed(1)}R
+                      </span>
+                      <span
+                        className={cn(
+                          "rounded px-1 py-0.5 font-mono text-[8px] font-bold uppercase",
+                          s.kind === "signal" ? "bg-up/15 text-up" : "bg-gold/10 text-gold",
+                        )}
+                      >
+                        {s.kind === "signal" ? t("liveChip") : t("planChip")}
+                      </span>
+                    </span>
+                  </div>
+                ))}
+              </div>
+              <p className="mt-1.5 text-[9px] leading-snug text-muted-foreground/70">
+                {t("tfSetupsHint")}
+              </p>
+            </div>
+          ) : null}
 
           {sig?.checks?.length ? (
             <div className="rounded-lg border border-border bg-card/50 p-3">

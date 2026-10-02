@@ -713,6 +713,7 @@ export default function TradingChart(props: Props) {
         instit: "structure",
         forecast: "structure",
         path: "structure",
+        tf_setup: "setup",
       };
       for (const d of autoRef.current) {
         const layer = LAYER_OF[d.kind] ?? "zones";
@@ -1303,6 +1304,50 @@ export default function TradingChart(props: Props) {
                     d.state === "confirmed" ? pt.line(0.55) : "rgba(148,163,158,0.4)", "left", 8.5);
                 }
               }
+            }
+            break;
+          }
+          case "tf_setup": {
+            // v16.7 — ANOTHER timeframe's own entry setup (user spec:
+            // "প্রত্যেক টাইম ফ্রেমের জন্য আলাদা আলাদা এন্ট্রি সেটাপ"): a thin
+            // TF-colored entry rail over the recent action + SL/TP whiskers
+            // + ONE compact TF-tagged contract badge. Live signals solid,
+            // plans dotted — thin crisp ink, never louder than the hero box.
+            const TF_INK: Record<string, [number, number, number]> = {
+              M1: [244, 114, 182], M5: [251, 191, 36], M15: [52, 211, 153],
+              M30: [251, 146, 60], H1: [45, 212, 191], H4: [251, 113, 133],
+            };
+            const [ir, ig, ib] = TF_INK[d.tf] ?? [226, 232, 230];
+            const ink = (a: number) => `rgba(${ir},${ig},${ib},${a})`;
+            const yE = yOfPrice(d.entry);
+            const yS = yOfPrice(d.sl);
+            const yT = yOfPrice(d.tp);
+            if (yE === null || yE < -8 || yE > h + 8) return;
+            const live = d.status === "signal";
+            const x0 = Math.max(2, rightEdge - Math.max(140, barSpacing * 24));
+            // entry rail — thin and crisp (0.8px), solid live · dotted planned
+            hardSeg(ctx, x0, yE, rightEdge, yE, ink(live ? 0.85 : 0.55), ink(0.05), 0.8, live ? [] : [2, 3]);
+            // tiny TF tick at the rail's start — the eye can follow it in
+            hardText(ctx, d.tf, x0 + 2, yE - 5, ink(live ? 0.9 : 0.62), 7, "left", 700);
+            // SL/TP whiskers — short, dimmer, dashed
+            const wx = rightEdge - 64;
+            if (yS !== null && yS > -8 && yS < h + 8) {
+              hardSeg(ctx, wx, yS, rightEdge, yS, `rgba(248,113,113,${live ? 0.42 : 0.28})`, "transparent", 0.55, [2, 3]);
+            }
+            if (yT !== null && yT > -8 && yT < h + 8) {
+              hardSeg(ctx, wx, yT, rightEdge, yT, `rgba(52,211,153,${live ? 0.42 : 0.28})`, "transparent", 0.55, [2, 3]);
+            }
+            // ONE compact contract badge — TF · dir · entry, SL/TP below it
+            const verb = live ? "SIG" : "PLAN";
+            const arrowCh = d.dir === "BUY" ? "▲" : "▼";
+            const l1 = `${d.tf} ${arrowCh}${verb} ${d.entry.toFixed(digits)}`;
+            const l2 = `SL ${d.sl.toFixed(digits)} · TP ${d.tp.toFixed(digits)} · ${d.rr.toFixed(1)}R`;
+            let by = yE + 11;
+            if (!tryLabel(rightEdge - 4, by, l1, 8, "right")) by = yE - 11;
+            tryLabel(rightEdge - 4, by, l1, 8, "right", true);
+            badgeTag(rightEdge, by, l1, `rgb(${ir},${ig},${ib})`, "rgba(13,17,23,0.88)", ink(0.5), !live, 8);
+            if (tryLabel(rightEdge - 4, by + 10, l2, 7, "right", true)) {
+              hardText(ctx, l2, rightEdge - 4, by + 10, `rgba(200,208,214,${live ? 0.8 : 0.58})`, 7, "right", 600);
             }
             break;
           }

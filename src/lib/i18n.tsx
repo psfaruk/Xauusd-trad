@@ -141,6 +141,11 @@ const DICT: Record<Locale, Record<string, string>> = {
     // are unavailable; the MTF bias is running degraded, the UI must say so.
     feedPartial: "partial feed",
     feedPartialHint: "Multi-timeframe bias is degraded — missing:",
+    // v16.7 — per-timeframe entry setups (each TF's own price-anchored plan)
+    tfSetups: "Entries by timeframe",
+    tfSetupsHint: "Each timeframe's own setup — entries sit near the live price.",
+    liveChip: "live",
+    planChip: "plan",
     trigger: "Trigger",
     status: "Status",
     history: "History",
@@ -531,6 +536,11 @@ const DICT: Record<Locale, Record<string, string>> = {
     // যাচ্ছে না; মাল্টি-টাইমফ্রেম বায়াস ডিগ্রেডেড অবস্থায় চলছে।
     feedPartial: "আংশিক ফিড",
     feedPartialHint: "মাল্টি-টাইমফ্রেম বায়াস ডিগ্রেডেড — অনুপস্থিত:",
+    // v16.7 — প্রতি টাইমফ্রেমের নিজস্ব এন্ট্রি সেটাপ (কারেন্ট প্রাইসের কাছে)
+    tfSetups: "টাইমফ্রেম অনুযায়ী এন্ট্রি",
+    tfSetupsHint: "প্রতি টাইমফ্রেমের নিজস্ব সেটাপ — এন্ট্রি কারেন্ট প্রাইসের কাছেই।",
+    liveChip: "লাইভ",
+    planChip: "প্ল্যান",
     trigger: "ট্রিগার",
     status: "স্ট্যাটাস",
     history: "হিস্ট্রি",
