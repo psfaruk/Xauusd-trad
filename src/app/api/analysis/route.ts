@@ -26,17 +26,26 @@ const seeding = new Set<string>();
 
 const ENGINE_TFS = ["M1", "M5", "M15", "M30", "H1", "H4"];
 
-async function fetchCandles(symbol: string, tf: string, limit: number): Promise<Candle[]> {
+/** v16.4.1 (audit §10): a tf "fed" the engine when it returned at least
+ *  this many bars — fewer means the MTF bias ran without that timeframe. */
+const MIN_TF_BARS = 40;
+
+/** v16.4.1 (audit §2.5/§10): fetch outcomes are now distinguishable —
+ *  `ok:false` is a TRANSPORT failure (service down / timeout / non-200),
+ *  `ok:true` + empty bars is "the service answered but has no history"
+ *  (unknown symbol / brand-new market). The old version collapsed both
+ *  into [] and mislabeled a dead service as a quiet market. */
+async function fetchCandles(symbol: string, tf: string, limit: number): Promise<{ bars: Candle[]; ok: boolean }> {
   try {
     const res = await fetch(
       `${MT5_URL}/api/candles?symbol=${encodeURIComponent(symbol)}&tf=${tf}&limit=${limit}`,
       { cache: "no-store", signal: AbortSignal.timeout(12_000), headers: svcHeaders() },
     );
-    if (!res.ok) return [];
+    if (!res.ok) return { bars: [], ok: false };
     const data = await res.json();
-    return (data.bars ?? []) as Candle[];
+    return { bars: (data.bars ?? []) as Candle[], ok: true };
   } catch {
-    return [];
+    return { bars: [], ok: false };
   }
 }
 
@@ -65,7 +74,7 @@ async function trackOpenSignals(symbol: string): Promise<void> {
     const oldest = Math.min(...sigs.map((s) => s.barTime));
     const need = Math.min(90, Math.ceil((Date.now() / 1000 - oldest) / (tfSec[tf] ?? 900)) + 4);
     const bars = await fetchCandles(symbol, tf, Math.max(10, need));
-    const closed = bars.filter((b) => !b.f);
+    const closed = bars.bars.filter((b) => !b.f);
     if (!closed.length) continue;
     // ATR for pending-invalidation (a limit the market ran away from)
     const atrVals = atr(closed, 14).filter((v) => v != null) as number[];
@@ -207,11 +216,25 @@ export async function GET(req: Request) {
     M1: 900, M5: 700, M15: 600, M30: 400, H1: 400, H4: 300,
   };
   const bars: Record<string, Candle[]> = {};
+  /** v16.4.1 (audit §10): per-tf transport health — the fan-out result is
+   *  now inspectable instead of every failure silently becoming []. */
+  const feedOk: Record<string, boolean> = {};
   await Promise.all(
     ENGINE_TFS.map(async (t) => {
-      bars[t] = await fetchCandles(symbol, t, limits[t] ?? 500);
+      const r = await fetchCandles(symbol, t, limits[t] ?? 500);
+      bars[t] = r.bars;
+      feedOk[t] = r.ok;
     }),
   );
+  // v16.4.1 (audit §2.5): the REQUESTED tf failing to TRANSPORT (service
+  // down / timeout) is a different outage from the service answering with
+  // no history — split the 503 codes so the UI can say which one it is.
+  if (!feedOk[tf]) {
+    return NextResponse.json(
+      { error: "MT5 service did not answer the candle request", code: "MT5_FETCH_FAILED", symbol, timeframe: tf },
+      { status: 503 },
+    );
+  }
   if (!bars[tf]?.length) {
     // v16.4 (audit §2.5/§10): a structured DATA_UNAVAILABLE — the UI can now
     // tell "MT5 service offline / market closed / symbol unknown" apart from
@@ -221,6 +244,10 @@ export async function GET(req: Request) {
       { status: 503 },
     );
   }
+  // v16.4.1 (audit §10): which timeframes fed this evaluation — a partial
+  // feed (e.g. H4 down) degrades the MTF bias; the contract must say so.
+  const sourceTimeframes = ENGINE_TFS.filter((t) => (bars[t]?.length ?? 0) >= MIN_TF_BARS);
+  const missingTimeframes = ENGINE_TFS.filter((t) => !sourceTimeframes.includes(t));
 
   // v14: cache keyed on the LAST CLOSED bar time — a new bar close forces a
   // fresh evaluate even inside the 8s TTL (the audit's "stale zones after
@@ -395,6 +422,12 @@ export async function GET(req: Request) {
   const payload: AnalysisResponse = {
     symbol,
     timeframe: tf,
+    // v16.4.1 (audit §10): explicit request/signal/source identity — a
+    // multi-tf consumer never has to guess which tf produced the signal.
+    requestedTimeframe: tf,
+    signalTimeframe: liveSignal ? liveSignal.timeframe : null,
+    sourceTimeframes,
+    missingTimeframes,
     price,
     digits,
     status: liveSignal ? "OK" : "NO_SETUP",

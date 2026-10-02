@@ -64,6 +64,8 @@ const RIGHT_PAD = 5;
 
 /** /api/ai-chart response → AutoDrawing[] — what the AI brain "sees" on the chart */
 function aiDrawingsFrom(j: {
+  symbol?: string;
+  tf?: string;
   supports?: { price: number; touches: number }[];
   resistances?: { price: number; touches: number }[];
   valueArea?: { poc: number; vah: number; val: number } | null;
@@ -204,7 +206,15 @@ export default function TradingChart(props: Props) {
         const res = await fetch(restUrl(`/api/ai-chart?symbol=${encodeURIComponent(symbol)}&tf=${timeframe}`));
         if (res.ok) {
           const j = await res.json();
-          if (!stop && j && !j.error) {
+          // v16.4.1 (audit §4): TWO stale guards, not one — the stop flag
+          // kills responses after THIS effect was torn down (tf switched),
+          // and the identity echo (the service returns symbol+tf) catches
+          // an out-of-order landing that survived teardown (e.g. a retry
+          // racing the cleanup). A stale read must never ink the new chart.
+          const isCurrent =
+            (j.symbol === undefined || j.symbol === symbol) &&
+            (j.tf === undefined || j.tf === timeframe);
+          if (!stop && j && !j.error && isCurrent) {
             aiRef.current = aiDrawingsFrom(j, digits);
             scheduleRedraw();
           }

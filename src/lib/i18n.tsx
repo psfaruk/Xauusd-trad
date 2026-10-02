@@ -137,6 +137,10 @@ const DICT: Record<Locale, Record<string, string>> = {
     dataUnavailable: "Market data unavailable",
     dataUnavailableHint: "MT5 service is not answering — this is a data outage, not a no-signal state.",
     staleFeed: "stale feed",
+    // v16.4.1 (audit §10): partial feed — some timeframes the engine wanted
+    // are unavailable; the MTF bias is running degraded, the UI must say so.
+    feedPartial: "partial feed",
+    feedPartialHint: "Multi-timeframe bias is degraded — missing:",
     trigger: "Trigger",
     status: "Status",
     history: "History",
@@ -523,6 +527,10 @@ const DICT: Record<Locale, Record<string, string>> = {
     dataUnavailable: "মার্কেট ডেটা পাওয়া যাচ্ছে না",
     dataUnavailableHint: "MT5 সার্ভিস সাড়া দিচ্ছে না — এটি ডেটা সমস্যা, নো-সিগন্যাল নয়।",
     staleFeed: "স্টেল ফিড",
+    // v16.4.1 (audit §10): আংশিক ফিড — ইঞ্জিনের দরকারি কিছু টাইমফ্রেম পাওয়া
+    // যাচ্ছে না; মাল্টি-টাইমফ্রেম বায়াস ডিগ্রেডেড অবস্থায় চলছে।
+    feedPartial: "আংশিক ফিড",
+    feedPartialHint: "মাল্টি-টাইমফ্রেম বায়াস ডিগ্রেডেড — অনুপস্থিত:",
     trigger: "ট্রিগার",
     status: "স্ট্যাটাস",
     history: "হিস্ট্রি",

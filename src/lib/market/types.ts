@@ -424,6 +424,16 @@ export interface AnalysisResponse {
    *  so the UI can flag a stale feed instead of showing it as live. */
   lastCandleTime: number;
   dataFreshness: { lastCandleTime: number; ageSec: number; fresh: boolean };
+  /** v16.4.1 (audit §10 completion): the tf the CLIENT asked for and the tf
+   *  the signal (if any) was generated on — carried separately so a
+   *  multi-tf consumer can never conflate the two. */
+  requestedTimeframe: string;
+  signalTimeframe: string | null;
+  /** v16.4.1 (audit §10): which timeframes ACTUALLY fed the engine (had
+   *  candle data) and which were unavailable — a partial feed degrades the
+   *  MTF bias silently otherwise; now it is part of the contract. */
+  sourceTimeframes: string[];
+  missingTimeframes: string[];
   /** v16.4 (audit §10): the strategy build that produced this payload —
    *  cache keys and consumers can compare across deploys. */
   strategyVersion: string;

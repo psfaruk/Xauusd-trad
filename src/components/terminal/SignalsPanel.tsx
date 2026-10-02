@@ -80,6 +80,17 @@ export function SignalsPanel({ analysis }: { analysis: AnalysisResponse | null }
               {t("staleFeed")}
             </span>
           )}
+          {/* v16.4.1 (audit §10): a PARTIAL feed — the engine wanted all six
+              timeframes but some are unavailable; the MTF bias is running
+              degraded. Honest ink instead of a silently weaker read. */}
+          {analysis?.missingTimeframes && analysis.missingTimeframes.length > 0 && (
+            <span
+              title={`${t("feedPartialHint")} ${analysis.missingTimeframes.join(" · ")}`}
+              className="rounded border border-gold/40 bg-gold/10 px-1 py-px font-mono text-[9px] font-bold uppercase tracking-wider text-gold/90"
+            >
+              {t("feedPartial")} {analysis.missingTimeframes.join("·")}
+            </span>
+          )}
           <UpdatedAgo at={analysis?.generatedAt} />
           <span className="tnum font-mono text-[10px] text-muted-foreground">
             {won}W / {lost}L · {totalR >= 0 ? "+" : ""}{totalR.toFixed(1)}R
