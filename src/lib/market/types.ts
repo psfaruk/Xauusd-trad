@@ -297,8 +297,14 @@ export type AutoDrawing =
        * institutional footprint; the label carries an INST tag */
       institutional?: boolean;
     }
-  | { kind: "channel"; dir: "up" | "down"; upper: { t1: number; p1: number; t2: number; p2: number }; lower: { t1: number; p1: number; t2: number; p2: number } }
-  | { kind: "trendline"; t1: number; p1: number; t2: number; p2: number; tone: Tone; broken?: boolean; state?: "active" | "faded" }
+  | {
+      kind: "channel"; dir: "up" | "down"; label?: string; tone?: Tone;
+      upper: { t1: number; p1: number; t2: number; p2: number };
+      lower: { t1: number; p1: number; t2: number; p2: number };
+      median?: { t1: number; p1: number; t2: number; p2: number };
+      source_tf?: string;
+    }
+  | { kind: "trendline"; t1: number; p1: number; t2: number; p2: number; tone: Tone; broken?: boolean; state?: "active" | "faded"; source_tf?: string }
   | { kind: "fib"; t0: number; p0: number; t1: number; p1: number; dir: "up" | "down"; levels: { ratio: number; price: number }[]; ote?: [number, number] }
   | { kind: "sweep"; t: number; price: number; side: "high" | "low" }
   | { kind: "structure"; t: number; price: number; dir: "up" | "down"; label: "BOS" | "CHoCH"; fromT?: number; source_tf?: string }
@@ -314,7 +320,30 @@ export type AutoDrawing =
   | { kind: "magnet"; price: number; source: string; dist_atr: number }
   | { kind: "liq"; side: "BSL" | "SSL"; price: number; t: number; state: "untouched" | "swept" | "run" }
   | { kind: "path"; dir: "up" | "down"; from_price: number; to_price: number }
-  | { kind: "pattern"; name: string; family: "reversal" | "continuation"; points: { t: number; price: number; n: number }[]; neckline?: { t1: number; p1: number; t2: number; p2: number }; target?: number }
+  | {
+      /** v16.6 — the classic chart-pattern drawing (ref-repo D-072 recipe):
+       * numbered pivots 1..N, thin geometry lines, whisper shading, and the
+       * full measured-move trade plan (entry/SL/target + RR) — the chart's
+       * answer to "reversal হলে কত দূর যাবে / continue করলে কত দূর" */
+      kind: "pattern";
+      name: string;
+      family: "reversal" | "continuation" | "boundary";
+      dir: "up" | "down";
+      state: "forming" | "confirmed";
+      points: { t: number; price: number; n: number; kind: "high" | "low" }[];
+      lines: { t1: number; p1: number; t2: number; p2: number; dash?: boolean }[];
+      zone?: { t: number; lo: number; hi: number } | null;
+      entry: { price: number; t?: number };
+      sl: number;
+      target: number;
+      target_zone: { lo: number; hi: number };
+      height_atr?: number | null;
+      rr?: number | null;
+      note?: string;
+      breakout_t?: number;
+      tone?: "bull" | "bear";
+      source_tf?: string;
+    }
   // ── v16.5 — the market-structure narrative layer (user spec) ──
   /** a consolidation range: where price coiled before its next decision */
   | { kind: "range"; t0: number; t1: number; hi: number; lo: number; state: "forming" | "broken_up" | "broken_down"; source_tf?: string }

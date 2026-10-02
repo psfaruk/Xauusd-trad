@@ -775,25 +775,48 @@ export default function TradingChart(props: Props) {
             if ([x1, x2, y1, y2].some((v) => v === null)) return;
             const tone = TONES[d.tone] ?? TONES.neutral;
             const faded = d.state === "faded" || d.broken;
-            const alpha = faded ? 0.32 : 0.88;
-            // project to right edge
-            const slope = (y2! - y1!) / Math.max(1, x2! - x1!);
-            const xe = rightEdge;
-            const ye = y1! + slope * (xe - x1!);
-            hardSeg(ctx, x1!, y1!, xe, ye, tone.line(alpha), tone.halo(0.07), 0.55, faded ? [3, 4] : []);
+            if (faded) {
+              // broken line: THIN ghost, never projected (ref D-053)
+              hardSeg(ctx, x1!, y1!, x2!, y2!, tone.line(0.30), tone.halo(0.04), 0.45, [3, 4]);
+            } else {
+              // solid thin core t1→t2 …
+              hardSeg(ctx, x1!, y1!, x2!, y2!, tone.line(0.88), tone.halo(0.07), 0.7);
+              // … then the dashed projection to the right edge — the path
+              // ahead the market has been respecting ("মার্কেট ট্রেন্ড লাইন
+              // ফলো করেই চলে")
+              const slope = (y2! - y1!) / Math.max(1, x2! - x1!);
+              const ye = y2! + slope * (rightEdge - x2!);
+              hardSeg(ctx, x2!, y2!, rightEdge, ye, tone.line(0.55), "transparent", 0.55, [5, 4]);
+            }
             break;
           }
           case "channel": {
-            const draw = (l: { t1: number; p1: number; t2: number; p2: number }) => {
-              const x1 = xOfTime(l.t1), x2 = xOfTime(l.t2), y1 = yOfPrice(l.p1), y2 = yOfPrice(l.p2);
-              if ([x1, x2, y1, y2].some((v) => v === null)) return;
-              const slope = (y2! - y1!) / Math.max(1, x2! - x1!);
-              const ye = y1! + slope * (rightEdge - x1!);
-              hardSeg(ctx, x1!, y1!, rightEdge, ye, TONES.neutral.line(0.6), TONES.neutral.halo(0.06), 0.48);
+            // v16.6 (ref _channel): upper/lower parallels + dashed median,
+            // each projected forward — the corridor the market walks in
+            const ctone = TONES[d.tone ?? (d.dir === "up" ? "bull" : "bear")] ?? TONES.neutral;
+            const drawSide = (l: { t1: number; p1: number; t2: number; p2: number }, isMedian = false) => {
+              const cx1 = xOfTime(l.t1), cx2 = xOfTime(l.t2), cy1 = yOfPrice(l.p1), cy2 = yOfPrice(l.p2);
+              if ([cx1, cx2, cy1, cy2].some((v) => v === null)) return;
+              hardSeg(ctx, cx1!, cy1!, cx2!, cy2!,
+                isMedian ? TONES.neutral.line(0.38) : ctone.line(0.8),
+                isMedian ? "transparent" : ctone.halo(0.05),
+                isMedian ? 0.5 : 0.7);
+              const slope = (cy2! - cy1!) / Math.max(1, cx2! - cx1!);
+              const ye = cy2! + slope * (rightEdge - cx2!);
+              hardSeg(ctx, cx2!, cy2!, rightEdge, ye,
+                isMedian ? TONES.neutral.line(0.28) : ctone.line(0.5),
+                "transparent", 0.5, [4, 4]);
             };
-            draw(d.upper);
-            draw(d.lower);
-            draw({ t1: (d.upper.t1 + d.lower.t1) / 2, p1: (d.upper.p1 + d.lower.p1) / 2, t2: (d.upper.t2 + d.lower.t2) / 2, p2: (d.upper.p2 + d.lower.p2) / 2 });
+            drawSide(d.upper);
+            drawSide(d.lower);
+            if (d.median) drawSide(d.median, true);
+            if (d.label) {
+              const xl = xOfTime(d.lower.t2);
+              const yl = yOfPrice(d.lower.p2);
+              if (xl !== null && yl !== null && tryLabel(xl + 6, yl + 11, d.label, 8, "left")) {
+                pillLabel(ctx, `${d.label}${d.source_tf ? " · " + d.source_tf : ""}`, xl + 6, yl + 11, ctone.text, ctone.line(0.5), "left", 8);
+              }
+            }
             break;
           }
           case "fib": {
@@ -1152,31 +1175,133 @@ export default function TradingChart(props: Props) {
             break;
           }
           case "pattern": {
-            for (const pt of d.points) {
-              const x = xOfTime(pt.t);
-              const y = yOfPrice(pt.price);
-              if (x === null || y === null) continue;
-              ctx.save();
-              ctx.beginPath();
-              ctx.arc(x, y, 5.5, 0, Math.PI * 2);
-              ctx.strokeStyle = "rgba(196,181,253,0.85)";
-              ctx.lineWidth = 0.9;
-              ctx.stroke();
-              ctx.restore();
-              hardText(ctx, String(pt.n), x, y, "rgba(221,214,254,0.95)", 7, "center");
-            }
-            if (d.neckline) {
-              const x1 = xOfTime(d.neckline.t1), x2 = xOfTime(d.neckline.t2);
-              const y1 = yOfPrice(d.neckline.p1), y2 = yOfPrice(d.neckline.p2);
-              if ([x1, x2, y1, y2].every((v) => v !== null)) {
-                hardSeg(ctx, x1!, y1!, rightEdge, y2! + (y2! - y1!) * 0.15, "rgba(167,139,250,0.6)", "rgba(167,139,250,0.05)", 0.6, [4, 4]);
+            // v16.6 — the classic chart-pattern recipe (ref D-072, the
+            // studied channel's drawing style): numbered swing circles,
+            // thin geometry lines + dashed neckline, whisper shading, ENTRY
+            // ring + gold dashed line, red dashed SL, gold TARGET band,
+            // breakout arrow, name pill with family/state — the on-chart
+            // answer to "reversal নাকি continuation, কত দূর যাবে"
+            const pt = d.tone === "bull" ? TONES.bull : TONES.bear;
+            const gold = TONES.gold;
+            // 1. whisper body shading (candles stay loud)
+            if (d.zone) {
+              const yA = yOfPrice(d.zone.hi);
+              const yB = yOfPrice(d.zone.lo);
+              const xRaw = xOfTime(d.zone.t);
+              if (yA !== null && yB !== null && Math.abs(yB - yA) > 1 && xRaw !== null) {
+                const zx = Math.max(-2, xRaw);
+                if (zx <= rightEdge) {
+                  ctx.fillStyle = pt.fill(0.035);
+                  ctx.fillRect(zx, Math.min(yA, yB), rightEdge - zx, Math.abs(yB - yA));
+                }
               }
             }
-            if (d.target != null) {
-              const y = yOfPrice(d.target);
-              if (y !== null) {
-                hardSeg(ctx, rightEdge - 140, y, rightEdge, y, "rgba(245,158,11,0.65)", "rgba(245,158,11,0.05)", 0.7, [2, 3]);
-                hardText(ctx, `${d.name} TGT ${d.target.toFixed(digits)}`, rightEdge - 4, y - 7, "rgba(251,191,36,0.85)", 7.5, "right");
+            // 2. geometry lines — thin hard cores, dashed for necklines
+            for (const g of d.lines ?? []) {
+              const gx1 = xOfTime(g.t1), gx2 = xOfTime(g.t2), gy1 = yOfPrice(g.p1), gy2 = yOfPrice(g.p2);
+              if ([gx1, gx2, gy1, gy2].some((v) => v === null)) continue;
+              if (gx1! > rightEdge || gx2! < -2) continue;
+              hardSeg(ctx, clamp(gx1!, -2, rightEdge), gy1!, clamp(gx2!, -2, rightEdge), gy2!,
+                pt.line(0.85), pt.halo(0.06), 0.7, g.dash ? [4, 3] : []);
+              // dashed neckline/boundary extended ahead of price — the
+              // live trigger line stays visible where the decision happens
+              if (g.dash && gx2! <= rightEdge) {
+                const gslope = (gy2! - gy1!) / Math.max(1, gx2! - gx1!);
+                const gye = gy2! + gslope * (rightEdge - gx2!);
+                hardSeg(ctx, gx2!, gy2!, rightEdge, gye, pt.line(0.4), "transparent", 0.5, [4, 3]);
+              }
+            }
+            // 3. numbered swing circles 1..N (the structure walk)
+            for (const p of d.points) {
+              const x = xOfTime(p.t);
+              const y = yOfPrice(p.price);
+              if (x === null || y === null || x < -6 || x > rightEdge + 6) continue;
+              const cy = p.kind === "high" ? y - 10 : y + 10;
+              ctx.save();
+              ctx.beginPath();
+              ctx.arc(x, cy, 5.5, 0, Math.PI * 2);
+              ctx.fillStyle = "rgba(13,17,23,0.85)";
+              ctx.fill();
+              ctx.strokeStyle = pt.line(0.9);
+              ctx.lineWidth = 0.8;
+              ctx.stroke();
+              ctx.restore();
+              hardText(ctx, String(p.n), x, cy + 0.5, pt.text, 8, "center");
+            }
+            // tag anchor — NEXT TO THE PATTERN, not the right-edge strip
+            const headP = d.points[d.points.length - 1];
+            const xH = headP ? xOfTime(headP.t) : null;
+            const xAnchor = Math.min(xH ?? rightEdge - 84, rightEdge - 84) + 8;
+            // 4. ENTRY — gold ring at the trigger + dashed level line + tag
+            const yE = yOfPrice(d.entry.price);
+            if (yE !== null && yE > -5 && yE < h + 5) {
+              const xE0 = d.entry.t != null ? xOfTime(d.entry.t) : xH;
+              hardSeg(ctx, Math.max(0, xE0 ?? 0), Math.round(yE) + 0.5, rightEdge, Math.round(yE) + 0.5,
+                gold.line(0.75), gold.halo(0.06), 0.65, [4, 3]);
+              if (xE0 != null && xE0 >= -4 && xE0 <= rightEdge) {
+                ctx.save();
+                ctx.beginPath();
+                ctx.arc(xE0 + 2, yE, 5, 0, Math.PI * 2);
+                ctx.strokeStyle = gold.line(0.95);
+                ctx.lineWidth = 1.1;
+                ctx.stroke();
+                ctx.restore();
+              }
+              if (tryLabel(xAnchor, d.dir === "up" ? yE + 11 : yE - 4, `ENTRY ${d.entry.price.toFixed(digits)}`, 8, "left")) {
+                pillLabel(ctx, `ENTRY ${d.entry.price.toFixed(digits)}`, xAnchor, d.dir === "up" ? yE + 11 : yE - 4, gold.text, gold.line(0.5), "left", 8);
+              }
+            }
+            // 5. STOP-LOSS — thin red dashed line + tag
+            const yS = yOfPrice(d.sl);
+            if (yS !== null && yS > -5 && yS < h + 5) {
+              hardSeg(ctx, 0, Math.round(yS) + 0.5, rightEdge, Math.round(yS) + 0.5,
+                "rgba(248,113,113,0.72)", "rgba(248,113,113,0.05)", 0.55, [2.5, 3.5]);
+              if (tryLabel(xAnchor, yS + 12, `SL ${d.sl.toFixed(digits)}`, 8, "left")) {
+                pillLabel(ctx, `SL ${d.sl.toFixed(digits)}`, xAnchor, yS + 12, "rgba(252,165,165,0.95)", "rgba(248,113,113,0.5)", "left", 8);
+              }
+            }
+            // 6. TARGET — whisper gold band + dashed line + tag (measured move)
+            const yT1 = yOfPrice(d.target_zone.lo);
+            const yT2 = yOfPrice(d.target_zone.hi);
+            if (yT1 !== null && yT2 !== null && Math.abs(yT2 - yT1) > 0.5) {
+              ctx.fillStyle = "rgba(212,175,55,0.05)";
+              ctx.fillRect(rightEdge - 64, Math.min(yT1, yT2), 64, Math.abs(yT2 - yT1));
+            }
+            const yT = yOfPrice(d.target);
+            if (yT !== null && yT > -5 && yT < h + 5) {
+              hardSeg(ctx, 0, Math.round(yT) + 0.5, rightEdge, Math.round(yT) + 0.5,
+                gold.line(0.6), "transparent", 0.55, [2, 3]);
+              const rrTxt = d.rr != null ? ` · RR ${d.rr.toFixed(1)}` : "";
+              if (tryLabel(rightEdge - 4, yT - 8, `TARGET ${d.target.toFixed(digits)}${rrTxt}`, 8, "right")) {
+                pillLabel(ctx, `TARGET ${d.target.toFixed(digits)}${rrTxt}`, rightEdge - 4, yT - 8, gold.text, gold.line(0.5), "right", 8);
+              }
+            }
+            // 7. breakout arrow once price CLOSED through the trigger
+            if (d.state === "confirmed" && d.breakout_t != null) {
+              const xb = xOfTime(d.breakout_t);
+              if (xb != null && xb >= 0 && xb <= rightEdge) {
+                const yb = yOfPrice(d.entry.price);
+                if (yb !== null) {
+                  arrow(ctx, Math.min(xb + 10, rightEdge - 14), d.dir === "up" ? yb - 18 : yb + 18, d.dir,
+                    d.dir === "up" ? "rgba(52,211,153,0.95)" : "rgba(248,113,113,0.95)",
+                    d.dir === "up" ? "rgba(52,211,153,0.2)" : "rgba(248,113,113,0.2)", 6);
+                }
+              }
+            }
+            // 8. name pill at the pattern's first point — family + state
+            const firstP = d.points[0];
+            if (firstP) {
+              const x0 = xOfTime(firstP.t);
+              const y0 = yOfPrice(firstP.price);
+              if (x0 !== null && y0 !== null && x0 >= -4 && x0 <= rightEdge) {
+                const fam = d.family === "reversal" ? "REVERSAL" : d.family === "continuation" ? "CONTINUATION" : "BOUNDARY";
+                const nm = `${d.name} · ${fam} · ${d.state === "confirmed" ? "✓ CONFIRMED" : "FORMING"}${d.source_tf ? " · " + d.source_tf : ""}`;
+                const ty = firstP.kind === "high" ? y0 - 22 : y0 + 22;
+                if (tryLabel(x0, ty, nm, 8.5, "left", true)) {
+                  pillLabel(ctx, nm, x0, ty,
+                    d.state === "confirmed" ? pt.text : "rgba(226,232,230,0.9)",
+                    d.state === "confirmed" ? pt.line(0.55) : "rgba(148,163,158,0.4)", "left", 8.5);
+                }
               }
             }
             break;

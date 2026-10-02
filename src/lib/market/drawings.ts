@@ -12,6 +12,7 @@ import {
 } from "./smc";
 import type { SignalPayload } from "./types";
 import type { AmdPhase, ConsolidationRange, InstitutionalMark } from "./phases";
+import { detectChannel } from "./patterns";
 
 const MAX_DRAWINGS = 96;
 
@@ -111,28 +112,47 @@ export function buildDrawings(
     });
   }
 
-  // 4. trendlines from last two swings (projected; broken → faded)
+  // 4. trendlines from last two swings (projected; broken → faded).
+  //    v16.6: the break test is against the PROJECTED line value at the
+  //    last bar (the ref engine's rule) — on a descending supply line the
+  //    projection sits BELOW the older swing high, so a close through the
+  //    *line* (not the swing max) is the honest "market left the trendline"
+  //    read. This is why the drawn line looks like the market follows it.
   const sw = swings(win, 2, 2);
   const highs = sw.filter((s) => s.kind === "high");
   const lows = sw.filter((s) => s.kind === "low");
+  const projAt = (p1: { t: number; price: number }, p2: { t: number; price: number }, atT: number) => {
+    const dt = p2.t - p1.t;
+    if (dt <= 0) return p2.price;
+    return p2.price + ((p2.price - p1.price) / dt) * (atT - p2.t);
+  };
   if (highs.length >= 2) {
     const [s1, s2] = highs.slice(-2);
-    const broken = lastBar.c > Math.max(s1.price, s2.price);
+    const projNow = projAt(s1, s2, lastBar.t);
+    const broken = lastBar.c > projNow + 0.25 * a;
     out.push({
       kind: "trendline",
       t1: s1.t, p1: s1.price, t2: s2.t, p2: s2.price,
-      tone: "bear", broken, state: broken ? "faded" : "active",
+      tone: "bear", broken, state: broken ? "faded" : "active", source_tf: tf,
     });
   }
   if (lows.length >= 2) {
     const [s1, s2] = lows.slice(-2);
-    const broken = lastBar.c < Math.min(s1.price, s2.price);
+    const projNow = projAt(s1, s2, lastBar.t);
+    const broken = lastBar.c < projNow - 0.25 * a;
     out.push({
       kind: "trendline",
       t1: s1.t, p1: s1.price, t2: s2.t, p2: s2.price,
-      tone: "bull", broken, state: broken ? "faded" : "active",
+      tone: "bull", broken, state: broken ? "faded" : "active", source_tf: tf,
     });
   }
+
+  // 4b. v16.6 — the channel (ref _channel): upper + lower parallels + the
+  //     dashed median from the last 2 swing highs/lows (k=3 fractals).
+  //     Only prints when both sides agree on the slope — the corridor the
+  //     market has been walking between. Projected forward by the renderer.
+  const channel = detectChannel(bars);
+  if (channel) out.push({ ...channel, source_tf: tf });
 
   // 5. fib of the current leg with OTE
   const legFrom = pd.legDir === "up" ? pd.lo : pd.hi;

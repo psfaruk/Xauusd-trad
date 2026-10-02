@@ -8,6 +8,7 @@ import { buildDrawings, magnetsToDrawings, projectSetup, buildPhaseDrawings, bui
 import { buildRoadmap } from "@/lib/market/roadmap";
 import { detectStructure, detectSupplyDemand } from "@/lib/market/smc";
 import { detectConsolidations, detectAmdPhases, detectInstitutionalActivity } from "@/lib/market/phases";
+import { detectPatterns } from "@/lib/market/patterns";
 import type { AnalysisResponse, Candle, SignalPayload } from "@/lib/market/types";
 import { svcHeaders, getBrokerOffsetSec, spreadFor } from "@/lib/svc";
 
@@ -15,7 +16,7 @@ const MT5_URL = process.env.MT5_SERVICE_URL ?? "http://127.0.0.1:3031";
 const CACHE_TTL = 8_000;
 /** v16.4 (audit §10): the strategy build identity carried in every
  *  response so consumers/caches can compare across deploys. */
-const STRATEGY_VERSION = "v16.4";
+const STRATEGY_VERSION = "v16.6";
 /** v16.4 (audit §10): a candle older than 3× its timeframe (plus a
  *  market-closed weekend allowance) means the FEED is stale — surfaced
  *  via dataFreshness.fresh=false instead of passing silently. */
@@ -435,6 +436,20 @@ export async function GET(req: Request) {
     ...buildMtfStructureDrawings({ h1: h1Read, h4: h4Read }),
     ...magnetsToDrawings(roadmap.magnets),
   ];
+  // ── v16.6 — the classic chart-pattern layer (ref-repo D-072 recipe):
+  //    triangles / wedges / flags / H&S / double-triple tops with the full
+  //    measured-move trade plan (ENTRY/SL/TARGET + RR) — the chart's answer
+  //    to "reversal হলে কত দূর যাবে / continue করলে কত দূর যাবে". Active TF
+  //    always; H1 joins as source-labeled MTF context when it isn't the
+  //    active tf (audit §2.6: every drawing says where it came from). ──
+  for (const p of detectPatterns(closedBars)) {
+    drawings.push({ ...p, source_tf: tf });
+  }
+  if (tf !== "H1" && h1Closed.length >= 60) {
+    for (const p of detectPatterns(h1Closed).slice(0, 1)) {
+      drawings.push({ ...p, source_tf: "H1" });
+    }
+  }
   // v16.5: the forward map — projected legs to the roadmap's real targets
   // (supersedes the old single-arrow path drawing)
   const forecast = buildForecastDrawing(roadmap, price, digits);
