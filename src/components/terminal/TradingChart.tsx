@@ -588,6 +588,24 @@ export default function TradingChart(props: Props) {
     const xOfTime = (t: number): number | null => {
       const x = ts.timeToCoordinate(t as UTCTimestamp);
       if (x !== null) return x;
+      // v16.8 (user audit): off-window times resolve through the BAR GRID
+      // (logical coordinates), never blind barSpacing arithmetic — the old
+      // linear extrapolation ignored session/weekend gaps and drew BOS
+      // break-lines from wildly wrong left endpoints. Older than the loaded
+      // data clamps to the first bar; newer projects forward gap-free.
+      if (bs.length) {
+        const idx = bs.findIndex((b) => b.t >= t);
+        if (idx > 0) {
+          const prev = bs[idx - 1];
+          const frac = (t - prev.t) / Math.max(1e-9, bs[idx].t - prev.t);
+          const lc = ts.logicalToCoordinate(idx - 1 + frac);
+          if (lc != null) return lc;
+        }
+        if (t <= bs[0].t) {
+          const lc0 = ts.logicalToCoordinate(0);
+          if (lc0 != null) return lc0;
+        }
+      }
       const xLast = ts.timeToCoordinate(lastTime as UTCTimestamp);
       if (xLast === null) return null;
       return xLast + ((t - lastTime) / tf) * barSpacing;
@@ -613,8 +631,13 @@ export default function TradingChart(props: Props) {
           const bands: { name: string; s: number; e: number; gold: boolean }[] = [
             { name: "ASIA", s: 0, e: 6, gold: false },
             { name: "LONDON", s: 7, e: 10, gold: true },
-            { name: "NY·AM", s: 12, e: 15, gold: true },
-            { name: "NY·PM", s: 15.5, e: 17, gold: false },
+            // v16.8 (user audit): ICT kill zones on the UTC clock —
+            // NY·AM = 09:30–11:00 EST = 14:30–16:00 UTC (the old 12–15
+            // band started 30min early and ended an hour early);
+            // NY·PM = 13:30–16:00 EST = 18:30–21:00 UTC (was 15:30–17,
+            // which overlapped the corrected AM zone)
+            { name: "NY·AM", s: 14.5, e: 16, gold: true },
+            { name: "NY·PM", s: 18.5, e: 21, gold: false },
           ];
           const dayStart = Math.floor((vr.from as number) / 86400) * 86400 - 86400;
           for (let d = dayStart; d < (vr.to as number) + 86400; d += 86400) {
@@ -749,12 +772,22 @@ export default function TradingChart(props: Props) {
             if (y1 === null || y2 === null || x === null) return;
             const x0 = clamp(x, -2, rightEdge);
             if (x0 >= rightEdge - 4) return;
+            // v16.8 (user audit): a MITIGATED zone stops at its mitigation
+            // candle — the old rect stretched every faded zone to the right
+            // edge, piling dead ink over the live price area. Fresh zones
+            // still extend right (they are live levels).
+            let xEnd = rightEdge;
+            if (d.state === "faded" && d.mitT != null) {
+              const xm = xOfTime(d.mitT);
+              if (xm != null) xEnd = clamp(xm, x0, rightEdge);
+            }
+            if (xEnd - x0 < 2) return;
             const alphaMul = d.state === "faded" ? 0.32 : 1;
             ctx.globalAlpha = alphaMul;
             ctx.fillStyle = st.fill;
-            ctx.fillRect(x0, Math.min(y1, y2), rightEdge - x0, Math.abs(y2 - y1));
-            hardSeg(ctx, x0, y1, rightEdge, y1, st.border, st.halo, 0.62);
-            hardSeg(ctx, x0, y2, rightEdge, y2, st.border, st.halo, 0.62);
+            ctx.fillRect(x0, Math.min(y1, y2), xEnd - x0, Math.abs(y2 - y1));
+            hardSeg(ctx, x0, y1, xEnd, y1, st.border, st.halo, 0.5);
+            hardSeg(ctx, x0, y2, xEnd, y2, st.border, st.halo, 0.5);
             const sideName: Record<string, string> = {
               supply: "SUPPLY", demand: "DEMAND", ob_bull: "OB+", ob_bear: "OB−",
               fvg_bull: "FVG+", fvg_bear: "FVG−",
@@ -778,16 +811,16 @@ export default function TradingChart(props: Props) {
             const faded = d.state === "faded" || d.broken;
             if (faded) {
               // broken line: THIN ghost, never projected (ref D-053)
-              hardSeg(ctx, x1!, y1!, x2!, y2!, tone.line(0.30), tone.halo(0.04), 0.45, [3, 4]);
+              hardSeg(ctx, x1!, y1!, x2!, y2!, tone.line(0.30), tone.halo(0.04), 0.4, [3, 4]);
             } else {
-              // solid thin core t1→t2 …
-              hardSeg(ctx, x1!, y1!, x2!, y2!, tone.line(0.88), tone.halo(0.07), 0.7);
+              // solid thin core t1→t2 (v16.8: 0.7 → 0.55 — thinner & clearer, user spec) …
+              hardSeg(ctx, x1!, y1!, x2!, y2!, tone.line(0.88), tone.halo(0.07), 0.55);
               // … then the dashed projection to the right edge — the path
               // ahead the market has been respecting ("মার্কেট ট্রেন্ড লাইন
               // ফলো করেই চলে")
               const slope = (y2! - y1!) / Math.max(1, x2! - x1!);
               const ye = y2! + slope * (rightEdge - x2!);
-              hardSeg(ctx, x2!, y2!, rightEdge, ye, tone.line(0.55), "transparent", 0.55, [5, 4]);
+              hardSeg(ctx, x2!, y2!, rightEdge, ye, tone.line(0.55), "transparent", 0.45, [5, 4]);
             }
             break;
           }
@@ -801,12 +834,12 @@ export default function TradingChart(props: Props) {
               hardSeg(ctx, cx1!, cy1!, cx2!, cy2!,
                 isMedian ? TONES.neutral.line(0.38) : ctone.line(0.8),
                 isMedian ? "transparent" : ctone.halo(0.05),
-                isMedian ? 0.5 : 0.7);
+                isMedian ? 0.45 : 0.55);
               const slope = (cy2! - cy1!) / Math.max(1, cx2! - cx1!);
               const ye = cy2! + slope * (rightEdge - cx2!);
               hardSeg(ctx, cx2!, cy2!, rightEdge, ye,
                 isMedian ? TONES.neutral.line(0.28) : ctone.line(0.5),
-                "transparent", 0.5, [4, 4]);
+                "transparent", 0.45, [4, 4]);
             };
             drawSide(d.upper);
             drawSide(d.lower);
@@ -876,7 +909,7 @@ export default function TradingChart(props: Props) {
                 const xb = clamp(x + 6, xa, rightEdge);
                 if (xb > xa) {
                   const bc = isBos ? "52,211,153" : "245,158,11";
-                  hardSeg(ctx, xa, y, xb, y, `rgba(${bc},0.55)`, `rgba(${bc},0.04)`, 0.6, [4, 3]);
+                  hardSeg(ctx, xa, y, xb, y, `rgba(${bc},0.55)`, `rgba(${bc},0.04)`, 0.5, [4, 3]);
                 }
               }
             }
@@ -895,7 +928,7 @@ export default function TradingChart(props: Props) {
             if (pts.length < 2) return;
             ctx.save();
             ctx.strokeStyle = "rgba(196,205,214,0.8)";
-            ctx.lineWidth = 1.0;
+            ctx.lineWidth = 0.7; // v16.8: 1.0 → 0.7 — thinner & clearer
             ctx.setLineDash([]);
             ctx.shadowColor = "rgba(10,12,16,0.7)";
             ctx.shadowBlur = 2.5;
@@ -978,10 +1011,10 @@ export default function TradingChart(props: Props) {
             ctx.save();
             ctx.shadowColor = "rgba(212,175,55,0.55)";
             ctx.shadowBlur = 5;
-            hardSeg(ctx, xs, yE, rightEdge, yE, `rgba(230,190,70,${(0.98 * inkM).toFixed(2)})`, "rgba(212,175,55,0.1)", 0.95, waiting ? [2, 3] : []);
+            hardSeg(ctx, xs, yE, rightEdge, yE, `rgba(230,190,70,${(0.98 * inkM).toFixed(2)})`, "rgba(212,175,55,0.1)", 0.8, waiting ? [2, 3] : []);
             ctx.restore();
-            hardSeg(ctx, xs, yS, rightEdge, yS, `rgba(255,120,132,${(0.92 * inkM).toFixed(2)})`, "rgba(248,113,113,0.07)", 0.72, [5, 4]);
-            hardSeg(ctx, xs, yT, rightEdge, yT, `rgba(52,211,153,${(0.92 * inkM).toFixed(2)})`, "rgba(52,211,153,0.07)", 0.72, [5, 4]);
+            hardSeg(ctx, xs, yS, rightEdge, yS, `rgba(255,120,132,${(0.92 * inkM).toFixed(2)})`, "rgba(248,113,113,0.07)", 0.6, [5, 4]);
+            hardSeg(ctx, xs, yT, rightEdge, yT, `rgba(52,211,153,${(0.92 * inkM).toFixed(2)})`, "rgba(52,211,153,0.07)", 0.6, [5, 4]);
             // right-edge contract badges (setup labels always win — force register)
             const verb = projected ? "PLAN" : waiting ? "WAIT" : "ENTRY";
             const lE = `${d.dir} ${verb} ${d.entry.toFixed(digits)}`;
@@ -1356,13 +1389,21 @@ export default function TradingChart(props: Props) {
 
       // ── EMA ribbon ──
       if (layersRef.current.ema) {
-        const drawEma = (vals: (number | null)[], color: string, width: number) => {
+        // v16.8 (user audit): the forming candle's LIVE close drives the last
+        // EMA point — the ribbon used the last socket-bar close and visibly
+        // lagged the tick during the whole forming candle.
+        const liveC = bs[bs.length - 1]?.f && displayRef.current ? displayRef.current.c : null;
+        const drawEma = (vals: (number | null)[], color: string, width: number, period: number) => {
           ctx.save();
           ctx.beginPath();
           let started = false;
           for (let i = 0; i < bs.length; i++) {
-            const v = vals[i];
+            let v = vals[i];
             if (v == null) continue;
+            if (liveC != null && i === bs.length - 1 && i > 0 && vals[i - 1] != null) {
+              const k = 2 / (period + 1);
+              v = liveC * k + (vals[i - 1] as number) * (1 - k);
+            }
             const x = ts.timeToCoordinate(bs[i].t as UTCTimestamp);
             const y = yOfPrice(v);
             if (x === null || y === null) continue;
@@ -1374,9 +1415,9 @@ export default function TradingChart(props: Props) {
           ctx.stroke();
           ctx.restore();
         };
-        drawEma(emaRef.current.e9, "rgba(52,211,153,0.55)", 0.8);
-        drawEma(emaRef.current.e21, "rgba(245,158,11,0.55)", 0.7);
-        drawEma(emaRef.current.e50, "rgba(148,163,158,0.5)", 0.7);
+        drawEma(emaRef.current.e9, "rgba(52,211,153,0.55)", 0.7, 9);
+        drawEma(emaRef.current.e21, "rgba(245,158,11,0.55)", 0.6, 21);
+        drawEma(emaRef.current.e50, "rgba(148,163,158,0.5)", 0.6, 50);
       }
 
       // ── user drawings ──

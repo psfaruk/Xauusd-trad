@@ -63,24 +63,40 @@ export function buildRoadmap(
   const swept = ctx.pools.find((p) => p.state === "swept");
   let direction: RoadmapData["direction"];
   let directionWhy: string;
+  // v16.8 (user audit): the draw-on-liquidity target is the NEAREST
+  // untouched pool by DISTANCE — pools arrive as [BSL..., SSL...] so the old
+  // find() hit the first BSL almost by construction and the roadmap read
+  // BULL regardless of where price actually sat. Near-tie (≤ 0.35 ATR):
+  // prefer the side the bias/structure already faces.
+  const untouchedRanked = ctx.pools
+    .filter((p) => p.state === "untouched")
+    .map((p) => ({ p, d: Math.abs(p.price - price) }))
+    .sort((x, y) => x.d - y.d);
+  let nearestUntouched: LiquidityPool | null = untouchedRanked[0]?.p ?? null;
+  if (untouchedRanked.length >= 2) {
+    const [n1, n2] = untouchedRanked;
+    if (n2.d - n1.d <= 0.35 * a) {
+      const bullFace = ctx.biasDir === "BUY" || (ctx.biasDir === "NEUTRAL" && ctx.structure.trend === "bullish");
+      const bearFace = ctx.biasDir === "SELL" || (ctx.biasDir === "NEUTRAL" && ctx.structure.trend === "bearish");
+      if (bullFace && n2.p.side === "BSL") nearestUntouched = n2.p;
+      else if (bearFace && n2.p.side === "SSL") nearestUntouched = n2.p;
+    }
+  }
   if (swept) {
     direction = swept.side === "SSL" ? "BULL" : "BEAR";
     directionWhy = `${swept.side} swept at ${swept.price.toFixed(2)} — expect draw back inside`;
+  } else if (nearestUntouched) {
+    direction = nearestUntouched.side === "BSL" ? "BULL" : "BEAR";
+    directionWhy = `draw on liquidity — nearest untouched ${nearestUntouched.side} at ${nearestUntouched.price.toFixed(2)} (${(Math.abs(nearestUntouched.price - price) / a).toFixed(1)} ATR away)`;
+  } else if (ctx.biasDir === "BUY") {
+    direction = "BULL";
+    directionWhy = `multi-source bias ${(ctx.biasScore).toFixed(2)} (H1/H4 structure + EMA)`;
+  } else if (ctx.biasDir === "SELL") {
+    direction = "BEAR";
+    directionWhy = `multi-source bias ${(ctx.biasScore).toFixed(2)} (H1/H4 structure + EMA)`;
   } else {
-    const untouched = ctx.pools.find((p) => p.state === "untouched");
-    if (untouched) {
-      direction = untouched.side === "BSL" ? "BULL" : "BEAR";
-      directionWhy = `draw on liquidity — untouched ${untouched.side} at ${untouched.price.toFixed(2)}`;
-    } else if (ctx.biasDir === "BUY") {
-      direction = "BULL";
-      directionWhy = `multi-source bias ${(ctx.biasScore).toFixed(2)} (H1/H4 structure + EMA)`;
-    } else if (ctx.biasDir === "SELL") {
-      direction = "BEAR";
-      directionWhy = `multi-source bias ${(ctx.biasScore).toFixed(2)} (H1/H4 structure + EMA)`;
-    } else {
-      direction = "NEUTRAL";
-      directionWhy = "mixed reads — wait for a liquidity event";
-    }
+    direction = "NEUTRAL";
+    directionWhy = "mixed reads — wait for a liquidity event";
   }
 
   // ── magnets (counter-side pull levels, ≤3 ATR) ──
@@ -115,7 +131,8 @@ export function buildRoadmap(
     .slice(0, 4);
 
   // ── projected path ──
-  const nearestUntouched = ctx.pools.find((p) => p.state === "untouched");
+  // v16.8: same nearest-untouched pick as the direction verdict (the old
+  // find() drew the path to the first BSL in the array — up, always up).
   const path = nearestUntouched
     ? {
         dir: (nearestUntouched.side === "BSL" ? "up" : "down") as "up" | "down",

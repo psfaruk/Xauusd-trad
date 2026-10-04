@@ -25,13 +25,25 @@ export interface StructureRead {
   labels: { index: number; t: number; price: number; tag: "HH" | "HL" | "LH" | "LL"; side: "high" | "low" }[];
 }
 
-export function detectStructure(bars: Candle[], left = 2, right = 2, maxEvents = 6): StructureRead {
+/**
+ * v16.8 (user audit) — MAJOR structure swings: 5-left/5-right fractals.
+ * The old 2/2 fractals turned every M1/M5 micro-wick into a "swing", so
+ * BOS/CHoCH fired on noise and the structure flipped every 2–3 minutes.
+ * 5/5 = confirmed major structure (lag accepted: a swing confirms 5 bars
+ * after its extreme — that is the price of a structure read that is real).
+ */
+export function detectStructure(bars: Candle[], left = 5, right = 5, maxEvents = 6): StructureRead {
   const sw = swings(bars, left, right);
-  // label swings HH/LH/HL/LL vs previous same-kind
+  // label swings HH/LH/HL/LL vs previous same-kind — in swing order, each
+  // label remembered WITH its swing index so the event walk can vote the
+  // structure trend AS-OF any bar (no lookahead: a label joins the story
+  // only once its swing is confirmed, right bars later).
   const labels: StructureRead["labels"] = [];
+  const labelSwingIdx: number[] = [];
   let lastHigh: Swing | null = null;
   let lastLow: Swing | null = null;
-  for (const s of sw) {
+  for (let si = 0; si < sw.length; si++) {
+    const s = sw[si];
     if (s.kind === "high") {
       if (lastHigh) {
         labels.push({
@@ -39,6 +51,7 @@ export function detectStructure(bars: Candle[], left = 2, right = 2, maxEvents =
           tag: s.price > lastHigh.price ? "HH" : "LH",
           side: "high",
         });
+        labelSwingIdx.push(si);
       }
       lastHigh = s;
     } else {
@@ -48,22 +61,37 @@ export function detectStructure(bars: Candle[], left = 2, right = 2, maxEvents =
           tag: s.price > lastLow.price ? "HL" : "LL",
           side: "low",
         });
+        labelSwingIdx.push(si);
       }
       lastLow = s;
     }
   }
-  // trend = vote of latest labels
-  const recent = labels.slice(-4);
-  const bull = recent.filter((l) => l.tag === "HH" || l.tag === "HL").length;
-  const bear = recent.filter((l) => l.tag === "LH" || l.tag === "LL").length;
-  const trend = bull > bear ? "bullish" : bear > bull ? "bearish" : "neutral";
+  // v16.8 trend vote: the LAST 6 labels, newest heaviest (weighted recent
+  // emphasis) — the old 4-label plain count called a 10-label bull run
+  // "neutral" the moment a pullback printed 2 bear tags.
+  const vote = (upto: number): "bullish" | "bearish" | "neutral" => {
+    const recent = labels.slice(Math.max(0, upto - 6), upto);
+    let bull = 0;
+    let bear = 0;
+    for (let i = 0; i < recent.length; i++) {
+      const w = recent.length - i; // newest = heaviest
+      if (recent[i].tag === "HH" || recent[i].tag === "HL") bull += w;
+      else bear += w;
+    }
+    return bull > bear ? "bullish" : bear > bull ? "bearish" : "neutral";
+  };
+  const trend = vote(labels.length);
 
-  // events: walk bars; a close beyond the last swing high/low is a break
+  // events: walk bars; a close beyond the last CONFIRMED swing is a break.
+  // v16.8 BOS vs CHoCH — referenced against the STRUCTURE TREND (the label
+  // vote), not the previous break's direction: a break WITH the trend is
+  // BOS (continuation); a break AGAINST it is CHoCH (first crack / MSS).
+  // The old prevBreakDir logic relabeled range chop as CHoCH on every flip.
   const events: StructureEvent[] = [];
   let pendHigh: Swing | null = null;
   let pendLow: Swing | null = null;
   let swIdx = 0;
-  let prevDir: "up" | "down" | null = null;
+  let confirmed = 0; // labels whose swing has confirmed as-of bar i
   for (let i = 0; i < bars.length; i++) {
     while (swIdx < sw.length && sw[swIdx].index + right <= i) {
       const s = sw[swIdx];
@@ -71,22 +99,21 @@ export function detectStructure(bars: Candle[], left = 2, right = 2, maxEvents =
       else pendLow = s;
       swIdx++;
     }
+    while (confirmed < labels.length && labelSwingIdx[confirmed] < swIdx) confirmed++;
     const b = bars[i];
     if (pendHigh && b.c > pendHigh.price) {
       const dir: "up" | "down" = "up";
       events.push({
         t: b.t, price: pendHigh.price, dir, index: i, fromT: pendHigh.t,
-        label: prevDir === dir ? "BOS" : prevDir === null ? "BOS" : "CHoCH",
+        label: vote(confirmed) === "bearish" ? "CHoCH" : "BOS",
       });
-      prevDir = dir;
       pendHigh = null;
     } else if (pendLow && b.c < pendLow.price) {
       const dir: "up" | "down" = "down";
       events.push({
         t: b.t, price: pendLow.price, dir, index: i, fromT: pendLow.t,
-        label: prevDir === dir ? "BOS" : prevDir === null ? "BOS" : "CHoCH",
+        label: vote(confirmed) === "bullish" ? "CHoCH" : "BOS",
       });
-      prevDir = dir;
       pendLow = null;
     }
   }
@@ -108,9 +135,39 @@ export interface Zone {
   brokenT?: number;
 }
 
-/** Bullish OB: last down-close candle before an impulse (body ≥ impulse_atr × ATR) up-close. */
+/**
+ * v16.8 (user audit) — ICT-true order blocks:
+ *  · zone = the FULL candle range (wick to wick) — mitigation can come from
+ *    any part of the candle; a body-only zone is half an OB
+ *  · the OB candle must SWEEP liquidity (take out the prior confirmed
+ *    swing low for a bull OB / swing high for a bear OB)
+ *  · the impulse must BREAK structure (a close beyond the last confirmed
+ *    swing high/low within the next bars) — every ordinary retracement
+ *    candle used to get an OB tag; those false zones are gone
+ */
 export function detectOrderBlocks(bars: Candle[], impulseAtr = 1.2): Zone[] {
   const a = atr(bars);
+  // minor (2/2) swings for sweep validation — liquidity rests at minor pivots
+  const sw = swings(bars, 2, 2);
+  const highs = sw.filter((s) => s.kind === "high");
+  const lows = sw.filter((s) => s.kind === "low");
+  /** last CONFIRMED swing-high price strictly before bar k (null = none) */
+  const lastHighBefore = (k: number): number | null => {
+    let v: number | null = null;
+    for (const s of highs) {
+      if (s.index + 2 > k) break;
+      v = s.price;
+    }
+    return v;
+  };
+  const lastLowBefore = (k: number): number | null => {
+    let v: number | null = null;
+    for (const s of lows) {
+      if (s.index + 2 > k) break;
+      v = s.price;
+    }
+    return v;
+  };
   const out: Zone[] = [];
   for (let k = 0; k + 1 < bars.length; k++) {
     const atrK = a[k];
@@ -120,15 +177,43 @@ export function detectOrderBlocks(bars: Candle[], impulseAtr = 1.2): Zone[] {
     const downK = bars[k].c < bars[k].o;
     const upNext = bars[k + 1].c > bars[k + 1].o;
     if (downK && upNext) {
-      out.push({ side: "ob_bull", lo: Math.min(bars[k].o, bars[k].c), hi: Math.max(bars[k].o, bars[k].c), t: bars[k].t });
+      // bull OB: sweep of the prior swing low + impulse closes above the
+      // last confirmed swing high (BOS) within 6 bars
+      const priorLow = lastLowBefore(k);
+      const swept = priorLow != null && bars[k].l < priorLow;
+      const priorHigh = lastHighBefore(k);
+      let bos = false;
+      for (let j = k + 1; j <= Math.min(k + 6, bars.length - 1); j++) {
+        if (priorHigh != null && bars[j].c > priorHigh) { bos = true; break; }
+      }
+      if (swept && bos) {
+        out.push({ side: "ob_bull", lo: bars[k].l, hi: bars[k].h, t: bars[k].t });
+      }
     } else if (!downK && !upNext) {
-      out.push({ side: "ob_bear", lo: Math.min(bars[k].o, bars[k].c), hi: Math.max(bars[k].o, bars[k].c), t: bars[k].t });
+      // bear OB: sweep of the prior swing high + impulse closes below the
+      // last confirmed swing low (BOS) within 6 bars
+      const priorHigh = lastHighBefore(k);
+      const swept = priorHigh != null && bars[k].h > priorHigh;
+      const priorLow = lastLowBefore(k);
+      let bos = false;
+      for (let j = k + 1; j <= Math.min(k + 6, bars.length - 1); j++) {
+        if (priorLow != null && bars[j].c < priorLow) { bos = true; break; }
+      }
+      if (swept && bos) {
+        out.push({ side: "ob_bear", lo: bars[k].l, hi: bars[k].h, t: bars[k].t });
+      }
     }
   }
-  // mitigation: first later bar overlapping the zone
+  // timeline per zone: mitigation (first overlap) + broken (first close
+  // beyond the far edge) — as-of filterable like supply/demand
   for (const z of out) {
-    for (let i = bars.findIndex((b) => b.t === z.t) + 1; i < bars.length; i++) {
-      if (bars[i].l <= z.hi && bars[i].h >= z.lo) { z.mitT = bars[i].t; break; }
+    const startIdx = bars.findIndex((b) => b.t === z.t);
+    if (startIdx < 0) continue;
+    for (let i = startIdx + 1; i < bars.length; i++) {
+      const b = bars[i];
+      if (z.mitT == null && b.l <= z.hi && b.h >= z.lo) z.mitT = b.t;
+      if (z.side === "ob_bull" && b.c < z.lo) { z.brokenT = b.t; break; }
+      if (z.side === "ob_bear" && b.c > z.hi) { z.brokenT = b.t; break; }
     }
   }
   return out;
@@ -150,8 +235,11 @@ export function detectFvg(bars: Candle[]): (Zone & { gap: number; disp: number }
       for (let i = k + 2; i < bars.length; i++) {
         if (bars[i].l <= hi) {
           if (mitT == null) mitT = bars[i].t;
+          // v16.8: track the fill ALL THE WAY to 100% — the old `>= 0.5
+          // break` froze the gap at half-filled forever, so fully-mitigated
+          // FVGs kept signaling like fresh ones.
           fillPct = Math.min(1, (hi - bars[i].l) / Math.max(1e-9, gap));
-          if (fillPct >= 0.5) break;
+          if (fillPct >= 1) break;
         }
       }
       out.push({ side: "fvg_bull", lo, hi, t: bars[k].t, mitT, gap, gapAtr: atrK ? gap / atrK : 0, disp: atrK ? disp / atrK : 0, fillPct, filled: fillPct >= 1 });
@@ -165,8 +253,9 @@ export function detectFvg(bars: Candle[]): (Zone & { gap: number; disp: number }
       for (let i = k + 2; i < bars.length; i++) {
         if (bars[i].h >= lo) {
           if (mitT == null) mitT = bars[i].t;
+          // v16.8: same full-fill tracking on the bearish side
           fillPct = Math.min(1, (bars[i].h - lo) / Math.max(1e-9, gap));
-          if (fillPct >= 0.5) break;
+          if (fillPct >= 1) break;
         }
       }
       out.push({ side: "fvg_bear", lo, hi, t: bars[k].t, mitT, gap, gapAtr: atrK ? gap / atrK : 0, disp: atrK ? disp / atrK : 0, fillPct, filled: fillPct >= 1 });
@@ -343,19 +432,42 @@ export interface PremiumDiscount {
 
 export function premiumDiscount(bars: Candle[], lookback = 60, price: number): PremiumDiscount {
   const win = bars.slice(-lookback);
-  const hi = Math.max(...win.map((b) => b.h));
-  const lo = Math.min(...win.map((b) => b.l));
+  // v16.8 (user audit): the dealing range is the LAST MAJOR LEG (5/5
+  // swings) — ICT premium/discount + OTE are LEG measurements. The old
+  // 60-bar window extremes put the OTE pocket in the wrong half whenever
+  // two different legs shared the window (fib anchored on a range, not a leg).
+  const sw = swings(bars, 5, 5);
+  let lastHigh: Swing | null = null;
+  let lastLow: Swing | null = null;
+  for (const s of sw) {
+    if (s.kind === "high") lastHigh = s;
+    else lastLow = s;
+  }
+  let hi: number;
+  let lo: number;
+  let legDir: "up" | "down";
+  if (lastHigh && lastLow && lastHigh.index !== lastLow.index) {
+    hi = lastHigh.price;
+    lo = lastLow.price;
+    legDir = lastHigh.index > lastLow.index ? "up" : "down";
+  } else {
+    // no confirmed major swings in the window — honest fallback to extremes
+    hi = Math.max(...win.map((b) => b.h));
+    lo = Math.min(...win.map((b) => b.l));
+    const hiIdx = win.findIndex((b) => b.h === hi);
+    const loIdx = win.findIndex((b) => b.l === lo);
+    legDir = hiIdx > loIdx ? "up" : "down";
+  }
   const eq = (hi + lo) / 2;
-  const range = hi - lo;
-  const band = 0.05 * range;
+  const legH = Math.max(hi - lo, 1e-9);
+  const band = 0.05 * legH;
   const state = price > eq + band ? "premium" : price < eq - band ? "discount" : "balanced";
-  // leg direction: which extreme is more recent
-  const hiIdx = win.findIndex((b) => b.h === hi);
-  const loIdx = win.findIndex((b) => b.l === lo);
-  const legDir = hiIdx > loIdx ? "up" : "down";
-  // OTE of the current leg
+  // v16.8 OTE of the CURRENT leg — retracement into the tradeable side:
+  //   up leg  → pullback 61.8–78.6% DOWN from the high = the discount longs
+  //   down leg → pullback 61.8–78.6% UP from the low = the premium shorts
+  // (the old formula measured the window range and mirrored the zone).
   const ote: [number, number] = legDir === "up"
-    ? [hi - 0.62 * range, hi - 0.79 * range]
-    : [lo + 0.62 * range, lo + 0.79 * range];
+    ? [hi - 0.786 * legH, hi - 0.618 * legH]
+    : [lo + 0.618 * legH, lo + 0.786 * legH];
   return { hi, lo, eq, state, legDir, ote, price };
 }

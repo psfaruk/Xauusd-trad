@@ -92,8 +92,16 @@ export function macd(bars: Candle[], fast = 12, slow = 26, signal = 9) {
   const line: number[] = bars.map((_, i) =>
     eFast[i] != null && eSlow[i] != null ? (eFast[i] as number) - (eSlow[i] as number) : NaN,
   );
-  const valid = line.map((v) => (Number.isFinite(v) ? v : 0));
-  const sig = ema(valid, signal);
+  // v16.8 (user audit): the signal EMA warms up from the FIRST valid line
+  // value — the old NaN→0 substitution pulled the seed toward zero and
+  // biased the first ~26 bars of the histogram.
+  const sig: (number | null)[] = bars.map(() => null);
+  const firstValid = line.findIndex((v) => Number.isFinite(v));
+  if (firstValid >= 0) {
+    const tail = line.slice(firstValid).map((v) => (Number.isFinite(v) ? v : 0));
+    const sigTail = ema(tail, signal);
+    for (let i = 0; i < sigTail.length; i++) sig[firstValid + i] = sigTail[i];
+  }
   const hist = line.map((v, i) => (Number.isFinite(v) && sig[i] != null ? v - (sig[i] as number) : NaN));
   return { line, signal: sig, hist };
 }
@@ -241,11 +249,14 @@ export function swings(bars: Candle[], left = 2, right = 2): Swing[] {
   return dedup;
 }
 
-/** Session name from UTC hour — tokyo 0-7, london 7-16, newyork 13-20. */
-export function sessionOf(tsSec: number): "tokyo" | "london" | "newyork" | "off" {
+/** Session name from UTC hour — tokyo 0-7, london 7-13, the London–NY
+ *  OVERLAP 13-16 (v16.8: the user audit — the overlap is the highest-quality
+ *  tape of the day and was silently labeled "newyork"), newyork 16-21. */
+export function sessionOf(tsSec: number): "tokyo" | "london" | "overlap" | "newyork" | "off" {
   const h = new Date(tsSec * 1000).getUTCHours();
   if (h < 7) return "tokyo";
   if (h < 13) return "london";
-  if (h < 20) return "newyork";
+  if (h < 16) return "overlap";
+  if (h < 21) return "newyork";
   return "off";
 }

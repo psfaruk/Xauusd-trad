@@ -150,12 +150,17 @@ const BULL_ZONES = ["demand", "ob_bull", "fvg_bull"];
 const BEAR_ZONES = ["supply", "ob_bear", "fvg_bear"];
 
 /**
- * Zone retest — REAL rejections only (P5):
+ * Zone retest — REAL rejections only (P5 + v16.8 audit hardening):
  *  · zone exists & fresh as-of the trigger bar (mitT null or == trigger t)
  *  · height ≤ 1.25 ATR (wide zones are noise magnets)
- *  · last 3 bars PENETRATED ≥ 25% of the zone height (not an edge kiss)
- *  · trigger bar closed back out of the zone (mild in-zone close allowed
- *    at higher quality) with a rejection wick or directional body
+ *  · last 3 bars PENETRATED ≥ 40% of the zone height (was 25% — an edge
+ *    kiss is not a test; v16.8)
+ *  · LIQUIDITY SWEEP first: the test's wick took out the prior 20-bar
+ *    low (bull) / high (bear) — a real ICT retest grabs stops before it
+ *    turns; a touch without a sweep is just noise visiting the zone
+ *  · MSS confirmation to fire: close back OUT of the zone (structure
+ *    shift through the proximal edge), or an in-zone close only with a
+ *    displacement body ≥ 0.6 ATR behind it
  *  · far edge not pierced (a close through the zone is a break, not a test)
  * Bias-side zones try first (P1); counter-bias zones need quality ≥ 0.62.
  */
@@ -164,12 +169,22 @@ export function detectZoneRetest(
   biasDir: "BUY" | "SELL" | "NEUTRAL" = "NEUTRAL",
 ): TriggerResult | null {
   if (!zones.length || a <= 0) return null;
+  if (bars.length < 26) return null;
   const b = bars[bars.length - 1];
   const nowT = b.t;
   const win = bars.slice(-3);
+  const prior = bars.slice(-23, -3); // the 20 bars before the test window
+  const priorLo = prior.length ? Math.min(...prior.map((x) => x.l)) : Infinity;
+  const priorHi = prior.length ? Math.max(...prior.map((x) => x.h)) : -Infinity;
 
   const trySide = (bull: boolean): TriggerResult | null => {
     const sides = bull ? BULL_ZONES : BEAR_ZONES;
+    // v16.8: the sweep gate — the test window must take out the prior
+    // 20-bar extreme on the zone's side (stops grabbed → real rejection)
+    const swept = bull
+      ? Math.min(...win.map((w) => w.l)) < priorLo
+      : Math.max(...win.map((w) => w.h)) > priorHi;
+    if (!swept) return null;
     const candidates = zones
       .filter((z) => sides.includes(z.side))
       // exists + not broken as-of now
@@ -185,11 +200,11 @@ export function detectZoneRetest(
     for (const z of [...candidates].sort((x, y) => Math.abs(dist(x)) - Math.abs(dist(y)))) {
       const zh = z.hi - z.lo;
       if (zh <= 0) continue;
-      // penetration: last 3 bars entered the zone by ≥ 25% of its height
+      // penetration: last 3 bars entered the zone by ≥ 40% of its height
       const depth = bull
         ? z.hi - Math.min(...win.map((w) => w.l))
         : Math.max(...win.map((w) => w.h)) - z.lo;
-      if (depth < 0.25 * zh) continue;
+      if (depth < 0.4 * zh) continue;
       const range = b.h - b.l;
       if (range <= 0) continue;
       const bodyPos = (b.c - b.l) / range;
@@ -198,7 +213,9 @@ export function detectZoneRetest(
       const mid = (z.hi + z.lo) / 2;
       const strongReject = bull ? b.c > z.hi : b.c < z.lo;
       const mildReject = bull ? b.c > mid : b.c < mid;
-      if (!strongReject && !mildReject) continue;
+      // v16.8 MSS: an in-zone close only counts with displacement behind it
+      const displaced = Math.abs(b.c - b.o) >= 0.6 * a;
+      if (!strongReject && !(mildReject && displaced)) continue;
       // far-edge pierce = zone failed, not a retest
       const pierced = bull ? b.l < z.lo - 0.05 * a : b.h > z.hi + 0.05 * a;
       if (pierced) continue;
@@ -212,6 +229,7 @@ export function detectZoneRetest(
       const tightQ = 1 - 0.5 * Math.min(1, zh / (1.25 * a));
       let quality = 0.42 * freshness + 0.28 * wickQ + 0.15 * penQ + 0.15 * tightQ;
       if (strongReject) quality += 0.06; // full close back out of the zone
+      if (displaced && !strongReject) quality += 0.04; // displacement MSS
       quality = Math.max(0.1, Math.min(1, quality));
       const withBias = biasDir === (bull ? "BUY" : "SELL");
       const minQ = withBias ? 0.5 : 0.62;
@@ -220,7 +238,7 @@ export function detectZoneRetest(
         kind: "zone",
         dir: bull ? "BUY" : "SELL",
         quality,
-        note: `${z.side} ${z.lo.toFixed(2)}–${z.hi.toFixed(2)} first retest ${strongReject ? "rejected" : "holding"}`,
+        note: `${z.side} sweep-retest ${z.lo.toFixed(2)}–${z.hi.toFixed(2)} ${strongReject ? "rejected (MSS)" : "holding + displacement"}`,
         zone: { ...z, quality },
       };
     }
@@ -260,12 +278,18 @@ export function detectPullback(
 
 // ═══════════════════════ geometry (setup-true SL/TP) ═══════════════════════
 
-const SL_PAD_ATR = 0.25;
+/** v16.8 (user audit): 0.25 → 0.5 ATR — market makers sweep 3–10 pips
+ *  PAST zone lows before reversing; a 0.25-ATR pad planted the stop
+ *  exactly in their sweep path. 0.5 ATR + half the live spread clears the
+ *  wick-and-spread noise on XAUUSD instead of donating to it. */
+const SL_PAD_ATR = 0.5;
 const LIQ_PROTECT_ATR = 0.12;
 const TP_MIN_RR = 0.8;
 const TP_FLOOR_RR = 1.0;
 const MAX_RISK_ATR = 1.8;
-const MIN_RISK_ATR = 0.28;
+/** v16.8: a stop closer than half an ATR is wick-food by construction —
+ *  the old 0.28 floor let "risk too small vs spread" be the only guard. */
+const MIN_RISK_ATR = 0.5;
 /** v16.7 — the PRICE-ANCHORED ENTRY CONTRACT (user spec):
  *  "প্রাইস যেই কারেন্ট প্রাইসে আছে, সেই প্রাইস লেভেল থেকে কনফার্মেশন
  *  অনুযায়ী এন্ট্রি বসাতে হবে" — an entry the trader can actually take from
@@ -301,11 +325,14 @@ export function setupGeometry(
   pools: LiquidityPool[],
   zones: Zone[],
   tf = "M15",
+  /** v16.8: live spread (price units) — the SL pads clear it by design */
+  spread = 0,
 ): Geometry | null {
   const bull = trig.dir === "BUY";
   const asOfT = bars[bars.length - 1].t;
   const price = bars[bars.length - 1].c;
   const scalp = tf === "M1" || tf === "M5";
+  const pad = SL_PAD_ATR * a + 0.5 * spread; // structure pad + spread allowance
   let entry: number;
   let sl: number;
 
@@ -316,22 +343,20 @@ export function setupGeometry(
     // price (EQ inside the zone, proximal edge outside) — then clamp: if
     // even the closest candidate is farther than MAX_ENTRY_DIST_ATR, the
     // trigger bar's rejection close IS the confirmation and entry = price.
-    // (The old `entry = z.hi / z.lo` blind edge-limit produced entries the
-    // market would never come back to touch — the user's core complaint.)
     const edge = bull ? z.hi : z.lo;
     const mid = (z.lo + z.hi) / 2;
     const cand = inside ? mid : edge; // EQ inside · proximal edge outside
     entry = Math.abs(cand - price) <= MAX_ENTRY_DIST_ATR * a ? cand : price;
-    sl = bull ? z.lo - SL_PAD_ATR * a : z.hi + SL_PAD_ATR * a;
+    sl = bull ? z.lo - pad : z.hi + pad;
   } else if (trig.kind === "sfp" && trig.sweepExtreme != null) {
     entry = price;
-    sl = bull ? trig.sweepExtreme - 0.2 * a : trig.sweepExtreme + 0.2 * a;
+    sl = bull ? trig.sweepExtreme - pad : trig.sweepExtreme + pad;
   } else {
     const win = bars.slice(-3);
     const microLo = Math.min(...win.map((b) => b.l));
     const microHi = Math.max(...win.map((b) => b.h));
     entry = price;
-    sl = bull ? microLo - 0.2 * a : microHi + 0.2 * a;
+    sl = bull ? microLo - pad : microHi + pad;
   }
 
   // liquidity protection: extend past the deepest same-side pool within 1.6 ATR
@@ -433,7 +458,7 @@ export function softChecks(
   if (rsiWin) factors.push("rsi_aligned");
 
   const sess = sessionOf(b.t);
-  const sessOk = sess === "london" || sess === "newyork";
+  const sessOk = sess === "london" || sess === "newyork" || sess === "overlap"; // v16.8: the London–NY overlap is PRIME tape
   checks.push({ name: "Prime session", ok: sessOk, value: sess });
   if (sessOk) factors.push("prime_session");
 
@@ -582,6 +607,16 @@ export function evaluate(input: EngineInput): {
   checks.push({ name: "Trigger", ok: !!best, value: best ? `${best.kind} ${best.dir} q=${best.quality.toFixed(2)}` : "none" });
   if (!best) nearMiss.push("no trigger (sweep / zone-retest / pullback)");
 
+  // ── v16.8 HARD COUNTER-TREND FILTER (user audit) ──
+  // The old code only shaved −0.05 confidence off a signal fighting the
+  // H1/H4 multi-source bias — those were the "এন্ট্রি নিলেই SL" trades: an
+  // M5 bullish wick inside a hard H4 downtrend is liquidity, not a reversal.
+  // Now: NO signal against a non-neutral bias, period. NEUTRAL bias (range
+  // regime) keeps both directions live.
+  if (best && biasDir !== "NEUTRAL" && biasDir !== best.dir) {
+    nearMiss.push(`counter-trend blocked (bias ${biasDir} vs ${best.dir})`);
+  }
+
   // ── HARD GATES ──
   if (a < MIN_ATR_PCT * price) {
     nearMiss.push(`ATR ${a.toFixed(2)} below sanity floor`);
@@ -621,7 +656,7 @@ export function evaluate(input: EngineInput): {
     });
 
     // ── geometry ──
-    const geo = setupGeometry(best, base, a, pools, zones, tf);
+    const geo = setupGeometry(best, base, a, pools, zones, tf, input.spread);
     if (!geo) {
       nearMiss.push("geometry rejected (risk too wide vs ATR)");
     } else {
@@ -637,7 +672,8 @@ export function evaluate(input: EngineInput): {
           let confidence = 0.45 + 0.5 * soft.passRatio;
           if (soft.factors.length >= 5) confidence += 0.05;
           if (best.quality >= 0.7) confidence += 0.03;
-          if (biasDir !== "NEUTRAL" && biasDir !== best.dir) confidence -= 0.05;
+          // (v16.8: the old −0.05 counter-trend penalty is gone — the hard
+          // filter above already blocks those signals outright)
           confidence = Math.max(0.4, Math.min(0.95, confidence));
 
           const entryType: "market" | "limit" =

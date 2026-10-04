@@ -1781,7 +1781,9 @@ function RuleRow({
   const { t } = useI18n();
   return (
     <div className={cn(
-      "flex items-center gap-2 rounded-lg border p-2 transition-colors",
+      // v16.8: flex-wrap — on ≤390px phones the LOT/MAX groups now fold to a
+      // second line instead of overflowing the viewport (mobile audit)
+      "flex flex-wrap items-center gap-x-2 gap-y-1.5 rounded-lg border p-2 transition-colors",
       rule.enabled ? "border-gold/25 bg-gold/[0.04]" : "border-border bg-card/40",
     )}>
       <Switch
@@ -1791,7 +1793,7 @@ function RuleRow({
         className="scale-90"
         aria-label={`${rule.symbol} enabled`}
       />
-      <span className="min-w-0 flex-1 truncate font-mono text-[11px] font-bold">{rule.symbol}</span>
+      <span className="min-w-[72px] flex-1 truncate font-mono text-[11px] font-bold">{rule.symbol}</span>
       <label className="flex items-center gap-1" aria-label="lot size" title={t("traderLotsHint")}>
         <span className="text-[8px] font-semibold uppercase text-muted-foreground">{t("traderLots")}</span>
         <Input

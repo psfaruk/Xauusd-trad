@@ -1536,14 +1536,25 @@ export class AiTrader {
     lo3: number; hi3: number;
   } | null {
     if (!bars || bars.length < 10) return null;
-    // ATR(14)
+    // ATR(14) — v16.8 (user audit): WILDER smoothing (α = 1/n), identical to
+    // lib/market/indicators.atr and every chart ATR. The old simple mean of
+    // the last 14 TRs ran hotter than Wilder right after vol spikes and
+    // silently disagreed with the whole stack (trader-sized SL ≠ chart SL).
     const trs: number[] = [];
     for (let i = 1; i < bars.length; i++) {
       const b = bars[i], p = bars[i - 1];
       trs.push(Math.max(b.h - b.l, Math.abs(b.h - p.c), Math.abs(b.l - p.c)));
     }
-    const use = trs.slice(-14);
-    const atr = use.reduce((a, b) => a + b, 0) / use.length;
+    let atr: number;
+    if (trs.length >= 14) {
+      let prev = 0;
+      for (let i = 0; i < 14; i++) prev += trs[i];
+      prev /= 14;
+      for (let i = 14; i < trs.length; i++) prev = (prev * 13 + trs[i]) / 14;
+      atr = prev;
+    } else {
+      atr = trs.reduce((a, b) => a + b, 0) / Math.max(1, trs.length);
+    }
     // EMA(20) of closes
     const closes = bars.map((b) => b.c);
     const k = 2 / (20 + 1);
@@ -1558,6 +1569,22 @@ export class AiTrader {
       lo3: Math.min(...last3.map((b) => b.l)),
       hi3: Math.max(...last3.map((b) => b.h)),
     };
+  }
+
+  /** v16.8: Wilder ATR(14) over a candle array (null when too short) —
+   *  the M15 volatility basis for SL sizing. */
+  private wilderAtrOf(bars: { t: number; o: number; h: number; l: number; c: number; v: number }[]): number | null {
+    if (!bars || bars.length < 15) return null;
+    const trs: number[] = [];
+    for (let i = 1; i < bars.length; i++) {
+      const b = bars[i], p = bars[i - 1];
+      trs.push(Math.max(b.h - b.l, Math.abs(b.h - p.c), Math.abs(b.l - p.c)));
+    }
+    let prev = 0;
+    for (let i = 0; i < 14; i++) prev += trs[i];
+    prev /= 14;
+    for (let i = 14; i < trs.length; i++) prev = (prev * 13 + trs[i]) / 14;
+    return prev > 0 ? prev : null;
   }
 
   // ── MTF CONSENSUS (v6) — the user's multi-timeframe read: 1m/2m/3m must
@@ -1791,11 +1818,18 @@ export class AiTrader {
       const tDecide0 = Date.now();
 
       // ONE M1 fetch feeds everything: ATR/EMA snapshot + judge tape + SL
-      // structure + the 2m/3m/5m/10m/15m MTF aggregates (140 bars ≈ 2.3h)
+      // structure + the 2m/3m/5m/10m/15m MTF aggregates (140 bars ≈ 2.3h).
+      // v16.8 (user audit): plus ONE M15 fetch — SL sizing is now based on
+      // the M15 ATR. An M1-ATR stop on gold ($0.7–1.5) is wick-food: a
+      // normal 15-second fluctuation is $1–2.5, so every entry died inside
+      // the first minute. M15 volatility is the honest floor for gold.
       let m1bars: { t: number; o: number; h: number; l: number; c: number; v: number }[] = [];
       try { m1bars = await this.host.getCandles(rule.symbol, "M1", 140); } catch { continue; }
       const snap = this.snapshotFrom(m1bars);
       if (!snap || snap.atr <= 0) continue;
+      let m15bars: { t: number; o: number; h: number; l: number; c: number; v: number }[] = [];
+      try { m15bars = await this.host.getCandles(rule.symbol, "M15", 60); } catch { /* sizing falls back below */ }
+      const m15atr = this.wilderAtrOf(m15bars) ?? snap.atr * Math.sqrt(15);
 
       // CONFLUENCE (soft signals — the judge weighs them, one stays hard):
       const trendOk = snap.trendUp === null ? true : (side === "buy" ? snap.trendUp : !snap.trendUp);
@@ -1996,21 +2030,32 @@ export class AiTrader {
 
       // ── spread budget: SL wide enough that the spread is a small fraction,
       //    so gold / indices / oil (wide spreads) trade just like FX ──
-      let slDist = snap.atr * slAtrMult;
+      // v16.8 (user audit) — THREE fixes in one block:
+      //   1. VOLATILITY FLOOR moves to the M15 ATR (gold: ≥ 1.2×M15 ATR and
+      //      never under $3.50 / 35 pips — the user's own measured minimum;
+      //      cap breathes with volatility instead of a flat $6.00)
+      //   2. STRUCTURE SL is measured MID-to-MID: the old `ask − lo3` quietly
+      //      ate the whole spread (ask is always above mid), planting the
+      //      stop half-a-spread closer than intended — now + 0.5×spread is
+      //      explicit, and structure may only WIDEN the stop, never tighten
+      //      it below the volatility floor (the old [0.7×, 1.6×] band could
+      //      CHOKE it)
+      //   3. the M1 × slAtrMult stop is retired for gold; non-gold keeps the
+      //      classic sizing on top of an M15 floor
+      const isGold = /XAU|GOLD/i.test(rule.symbol);
+      const entry = side === "buy" ? q.ask : q.bid; // order fills on THIS side
+      let slDist = isGold
+        ? Math.max(1.2 * m15atr, 3.5)
+        : Math.max(snap.atr * slAtrMult, m15atr * 0.8);
 
-      // ── STRUCTURE SL: park the stop beyond the last 3 candles' battle
-      //    ground (the extreme + a quarter-ATR noise buffer) — not a blind
-      //    ATR ring. Used when it sits within [0.7×, 1.6×] the ATR distance,
-      //    so structure neither chokes nor blows up the risk unit. ──
-      const entry = side === "buy" ? q.ask : q.bid;
+      const mid = (q.ask + q.bid) / 2;
       const structExt = side === "buy" ? snap.lo3 : snap.hi3;
-      const structDist = Math.abs(entry - structExt) + snap.atr * 0.25;
-      if (structDist >= slDist * 0.7 && structDist <= slDist * 1.6) {
-        slDist = structDist;
-      }
+      const structDist = Math.abs(mid - structExt) + snap.atr * 0.5 + spread * 0.5;
+      if (structDist > slDist) slDist = structDist;
 
       if (slDist < spread * SPREAD_BUDGET) slDist = spread * SPREAD_BUDGET;
-      if (slDist > snap.atr * SL_ATR_CAP) slDist = snap.atr * SL_ATR_CAP;
+      const slCap = isGold ? Math.max(6.0, 1.5 * m15atr) : snap.atr * SL_ATR_CAP;
+      if (slDist > slCap) slDist = slCap;
       if (spread > slDist * 0.45) {
         // truly illiquid moment (spread wider than 45% of even the widened SL)
         this.journalLog({
@@ -2333,9 +2378,13 @@ export class AiTrader {
       // 1) flow flipped HARD against us and we're under water → cut (the
       //    human "feel"). v6: the bar is high (a moderate counter-flow must
       //    NOT scare the brain out at a tiny loss — the user's complaint:
-      //    “অল্প লসেই ক্লোজ করে দেয়”) and only LOSING trades are cut this way.
+      //    “অল্প লসেই ক্লোজ করে দেয়”). v16.8 (user audit): the bar is now a
+      //    WALL — a very hard counter-flow (≥ 0.85 strength) AND already
+      //    ≥ 0.45R under water. A trade must BREATHE: spread alone opens
+      //    positions at −0.2R and the old 0.62–0.72 flipStrength finished
+      //    them before the thesis had a chance.
       const losingNow = this.cfg.tpUsd > 0 ? p.pnl < 0 : p.pnlR < 0;
-      if (fp && flowAgainst && fp.sig.strength >= prof.flipStrength && losingNow) {
+      if (fp && flowAgainst && fp.sig.strength >= Math.max(prof.flipStrength, 0.85) && losingNow && p.pnlR <= -0.45) {
         await this.closeManaged(p, `flow flipped ${(p.side === "buy" ? "sell" : "buy").toUpperCase()} @${(fp.sig.strength * 100) | 0}%`, "FLIP");
         continue;
       }
@@ -2422,8 +2471,12 @@ export class AiTrader {
         }
       }
 
-      // 6) adverse cut — flow against + losing more than maxAdverseR → don't wait for the hard SL
-      if (p.pnlR <= -prof.maxAdverseR && flowAgainst) {
+      // 6) adverse cut — v16.8 (user audit): NEVER before the hard SL any
+      //    more. The old maxAdverseR 0.55–0.7 + flowAgainst closed trades
+      //    at −0.55R while the broker SL sat at −1R — the user saw "এন্ট্রি
+      //    নিলেই SL হিট" when it was really this kill-switch. Now it can
+      //    only fire at/inside the stop distance itself (≥ 1R underwater).
+      if (p.pnlR <= -Math.max(prof.maxAdverseR, 1.0) && flowAgainst) {
         await this.closeManaged(p, `adverse cut R ${p.pnlR.toFixed(2)} + flow against`, "ADVERSE");
         continue;
       }

@@ -296,6 +296,10 @@ export type AutoDrawing =
       /** v16.5: the zone's origin bar had a ≥1.5σ tick-volume spike — an
        * institutional footprint; the label carries an INST tag */
       institutional?: boolean;
+      /** v16.8: mitigation time (first overlap) — a FADED zone's rect stops
+       *  at this candle instead of stretching to the right edge (user audit:
+       *  mitigated zones painted over the live price area forever) */
+      mitT?: number;
     }
   | {
       kind: "channel"; dir: "up" | "down"; label?: string; tone?: Tone;

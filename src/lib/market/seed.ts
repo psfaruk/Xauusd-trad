@@ -125,18 +125,22 @@ export function seedSignals(input: SeedInput): SeedResult {
     // trigger-aware cooldown (matches live)
     if (lastEntryT !== -Infinity && barsSince < (COOLDOWN_BARS[trig.kind] ?? COOLDOWN_BARS_DEFAULT)) continue;
 
-    const geo = setupGeometry(trig, win, a, pools, zones, tf);
+    // v16.8 HARD COUNTER-TREND FILTER (parity with the live engine): no
+    // signal against a non-neutral bias — the −0.05-confidence era is over
+    if (biasDir !== "NEUTRAL" && biasDir !== trig.dir) continue;
+
+    const geo = setupGeometry(trig, win, a, pools, zones, tf, spread);
     if (!geo) continue;
 
     const risk = Math.abs(geo.entry - geo.sl) || 1e-9;
-    if (risk < Math.max(0.28 * a, 4 * spread)) continue;
+    if (risk < Math.max(0.5 * a, 4 * spread)) continue;
     if (spread > 0.35 * risk) continue;
 
     const sess = sessionOf(bar.t);
     const stTrend = detectStructure(win).trend;
     const passRatio =
       (trig.quality >= 0.5 ? 1 : 0) +
-      (sess === "london" || sess === "newyork" ? 1 : 0) +
+      (sess === "london" || sess === "newyork" || sess === "overlap" ? 1 : 0) +
       (spread > 0 && spread / price < 0.00015 ? 1 : 0) +
       (stTrend === (trig.dir === "BUY" ? "bullish" : "bearish") ? 1 : 0);
     let confidence = 0.45 + 0.5 * (passRatio / 4);

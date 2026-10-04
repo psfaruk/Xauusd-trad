@@ -557,24 +557,43 @@ export class FlowTracker {
     }
 
     // ── engaged: check for collapse (hysteresis) ──
+    // v16.8 (user audit) DELTA-GATED EXIT: entry required a one-sided tape
+    // (deltaExtreme); exit now respects it too — a momentary raw dip while
+    // the decisive delta is still clearly on the trade's side must NOT kill
+    // the lamp (the old exit fired on raw alone and cost the trader full
+    // moves that immediately resumed). A FULL flip (raw past −entryRaw) or
+    // a genuinely faded tape still disengages.
     const side = this.sigState;
+    const deltaFavors = side === "buy"
+      ? this.deltaEma >= T.deltaExtreme * 0.5
+      : this.deltaEma <= -T.deltaExtreme * 0.5;
     if (side === "buy") {
-      if (raw <= T.exitRaw) this.weakAboveSince ||= tsMs;
+      const hardFlip = raw <= -T.entryRaw;
+      if (raw <= T.exitRaw && (hardFlip || !deltaFavors)) this.weakAboveSince ||= tsMs;
       else this.weakAboveSince = 0;
     } else {
-      if (raw >= -T.exitRaw) this.weakBelowSince ||= tsMs;
+      const hardFlip = raw >= T.entryRaw;
+      if (raw >= -T.exitRaw && (hardFlip || !deltaFavors)) this.weakBelowSince ||= tsMs;
       else this.weakBelowSince = 0;
     }
     const weakSince = side === "buy" ? this.weakAboveSince : this.weakBelowSince;
     const collapsed = weakSince !== 0 && tsMs - weakSince >= T.persistExitMs;
     const heldLong = tsMs - this.sigSinceMs >= minHold;
 
-    // stop: adverse move beyond half the candle range (book the loss honestly)
+    // stop: adverse move beyond 40% of the RECENT CANDLE ATR (v16.8 user
+    // audit) — the old "half the running candle's range" unit had nothing
+    // to do with entry distance: an entry near the candle's 75% level got
+    // adverse-stopped by a move that was still INSIDE the candle's normal
+    // range. ATR-like = mean range of the last 14 completed candles.
     const range = this.h - this.l;
+    const lastN = this.prev.slice(-14);
+    const atrLike = lastN.length
+      ? lastN.reduce((s, x) => s + (x.r || range), 0) / lastN.length
+      : range;
     let adverseStop = false;
-    if (range > 1e-12 && this.sigEntryPrice > 0) {
+    if (atrLike > 1e-12 && this.sigEntryPrice > 0) {
       const adverse = side === "buy" ? this.sigEntryPrice - this.c : this.c - this.sigEntryPrice;
-      if (adverse > range * 0.5 && tsMs - this.sigSinceMs >= 3000) adverseStop = true;
+      if (adverse > atrLike * 0.4 && tsMs - this.sigSinceMs >= 3000) adverseStop = true;
     }
 
     if ((collapsed && heldLong) || adverseStop) this.disengage(tsMs);

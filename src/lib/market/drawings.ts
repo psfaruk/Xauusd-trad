@@ -106,19 +106,27 @@ export function buildDrawings(
       // v16.4 (audit §2.6/§6): zones carry their TRUE source timeframe —
       // HTF groups are labeled H1/H4, local zones get the active tf.
       // v16.5: a ≥1.5σ volume-spiked origin ⇒ INST (institutional) tag.
+      // v16.8: non-FVG zones carry their mitigation time so the renderer
+      // can STOP a faded zone at the mitigation candle instead of dragging
+      // it to the right edge (FVGs stay until filled — CE is still live).
       source_tf: src,
       institutional: inst(z.t),
       state: z.mitT ? "faded" : "active",
+      mitT: z.side.startsWith("fvg") ? undefined : z.mitT,
     });
   }
 
-  // 4. trendlines from last two swings (projected; broken → faded).
-  //    v16.6: the break test is against the PROJECTED line value at the
-  //    last bar (the ref engine's rule) — on a descending supply line the
-  //    projection sits BELOW the older swing high, so a close through the
-  //    *line* (not the swing max) is the honest "market left the trendline"
-  //    read. This is why the drawn line looks like the market follows it.
-  const sw = swings(win, 2, 2);
+  // 4. trendlines from the last two MAJOR swings (projected; broken →
+  //    faded). v16.8 (user audit) — three validations the old code lacked:
+  //      a) MAJOR anchors only (5/5 fractals — 2-bar swings made the lines
+  //         jump every few bars)
+  //      b) SLOPE: a supply (resistance) line must be flat-to-falling, a
+  //         demand (support) line flat-to-rising — two rising highs used to
+  //         project a line straight into the sky
+  //      c) INTEGRITY: no candle between the anchors may cross the line —
+  //         a trendline the market already traded through is a memory,
+  //         not a level
+  const sw = swings(win, 5, 5);
   const highs = sw.filter((s) => s.kind === "high");
   const lows = sw.filter((s) => s.kind === "low");
   const projAt = (p1: { t: number; price: number }, p2: { t: number; price: number }, atT: number) => {
@@ -126,25 +134,44 @@ export function buildDrawings(
     if (dt <= 0) return p2.price;
     return p2.price + ((p2.price - p1.price) / dt) * (atT - p2.t);
   };
+  /** candles strictly between two anchors must stay on the line's market side */
+  const noCut = (a1: { t: number; price: number }, a2: { t: number; price: number }, resistance: boolean): boolean => {
+    for (const b of win) {
+      if (b.t <= a1.t || b.t >= a2.t) continue;
+      const line = projAt(a1, a2, b.t);
+      if (resistance ? b.h > line + 0.02 * a : b.l < line - 0.02 * a) return false;
+    }
+    return true;
+  };
   if (highs.length >= 2) {
     const [s1, s2] = highs.slice(-2);
-    const projNow = projAt(s1, s2, lastBar.t);
-    const broken = lastBar.c > projNow + 0.25 * a;
-    out.push({
-      kind: "trendline",
-      t1: s1.t, p1: s1.price, t2: s2.t, p2: s2.price,
-      tone: "bear", broken, state: broken ? "faded" : "active", source_tf: tf,
-    });
+    // resistance: flat-to-falling highs, anchors ≥ 8 bars apart, uncut
+    const slopeOk = s2.price <= s1.price + 0.02 * a;
+    const spaced = s2.index - s1.index >= 8;
+    if (slopeOk && spaced && noCut(s1, s2, true)) {
+      const projNow = projAt(s1, s2, lastBar.t);
+      const broken = lastBar.c > projNow + 0.25 * a;
+      out.push({
+        kind: "trendline",
+        t1: s1.t, p1: s1.price, t2: s2.t, p2: s2.price,
+        tone: "bear", broken, state: broken ? "faded" : "active", source_tf: tf,
+      });
+    }
   }
   if (lows.length >= 2) {
     const [s1, s2] = lows.slice(-2);
-    const projNow = projAt(s1, s2, lastBar.t);
-    const broken = lastBar.c < projNow - 0.25 * a;
-    out.push({
-      kind: "trendline",
-      t1: s1.t, p1: s1.price, t2: s2.t, p2: s2.price,
-      tone: "bull", broken, state: broken ? "faded" : "active", source_tf: tf,
-    });
+    // support: flat-to-rising lows, anchors ≥ 8 bars apart, uncut
+    const slopeOk = s2.price >= s1.price - 0.02 * a;
+    const spaced = s2.index - s1.index >= 8;
+    if (slopeOk && spaced && noCut(s1, s2, false)) {
+      const projNow = projAt(s1, s2, lastBar.t);
+      const broken = lastBar.c < projNow - 0.25 * a;
+      out.push({
+        kind: "trendline",
+        t1: s1.t, p1: s1.price, t2: s2.t, p2: s2.price,
+        tone: "bull", broken, state: broken ? "faded" : "active", source_tf: tf,
+      });
+    }
   }
 
   // 4b. v16.6 — the channel (ref _channel): upper + lower parallels + the
@@ -154,11 +181,19 @@ export function buildDrawings(
   const channel = detectChannel(bars);
   if (channel) out.push({ ...channel, source_tf: tf });
 
-  // 5. fib of the current leg with OTE
-  const legFrom = pd.legDir === "up" ? pd.lo : pd.hi;
-  const legTo = pd.legDir === "up" ? pd.hi : pd.lo;
-  const fibT0 = win.find((b) => (pd.legDir === "up" ? b.l === legFrom : b.h === legTo))?.t ?? win[0].t;
-  const fibT1 = win.find((b) => (pd.legDir === "up" ? b.h === legTo : b.l === legFrom))?.t ?? lastBar.t;
+  // 5. fib of the current leg with OTE — v16.8 RETRACEMENT ANCHORS
+  //    (user audit): the fib is measured BACK down the leg — an UP leg
+  //    anchors 0 at the HIGH and 1 at the LOW, so the 0.618–0.786 golden
+  //    pocket lands in the DISCOUNT (2638–2621 on a 2600→2700 leg) where
+  //    longs are taken; a DOWN leg anchors 0 at the LOW so the pocket sits
+  //    in the PREMIUM for shorts. The old formula put the pocket on the
+  //    wrong side of equilibrium — every OTE box drawn in no-man's land.
+  const legHi = Math.max(pd.lo, pd.hi);
+  const legLo = Math.min(pd.lo, pd.hi);
+  const legFrom = pd.legDir === "up" ? legHi : legLo; // 0-anchor (retracement start)
+  const legTo = pd.legDir === "up" ? legLo : legHi;   // 1-anchor (retracement end)
+  const fibT0 = win.find((b) => (pd.legDir === "up" ? b.h === legFrom : b.l === legFrom))?.t ?? win[0].t;
+  const fibT1 = win.find((b) => (pd.legDir === "up" ? b.l === legTo : b.h === legTo))?.t ?? lastBar.t;
   const levels = [0, 0.236, 0.382, 0.5, 0.618, 0.786, 1].map((r) => ({
     ratio: r,
     price: legFrom + (legTo - legFrom) * r,
@@ -175,8 +210,22 @@ export function buildDrawings(
     out.push({ kind: "structure", t: ev.t, price: ev.price, dir: ev.dir, label: ev.label, fromT: ev.fromT, source_tf: tf });
   }
 
-  // 6b. market-structure zigzag — the swing map, connected
-  const swPath = sw.slice(-9);
+  // 6b. market-structure zigzag — the swing map, connected.
+  //    v16.8: HIGH/LOW ALTERNATION enforced — consecutive same-kind swings
+  //    collapse to the more extreme one (the raw fractal stream can emit
+  //    two highs in a row; connecting them drew a kinked non-structure path).
+  const swPathRaw = sw.slice(-14);
+  const swAlt: typeof swPathRaw = [];
+  for (const s of swPathRaw) {
+    const prev = swAlt[swAlt.length - 1];
+    if (prev && prev.kind === s.kind) {
+      const moreExtreme = s.kind === "high" ? s.price >= prev.price : s.price <= prev.price;
+      if (moreExtreme) swAlt[swAlt.length - 1] = s;
+      continue;
+    }
+    swAlt.push(s);
+  }
+  const swPath = swAlt.slice(-9);
   if (swPath.length >= 2) {
     out.push({
       kind: "zigzag",
