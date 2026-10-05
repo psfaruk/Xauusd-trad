@@ -173,7 +173,12 @@ async function trackOpenSignals(symbol: string): Promise<void> {
         }
       }
 
-      if (status === s.status) {
+      // v16.10 (user report): the expiry timer is a PENDING-SETUP contract —
+      // "no fill within the setup's window". An ACTIVE (filled/holding) signal
+      // must live until TP or SL is actually consumed on a close; the old
+      // blanket 45min timer used to expire positions mid-flight, which made
+      // the on-chart setup box vanish seconds/minutes after appearing.
+      if (status === s.status && s.status === "pending") {
         const lastT = closed[closed.length - 1].t;
         if (lastT - s.barTime > expiryBarsFor(tf) * (tfSec[tf] ?? 900)) {
           status = "expired";

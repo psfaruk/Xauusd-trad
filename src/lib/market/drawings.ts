@@ -144,33 +144,56 @@ export function buildDrawings(
     }
     return true;
   };
-  if (highs.length >= 2) {
-    const [s1, s2] = highs.slice(-2);
-    // resistance: flat-to-falling highs, anchors ≥ 8 bars apart, uncut
-    const slopeOk = s2.price <= s1.price + 0.02 * a;
-    const spaced = s2.index - s1.index >= 8;
-    if (slopeOk && spaced && noCut(s1, s2, true)) {
+  // v16.10 (user report — "trendline সঠিক নিয়মে আঁকা হচ্ছে না"): the old code
+  // took ONLY the last two major swings — when the freshest pair failed any
+  // validation (slope/spac­ing/integrity) the whole line VANISHED until some
+  // later pair happened to qualify, so the chart flickered between having
+  // and not having a trendline. Now we WALK BACK through the swing history:
+  // the freshest pair that passes the rules wins; if it is already broken we
+  // keep looking for a live one and fall back to the newest broken pair as a
+  // ghost. The line stays on screen instead of blinking, and it always obeys
+  // the textbook rules (major 5/5 anchors, flat-to-falling resistance /
+  // flat-to-rising support, uncut between anchors).
+  const pickTrendPair = (
+    arr: { t: number; index: number; price: number }[],
+    resistance: boolean,
+  ): { s1: { t: number; index: number; price: number }; s2: { t: number; index: number; price: number }; broken: boolean } | null => {
+    let live: { s1: any; s2: any; broken: boolean } | null = null;
+    let ghost: { s1: any; s2: any; broken: boolean } | null = null;
+    for (let i = arr.length - 1; i >= 1; i--) {
+      const s1 = arr[i - 1];
+      const s2 = arr[i];
+      const slopeOk = resistance
+        ? s2.price <= s1.price + 0.02 * a
+        : s2.price >= s1.price - 0.02 * a;
+      const spaced = s2.index - s1.index >= 8;
+      if (!(slopeOk && spaced && noCut(s1, s2, resistance))) continue;
       const projNow = projAt(s1, s2, lastBar.t);
-      const broken = lastBar.c > projNow + 0.25 * a;
+      const broken = resistance
+        ? lastBar.c > projNow + 0.25 * a
+        : lastBar.c < projNow - 0.25 * a;
+      if (!broken) { live = { s1, s2, broken }; break; }
+      if (!ghost) ghost = { s1, s2, broken };
+    }
+    return live ?? ghost;
+  };
+  if (highs.length >= 2) {
+    const pick = pickTrendPair(highs, true);
+    if (pick) {
       out.push({
         kind: "trendline",
-        t1: s1.t, p1: s1.price, t2: s2.t, p2: s2.price,
-        tone: "bear", broken, state: broken ? "faded" : "active", source_tf: tf,
+        t1: pick.s1.t, p1: pick.s1.price, t2: pick.s2.t, p2: pick.s2.price,
+        tone: "bear", broken: pick.broken, state: pick.broken ? "faded" : "active", source_tf: tf,
       });
     }
   }
   if (lows.length >= 2) {
-    const [s1, s2] = lows.slice(-2);
-    // support: flat-to-rising lows, anchors ≥ 8 bars apart, uncut
-    const slopeOk = s2.price >= s1.price - 0.02 * a;
-    const spaced = s2.index - s1.index >= 8;
-    if (slopeOk && spaced && noCut(s1, s2, false)) {
-      const projNow = projAt(s1, s2, lastBar.t);
-      const broken = lastBar.c < projNow - 0.25 * a;
+    const pick = pickTrendPair(lows, false);
+    if (pick) {
       out.push({
         kind: "trendline",
-        t1: s1.t, p1: s1.price, t2: s2.t, p2: s2.price,
-        tone: "bull", broken, state: broken ? "faded" : "active", source_tf: tf,
+        t1: pick.s1.t, p1: pick.s1.price, t2: pick.s2.t, p2: pick.s2.price,
+        tone: "bull", broken: pick.broken, state: pick.broken ? "faded" : "active", source_tf: tf,
       });
     }
   }

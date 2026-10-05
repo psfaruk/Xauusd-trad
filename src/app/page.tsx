@@ -13,7 +13,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "@/hooks/use-toast";
 import TerminalShell from "@/components/terminal/TerminalShell";
 import { useTerminal } from "@/hooks/useTerminal";
-import { useBars, useFeedAnalysisResync } from "@/hooks/useFeed";
+import { useBars, useQuote, useFeedAnalysisResync } from "@/hooks/useFeed";
 import type { AnalysisResponse, UserDrawing } from "@/lib/market/types";
 
 async function fetchAnalysis(symbol: string, tf: string): Promise<AnalysisResponse> {
@@ -38,13 +38,31 @@ export default function Home() {
   useFeedAnalysisResync();
 
   // live analysis (engine + roadmap + auto-drawings + signal history)
+  // v16.10 (user report — drawings not updating in real time): 15s → 12s
+  // poll, PLUS a tick-driven invalidation below — the SMC ink used to wait
+  // for the next bar close or the full 15s poll before following the market.
   const analysisQ = useQuery({
     queryKey: ["analysis", symbol, timeframe],
     queryFn: () => fetchAnalysis(symbol, timeframe),
-    refetchInterval: 15_000,
+    refetchInterval: 12_000,
     retry: 2,
     staleTime: 6_000,
   });
+
+  // v16.10: every live tick (bid move) re-feeds the engine at most every 6s
+  // (throttled) so roadmap targets, magnets and the forecast MAP track the
+  // market between bar closes. The route's 8s same-key TTL cache keeps this
+  // cheap — identical bar-close keys return the cached payload.
+  const quote = useQuote(symbol);
+  const lastTickRef = useRef(0);
+  const bid = quote?.bid;
+  useEffect(() => {
+    if (bid == null) return;
+    const now = Date.now();
+    if (now - lastTickRef.current < 6_000) return;
+    lastTickRef.current = now;
+    void qc.invalidateQueries({ queryKey: ["analysis", symbol, timeframe] });
+  }, [bid, qc, symbol, timeframe]);
 
   // ── real-time per-timeframe analysis: every time a bar of the ACTIVE
   // symbol+tf closes (a new bar opens), refetch the engine immediately so

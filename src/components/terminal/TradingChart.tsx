@@ -1082,17 +1082,20 @@ export default function TradingChart(props: Props) {
               const ageMin = d.createdAt
                 ? Math.max(0, Math.round((Date.now() - new Date(d.createdAt).getTime()) / 60000))
                 : null;
-              // expiry countdown: bars this setup has left to resolve
               const barsSinceSetup = d.t0 ? Math.max(0, Math.floor((bs[bs.length - 1].t - d.t0) / tf)) : 0;
-              // v16.9 (audit A6): per-TF expiry — 45min of market time
-              // (M1=30 bars, M5=9, M15/H4=3), never the flat 30-bar window
-              // that lived 5 days on H4.
+              // v16.10 (user report): an ACTIVE signal holds until TP/SL is
+              // consumed on a close — the expiry countdown is a PENDING-only
+              // contract. Showing "expires in N bars" on a holding position
+              // made the box look like it was about to vanish.
               const barsLeft = Math.max(0, expiryBarsFor(d.tf ?? timeframe) - barsSinceSetup);
+              const holding = d.status === "active";
               const meta = [
                 d.entryType === "limit" ? "limit order" : "market entry",
                 ageMin !== null ? `${ageMin}m ago` : null,
                 d.trigger ? d.trigger.toUpperCase() : null,
-                `${t("expires")} ${barsLeft} ${t("bars")}`,
+                holding
+                  ? "holding · stays until TP/SL close"
+                  : `${t("expires")} ${barsLeft} ${t("bars")}`,
               ].filter(Boolean).join(" · ");
               hardText(ctx, meta, headX, headY + 26, "rgba(164,172,182,0.85)", 8.5, "left", 500);
             }
@@ -1312,8 +1315,19 @@ export default function TradingChart(props: Props) {
             const headP = d.points[d.points.length - 1];
             const xH = headP ? xOfTime(headP.t) : null;
             const xAnchor = Math.min(xH ?? rightEdge - 84, rightEdge - 84) + 8;
+            // v16.10 (user report — ENTRY confusion): the trade-plan ink
+            // (ENTRY ring/line, SL, TARGET) is the CONFIRMED pattern's
+            // contract ONLY. A FORMING pattern drew its own full-width
+            // ENTRY/SL/TARGET set — up to 3 patterns + the hero setup = 4
+            // competing "entries" on one chart. Forming now shows geometry
+            // (name pill, numbered pivots, shading) — its plan arrives when
+            // the market confirms the trigger.
+            const confirmed = d.state === "confirmed";
+            // plan lines START at the pattern's birth, never x=0 full width
+            const firstPx = d.points[0] ? xOfTime(d.points[0].t) : null;
+            const planX0 = clamp(firstPx ?? xAnchor, 2, rightEdge - 10);
             // 4. ENTRY — gold ring at the trigger + dashed level line + tag
-            const yE = yOfPrice(d.entry.price);
+            const yE = confirmed ? yOfPrice(d.entry.price) : null;
             if (yE !== null && yE > -5 && yE < h + 5) {
               const xE0 = d.entry.t != null ? xOfTime(d.entry.t) : xH;
               hardSeg(ctx, Math.max(0, xE0 ?? 0), Math.round(yE) + 0.5, rightEdge, Math.round(yE) + 0.5,
@@ -1331,25 +1345,25 @@ export default function TradingChart(props: Props) {
                 pillLabel(ctx, `ENTRY ${d.entry.price.toFixed(digits)}`, xAnchor, d.dir === "up" ? yE + 11 : yE - 4, gold.text, gold.line(0.5), "left", 8);
               }
             }
-            // 5. STOP-LOSS — thin red dashed line + tag
-            const yS = yOfPrice(d.sl);
+            // 5. STOP-LOSS — thin red dashed line + tag (confirmed only)
+            const yS = confirmed ? yOfPrice(d.sl) : null;
             if (yS !== null && yS > -5 && yS < h + 5) {
-              hardSeg(ctx, 0, Math.round(yS) + 0.5, rightEdge, Math.round(yS) + 0.5,
+              hardSeg(ctx, planX0, Math.round(yS) + 0.5, rightEdge, Math.round(yS) + 0.5,
                 "rgba(248,113,113,0.72)", "rgba(248,113,113,0.05)", 0.55, [2.5, 3.5]);
               if (tryLabel(xAnchor, yS + 12, `SL ${d.sl.toFixed(digits)}`, 8, "left")) {
                 pillLabel(ctx, `SL ${d.sl.toFixed(digits)}`, xAnchor, yS + 12, "rgba(252,165,165,0.95)", "rgba(248,113,113,0.5)", "left", 8);
               }
             }
-            // 6. TARGET — whisper gold band + dashed line + tag (measured move)
-            const yT1 = yOfPrice(d.target_zone.lo);
-            const yT2 = yOfPrice(d.target_zone.hi);
+            // 6. TARGET — whisper gold band + dashed line + tag (confirmed only)
+            const yT1 = confirmed ? yOfPrice(d.target_zone.lo) : null;
+            const yT2 = confirmed ? yOfPrice(d.target_zone.hi) : null;
             if (yT1 !== null && yT2 !== null && Math.abs(yT2 - yT1) > 0.5) {
               ctx.fillStyle = "rgba(212,175,55,0.05)";
               ctx.fillRect(rightEdge - 64, Math.min(yT1, yT2), 64, Math.abs(yT2 - yT1));
             }
-            const yT = yOfPrice(d.target);
+            const yT = confirmed ? yOfPrice(d.target) : null;
             if (yT !== null && yT > -5 && yT < h + 5) {
-              hardSeg(ctx, 0, Math.round(yT) + 0.5, rightEdge, Math.round(yT) + 0.5,
+              hardSeg(ctx, planX0, Math.round(yT) + 0.5, rightEdge, Math.round(yT) + 0.5,
                 gold.line(0.6), "transparent", 0.55, [2, 3]);
               const rrTxt = d.rr != null ? ` · RR ${d.rr.toFixed(1)}` : "";
               if (tryLabel(rightEdge - 4, yT - 8, `TARGET ${d.target.toFixed(digits)}${rrTxt}`, 8, "right")) {
