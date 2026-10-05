@@ -1,0 +1,138 @@
+# ════════════════════════════════════════════════════════════════════
+# AURUM Terminal — docker-compose: SPLIT deployment (audit §2.3)
+#
+# PRODUCTION (Railway) DOES NOT USE THIS FILE: the single-container
+# supervisor (start-railway.sh: mt5-service + Next.js + Caddy in one
+# image, restart-all-on-failure) stays the deployed path. This compose
+# file is the split-mode ALTERNATIVE for self-hosting — mt5-service
+# runs as its own service with its own volume/restart policy, and the
+# Next app runs separately against it.
+#
+# ── WHY THE APP SHARES THE MT5 NETWORK NAMESPACE ─────────────────────
+# The mt5-service deliberately binds 127.0.0.1 ONLY (v12 audit:
+# "listen() → 0.0.0.0" finding — the gateway is the single public
+# door). A naive two-container compose CANNOT talk to it: from the app
+# container, http://mt5:3031 hits nothing, because the service is not
+# listening on the compose network. Instead the app joins the mt5
+# container's network namespace (network_mode: "service:mt5") — then
+# 127.0.0.1:3030/3031 resolve exactly like the single-container layout
+# and the loopback-only security model is preserved. Trade-off: if the
+# mt5 container restarts, the app briefly loses networking too;
+# restart: unless-stopped brings both back.
+#
+# ── SECRETS ──────────────────────────────────────────────────────────
+# APP_PASSWORD must be IDENTICAL in both services (it derives the
+# session-cookie HMAC and the trader API key on both sides). It is
+# required:  APP_PASSWORD='…' docker compose up -d
+# (or put APP_PASSWORD in a .env next to this file).
+#
+# ── BROWSER FEED (socket.io) ─────────────────────────────────────────
+# The UI's live tick socket connects same-origin with
+# ?XTransformPort=3030 and expects a gateway to route that to
+# :3030 (that's Caddy's job on Railway). REST works out of the box
+# (same-origin /api/mt5/* proxy). For the full live feed, uncomment
+# the optional `gateway` service at the bottom — it reuses the image's
+# caddy + the repo Caddyfile.railway on the same shared netns.
+# ════════════════════════════════════════════════════════════════════
+
+services:
+  # ── mt5-service: market-data + trading sidecar (:3030 io, :3031 REST) ──
+  mt5:
+    build: .
+    image: aurum-terminal
+    working_dir: /app/mini-services/mt5-service
+    command: ["bun", "index.ts"]
+    environment:
+      NODE_ENV: production
+      APP_PASSWORD: ${APP_PASSWORD:?set APP_PASSWORD before running compose (locks both auth doors)}
+      # optional explicit trader key (defaults to being derived from APP_PASSWORD)
+      TRADER_API_KEY: ${TRADER_API_KEY:-}
+      # optional broker credentials (v13+: the in-app Settings → MT5
+      # Account form is the preferred path — stored AES-encrypted in the
+      # mt5-data volume, auto-reconnects on restart)
+      MT5_LOGIN: ${MT5_LOGIN:-}
+      MT5_PASSWORD: ${MT5_PASSWORD:-}
+      MT5_SERVER: ${MT5_SERVER:-}
+    volumes:
+      # trader journal / tick caches / encrypted MT5 credentials
+      - mt5-data:/app/mini-services/mt5-service/data
+    ports:
+      # host-LOOPBACK only — nothing is exposed on other interfaces.
+      # (All three are published here because this service owns the
+      # shared network namespace the app joins — see header.)
+      - "127.0.0.1:3000:3000" # the Next.js app UI (app service, same netns)
+      - "127.0.0.1:3030:3030" # mt5 socket.io — live tick feed
+      - "127.0.0.1:3031:3031" # mt5 REST — ops/debug (app talks over the shared netns)
+    healthcheck:
+      # /health is the service's open local endpoint (used by start-railway.sh too)
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:3031/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    restart: unless-stopped
+
+  # ── Next.js app: UI + analysis engine + SQLite (:3000) ──
+  app:
+    build: .
+    image: aurum-terminal
+    working_dir: /app
+    # the standalone Next server (same invocation start-railway.sh uses)
+    command: ["bun", "server.js"]
+    # see header — required because mt5-service binds loopback only
+    network_mode: "service:mt5"
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      # bind loopback inside the shared netns (matches start-railway.sh)
+      HOSTNAME: 127.0.0.1
+      # ?connection_limit=1 — same writer-serialization hardening as the
+      # repo .env (audit P3.1); WAL/busy_timeout PRAGMAs are armed at
+      # boot by instrumentation.ts → lib/db.ts
+      DATABASE_URL: file:/app/db/custom.db?connection_limit=1
+      MT5_SERVICE_URL: http://127.0.0.1:3031
+      # split mode: the sidecar is its own container — NEVER spawn a
+      # child mt5-service from the app process
+      MT5_SKIP_SPAWN: "1"
+      APP_PASSWORD: ${APP_PASSWORD:?set APP_PASSWORD before running compose (locks both auth doors)}
+      TRADER_API_KEY: ${TRADER_API_KEY:-}
+      # display-only (setup-status shows which account is wired up);
+      # the actual broker password belongs to the mt5 service only
+      MT5_LOGIN: ${MT5_LOGIN:-}
+      MT5_SERVER: ${MT5_SERVER:-}
+    volumes:
+      # named volume over /app/db: initialized from the image's pristine
+      # seeded custom.db on first use, then persists all signal/drawing
+      # data across restarts
+      - app-db:/app/db
+    depends_on:
+      mt5:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── OPTIONAL gateway for the live socket feed ──────────────────────
+  # Uncomment to get the full browser tick stream: caddy (already in the
+  # image) routes /?XTransformPort=3030 → 127.0.0.1:3030 and everything
+  # else → 127.0.0.1:3000, exactly like the Railway single container.
+  # It must join the same shared netns, so ALSO add
+  #   - "127.0.0.1:8080:8080"
+  # to the mt5 service's ports list above, then browse
+  # http://127.0.0.1:8080 (keep the :{$PORT} semantics of
+  # Caddyfile.railway by setting PORT below).
+  #
+  # gateway:
+  #   build: .
+  #   image: aurum-terminal
+  #   working_dir: /app
+  #   command: ["caddy", "run", "--config", "/app/Caddyfile.railway", "--adapter", "caddyfile"]
+  #   network_mode: "service:mt5"
+  #   environment:
+  #     PORT: "8080"
+  #   depends_on:
+  #     mt5:
+  #       condition: service_healthy
+  #   restart: unless-stopped
+
+volumes:
+  mt5-data:
+  app-db:

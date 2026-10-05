@@ -6,16 +6,20 @@
  *  · step 1 (was 2 — odd bars were invisible to the backtest but fire live)
  *  · zones/pools filtered AS-OF each bar (fresh · alive · not-run), so the
  *    walk-forward sees the same universe the live engine saw — no lookahead
- *  · trigger-aware cooldown + the shared 30-bar expiry (matches live tracking)
+ *  · trigger-aware cooldown + the shared 45-min/time-capped expiry (v16.9,
+ *    matches live tracking via expiryBarsFor)
  *  · per-bar bias (EMA50 of the window) drives the zone side preference
  *    exactly like the live engine
+ *  · v16.9 §5.1 parity: counter-trend signals pass the SAME qualified gate
+ *    as the live engine (counterTrendGate) — backtest and live can never
+ *    disagree about what a counter-trend signal is
  */
 
 import type { Candle, SignalPayload } from "./types";
-import { atr, ema, sessionOf, volZ } from "./indicators";
-import { detectOrderBlocks, detectFvg, detectLiquidity, detectSupplyDemand, detectStructure, type LiquidityPool, type Zone } from "./smc";
+import { atr, ema, rsi, sessionOf, volZ } from "./indicators";
+import { detectOrderBlocks, detectFvg, detectLiquidity, detectSupplyDemand, detectStructure, premiumDiscount, type LiquidityPool, type Zone } from "./smc";
 import {
-  COOLDOWN_BARS, COOLDOWN_BARS_DEFAULT, SIGNAL_EXPIRY_BARS,
+  COOLDOWN_BARS, COOLDOWN_BARS_DEFAULT, atrSmooth, counterTrendGate, expiryBarsFor,
   detectPullback, detectSfp, detectZoneRetest, setupGeometry, type TriggerResult,
 } from "./engine";
 
@@ -97,7 +101,10 @@ export function seedSignals(input: SeedInput): SeedResult {
     if (win.length < 60) continue;
 
     const a = (atrAll[i] as number) || 0;
-    const aPrev = (atrAll[i - 1] as number) || a; // SFP threshold ATR (P4)
+    const aPrev = (atrAll[i - 1] as number) || a; // legacy pre-trigger ATR
+    // v16.9 §5.7 parity: SFP threshold uses the SMOOTHED ATR (trigger bar
+    // excluded) — same atrSmooth the live engine uses
+    const aSfp = atrSmooth(atrAll.slice(Math.max(0, i - 12), i)) || aPrev;
     const e21 = ema21All[i] as number;
     const e21Prev = (ema21All[i - 5] as number) ?? e21; // pullback slope (P3)
     const price = bar.c;
@@ -117,17 +124,28 @@ export function seedSignals(input: SeedInput): SeedResult {
 
     // trigger suite (direction-bearing)
     const vz = volZ(win);
-    let trig: TriggerResult | null = detectSfp(win, aPrev, vz);
+    let trig: TriggerResult | null = detectSfp(win, aSfp, vz);
     if (!trig) trig = detectZoneRetest(win, a, price, zones, biasDir);
-    if (!trig) trig = detectPullback(win, e21, e21Prev, a);
+    if (!trig) trig = detectPullback(win, e21, e21Prev, a, tf);
     if (!trig) continue;
 
     // trigger-aware cooldown (matches live)
     if (lastEntryT !== -Infinity && barsSince < (COOLDOWN_BARS[trig.kind] ?? COOLDOWN_BARS_DEFAULT)) continue;
 
-    // v16.8 HARD COUNTER-TREND FILTER (parity with the live engine): no
-    // signal against a non-neutral bias — the −0.05-confidence era is over
-    if (biasDir !== "NEUTRAL" && biasDir !== trig.dir) continue;
+    const stWin = detectStructure(win);
+
+    // v16.9 §5.1 parity: the SAME qualified gate as the live engine —
+    // quality ≥ 0.62 + CHoCH / RSI-divergence / OTE-side / fresh-sweep
+    // evidence (the v16.8 blanket continue is gone: it made the backtest
+    // blind to every real reversal the live engine now takes)
+    if (biasDir !== "NEUTRAL" && biasDir !== trig.dir) {
+      const pdWin = premiumDiscount(win, 60, price);
+      const rsiWin = rsi(win, 14);
+      const verdict = counterTrendGate(trig, biasDir, {
+        bars: win, tf, rsiArr: rsiWin, structure: stWin, pools, pd: pdWin,
+      });
+      if (!verdict.allowed) continue;
+    }
 
     const geo = setupGeometry(trig, win, a, pools, zones, tf, spread);
     if (!geo) continue;
@@ -137,7 +155,7 @@ export function seedSignals(input: SeedInput): SeedResult {
     if (spread > 0.35 * risk) continue;
 
     const sess = sessionOf(bar.t);
-    const stTrend = detectStructure(win).trend;
+    const stTrend = stWin.trend;
     const passRatio =
       (trig.quality >= 0.5 ? 1 : 0) +
       (sess === "london" || sess === "newyork" || sess === "overlap" ? 1 : 0) +
@@ -158,6 +176,7 @@ export function seedSignals(input: SeedInput): SeedResult {
       entry: rnd(geo.entry, digits),
       sl: rnd(geo.sl, digits),
       tp: rnd(geo.tp, digits),
+      tp2: rnd(geo.tp2, digits),
       rr: rnd(geo.rr, 2),
       confidence: rnd(confidence, 3),
       status: entryType === "limit" ? "pending" : "active",
@@ -174,21 +193,23 @@ export function seedSignals(input: SeedInput): SeedResult {
     lastTrigKind = trig.kind;
   }
 
-  resolveSeeded(out, bars, tfSec);
+  resolveSeeded(out, bars, tfSec, tf);
   return { signals: out, scanned: n };
 }
 
 /**
  * Resolve seeded signals against the REAL bars that followed
- * (pessimistic: a bar spanning SL and TP counts as a loss). The newest
+ * (pessimistic: a bar spanning SL and TP counts as a loss — the honest
+ * backtest rule; live tracking resolves on closes, §5.9). The newest
  * unresolved signal stays LIVE so the chart opens with a setup (D-074).
  */
-function resolveSeeded(seeds: SignalPayload[], bars: Candle[], tfSec: number) {
+function resolveSeeded(seeds: SignalPayload[], bars: Candle[], tfSec: number, tf: string) {
   const n = bars.length;
+  const expiryBars = expiryBarsFor(tf);
   for (const s of seeds) {
     const startIdx = bars.findIndex((b) => b.t === s.barTime);
     if (startIdx === -1) continue;
-    const end = Math.min(n - 1, startIdx + SIGNAL_EXPIRY_BARS);
+    const end = Math.min(n - 1, startIdx + expiryBars);
     let outcome: "won" | "lost" | "expired" | null = null;
     let resultR = 0;
     // pending limit → filled when price traded through the entry level
@@ -242,7 +263,7 @@ function resolveSeeded(seeds: SignalPayload[], bars: Candle[], tfSec: number) {
     // only resurrect if it never actually resolved within its window
     const startIdx = bars.findIndex((b) => b.t === liveCandidate.barTime);
     const resolvedIn = bars
-      .slice(startIdx + 1, Math.min(n, startIdx + SIGNAL_EXPIRY_BARS + 1))
+      .slice(startIdx + 1, Math.min(n, startIdx + expiryBars + 1))
       .some((b) =>
         liveCandidate.direction === "BUY"
           ? (b.h >= liveCandidate.tp || b.l <= liveCandidate.sl)

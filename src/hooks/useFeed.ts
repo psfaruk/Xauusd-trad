@@ -12,6 +12,7 @@
  */
 
 import { useCallback, useEffect, useRef, useSyncExternalStore } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { io, type Socket } from "socket.io-client";
 import type { Candle, FeedStatus, FlowPayload, SymbolQuote, TraderState } from "@/lib/market/types";
 
@@ -68,6 +69,12 @@ class FeedStore {
   private tickSnapshots = new Map<string, TickPoint[]>();
   private tickSubs = new Map<string, Set<() => void>>();
   private tickBackfilled = new Set<string>();
+
+  /** v16.9 (audit §3.3): true once the socket has dropped — the NEXT
+   *  "connect" is a REAL reconnect (data may have been missed while the
+   *  line was down), not the initial boot. */
+  private hadDisconnect = false;
+  private reconnectSubs = new Set<() => void>();
 
   // ── AI trader state ──
   private traderState: TraderState | null = null;
@@ -129,6 +136,14 @@ class FeedStore {
       }
       if (this.traderLive) socket.emit("tradersub");
       armSymbolHeal(); // v16.3: resurrect the 30s heal on every reconnect
+      // v16.9 (audit §3.3): on a REAL reconnect (a connect that follows a
+      // disconnect) the app may have missed ticks, bar closes and engine
+      // signals while the line was down — notify reconnect listeners
+      // (useFeedAnalysisResync refetches the analysis queries).
+      if (this.hadDisconnect) {
+        this.hadDisconnect = false;
+        this.reconnectSubs.forEach((fn) => fn());
+      }
     });
 
     socket.on("status", (s: FeedStatus) => {
@@ -145,6 +160,14 @@ class FeedStore {
       this.rebuildSymbols();
     });
     socket.on("tick", (t: { symbol: string; bid: number; ask: number; mid: number; ts: number }) => {
+      const prev = this.ticks.get(t.symbol);
+      // v16.9 (audit §3.3) client-side MONOTONIC guard: a tick stamped OLDER
+      // than the stored quote (reconnect replay, out-of-order delivery) must
+      // never move the market backwards — discard it whole (ring included, a
+      // late old price would glitch the focus chart too). Equal stamps pass:
+      // same-second updates are normal, and a missing server stamp (older
+      // service build) compares as NaN → passes.
+      if (prev && t.ts < prev.ts) return;
       // tick history ring (focus area chart) — every symbol, always
       let ring = this.tickHist.get(t.symbol);
       if (!ring) { ring = []; this.tickHist.set(t.symbol, ring); }
@@ -155,7 +178,6 @@ class FeedStore {
       if (snap && snap !== ring) { snap.push(tp); ringTrim(snap); }
       this.tickSubs.get(t.symbol)?.forEach((fn) => fn());
 
-      const prev = this.ticks.get(t.symbol);
       const base = this.basePrice.get(t.symbol) ?? prev?.mid ?? t.mid;
       this.ticks.set(t.symbol, {
         name: t.symbol,
@@ -223,8 +245,16 @@ class FeedStore {
     // throttled flush → watchlist/header updates at 4 Hz
     this.flushTimer = setInterval(() => this.rebuildSymbols(), 250);
     socket.on("disconnect", () => {
+      this.hadDisconnect = true; // v16.3 heal cleanup + v16.9 reconnect flag
       if (symTimer) { clearInterval(symTimer); symTimer = null; }
     });
+  }
+
+  /** v16.9 (audit §3.3): subscribe to REAL reconnects (a "connect" that
+   *  follows a "disconnect" — not the initial boot). Returns unsubscribe. */
+  onReconnect(fn: () => void): () => void {
+    this.reconnectSubs.add(fn);
+    return () => { this.reconnectSubs.delete(fn); };
   }
 
   private rebuildSymbols() {
@@ -524,6 +554,22 @@ export function useFeedBoot() {
   useEffect(() => {
     feed.connect();
   }, []);
+}
+
+/** v16.9 (audit §3.3): refetch analysis after a REAL socket reconnect — while
+ *  the line was down the app may have missed bar closes and engine signals;
+ *  the 15s poll would eventually catch up, but the chart must not sit on a
+ *  stale read when the feed is live again. The ["analysis"] PREFIX key covers
+ *  every ["analysis", symbol, tf] query registered in page.tsx. Must be used
+ *  under the QueryClientProvider (providers.tsx) — page.tsx calls it. */
+export function useFeedAnalysisResync() {
+  const queryClient = useQueryClient();
+  useEffect(
+    () => feed.onReconnect(() => {
+      queryClient.invalidateQueries({ queryKey: ["analysis"] });
+    }),
+    [queryClient],
+  );
 }
 
 /** One-shot REST status pull — used after MT5 connect/disconnect actions so

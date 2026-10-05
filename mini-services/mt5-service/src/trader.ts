@@ -48,6 +48,12 @@ export interface TraderConfig {
   enabled: boolean;          // master switch (user-managed)
   riskMode: RiskMode;
   dailyLossLimitPct: number; // halt new entries when day loss exceeds this
+  /** v16.9 (audit E2) — OPT-IN risk-% position sizing. 0 (DEFAULT) = legacy
+   *  fixed lots per symbol rule, NO behavior change; > 0 = size every entry
+   *  from the LIVE balance (risk ≈ this % of the account at the SL), clamped
+   *  to [0, MAX_RISK_PCT] percent (2 decimals). Falls back to the fixed lots
+   *  whenever balance/contract metadata is missing — never a wrong size. */
+  riskPct: number;
   /** fixed-dollar take profit — bank the whole trade at +$X (v6 user rule;
    *  0 = classic R-multiple mode). Default 0.50. */
   tpUsd: number;
@@ -205,6 +211,12 @@ export interface TraderHistoryEntry {
 export interface TraderState {
   enabled: boolean;
   riskMode: RiskMode;
+  /** v16.9 (audit E2): risk-% position sizing — 0 = legacy fixed lots
+   *  (default, no silent behavior change); > 0 sizes every entry from the
+   *  live balance: lots = (balance × riskPct%) / (SL distance × $-per-
+   *  price-unit-per-lot), rounded DOWN to the lot step, clamped to
+   *  [minLot, MAX_LOT]. Mirrors the optional field in the app's types.ts. */
+  riskPct: number;
   tpUsd: number;             // active fixed-dollar profit target (0 = R-mode)
   beUsd: number;             // v9: breakeven trigger $ (0 = auto: 60% of tpUsd / breakevenR)
   beLockUsd: number;         // v9: $ locked above entry when BE fires
@@ -326,6 +338,8 @@ const MAX_LOT = 1.0;              // 1.00 lots on gold ≈ $100/point — plenty
 const MAX_POSITIONS_PER_SYMBOL = 5;
 const MAX_DAILY_TRADES_CAP = 100;
 const MIN_TP_USD = 3;             // $-mode TP below this is inside spread noise (0.01-lot gold ≈ $3–5)
+const MAX_RISK_PCT = 2;           // audit E2 cap: risk-% sizing may never exceed 2% of balance
+                                   // per entry (0 = OFF — legacy fixed lots; no silent behavior change)
 
 const DEFAULT_SYMBOLS: SymbolRule[] = [
   // v12 SAFE DEFAULTS (the audit's step-by-step): ONE symbol, ONE position,
@@ -525,6 +539,7 @@ export class AiTrader {
     this.cfg = {
       enabled: false, // user must consciously arm it
       riskMode: "conservative", // v12: was "balanced" — safe default after the R:R audit
+      riskPct: 0,    // audit E2: DEFAULT 0 = legacy fixed lots — opt-in only, no silent change
       tpUsd: 0,       // v12: R-MULTIPLE mode by default (was $0.50 — structurally −EV:
                        // TP ≈ spread×2 vs ATR-sized SL ⇒ R:R ≈ 1:6). $-mode is still
                        // available but must be ≥ $3 (MIN_TP_USD).
@@ -564,6 +579,11 @@ export class AiTrader {
           symbols: Array.isArray(raw.config.symbols) && raw.config.symbols.length
             ? raw.config.symbols : this.cfg.symbols,
         };
+        // v16.9 (audit E2): sanitize riskPct from persisted/legacy states —
+        // pre-v16.9 files have no riskPct (undefined), and anything that snuck
+        // in out of range is clamped to [0, MAX_RISK_PCT]. Default stays 0
+        // (legacy fixed lots) so loading an old state changes NOTHING.
+        this.cfg.riskPct = Math.max(0, Math.min(MAX_RISK_PCT, Math.round((Number(this.cfg.riskPct) || 0) * 100) / 100));
       }
       if (Array.isArray(raw?.journal)) {
         this.journal = raw.journal.slice(-JOURNAL_MAX);
@@ -923,6 +943,7 @@ export class AiTrader {
     return {
       enabled: this.cfg.enabled,
       riskMode: this.cfg.riskMode,
+      riskPct: this.cfg.riskPct,
       tpUsd: this.cfg.tpUsd,
       beUsd: this.cfg.beUsd,
       beLockUsd: this.cfg.beLockUsd,
@@ -998,6 +1019,17 @@ export class AiTrader {
       this.journalLog({ action: "info", symbol: "", reason: patch.enabled ? "auto-trading ARMED" : "auto-trading DISARMED" });
     }
     if (patch.riskMode && RISK[patch.riskMode]) this.cfg.riskMode = patch.riskMode;
+    // v16.9 (audit E2) — OPT-IN risk-% position sizing, validated exactly like
+    // tpUsd/maxDailyTrades above (v14-style range validation): clamp to
+    // [0, MAX_RISK_PCT] percent with 2 decimals. 0 = legacy fixed lots — the
+    // DEFAULT, so nothing changes until the user explicitly opts in.
+    if (typeof patch.riskPct === "number") {
+      this.cfg.riskPct = Math.max(0, Math.min(MAX_RISK_PCT, Math.round(patch.riskPct * 100) / 100));
+      this.think(this.cfg.riskPct > 0
+        ? `⚖️ রিস্ক-সাইজিং ${this.cfg.riskPct}% — প্রতি এন্ট্রিতে ব্যালেন্সের ${this.cfg.riskPct}% রিস্ক করে লট হিসাব হবে (SL দূরত্ব অনুযায়ী, লট-স্টেপে রাউন্ড-ডাউন)`
+        : "⚖️ রিস্ক-% সাইজিং বন্ধ — প্রতি সিম্বলের ফিক্সড লটে ফিরে গেলাম", "info");
+      this.journalLog({ action: "info", symbol: "", reason: `risk sizing set to ${this.cfg.riskPct}% of balance per entry (0 = fixed lots)` });
+    }
     if (typeof patch.tpUsd === "number") {
       const want = Math.max(0, Math.min(50, Math.round(patch.tpUsd * 100) / 100));
       // v12 R:R-audit rule: $-mode TP must clear the spread-noise floor.
@@ -2066,15 +2098,47 @@ export class AiTrader {
       }
 
       const sl = side === "buy" ? entry - slDist : entry + slDist;
+
+      // ══ v16.9 (audit E2) — RISK-% POSITION SIZING · OPT-IN, DEFAULT OFF ══
+      // riskPct > 0 → size the entry from the LIVE balance so the SL costs
+      // ≈ riskPct% of the account: lots = riskUsd / (slDist × cm), where cm
+      // is the broker-deal-calibrated $-per-price-unit-per-lot (cmOf — the
+      // same multiplier every P/L computation already uses; XAUUSD = 100/lot).
+      // Round DOWN to the 0.01 lot step (never round UP into more risk),
+      // clamp to [broker-min 0.01, MAX_LOT]. riskPct = 0 (the DEFAULT) keeps
+      // the legacy fixed rule.lots EXACTLY — no silent behavior change. Any
+      // missing input (no balance / no multiplier / degenerate SL) falls
+      // back to the fixed lots: never trade a wrong size on a math hiccup.
+      const cm = this.cmOf(rule.symbol, entry);
+      let lots = rule.lots;
+      let sizingNote = "";
+      if (this.cfg.riskPct > 0) {
+        const bal = this.acct?.balance ?? 0;
+        if (bal > 0 && cm > 0 && slDist > 0) {
+          const riskUsd = (bal * this.cfg.riskPct) / 100;
+          const rawLots = riskUsd / (slDist * cm);
+          const sized = Math.max(0.01, Math.min(MAX_LOT, Math.floor(rawLots * 100) / 100));
+          lots = sized;
+          sizingNote = rawLots < 0.01
+            ? ` · lots ${sized.toFixed(2)} (${this.cfg.riskPct}% রিস্ক-বাজেট $${riskUsd.toFixed(2)} < 0.01-লট মিনিটাম — মিনিটাম লটে ঢুকছি)`
+            : ` · lots ${sized.toFixed(2)} (${this.cfg.riskPct}% রিস্ক, SL ${slDist.toFixed(1)} দূরে)`;
+        } else {
+          // metadata missing/unreliable → legacy fixed lots, said out loud
+          sizingNote = ` · রিস্ক-% সাইজিং স্কিপ (ব্যালেন্স/কন্ট্রাক্ট-ডেটা নেই) — ফিক্সড ${lots} লট`;
+          this.journalLog({
+            action: "info", symbol: rule.symbol,
+            reason: `risk-% sizing fell back to fixed lots (balance ${bal.toFixed(2)}, cm ${cm.toFixed(2)}, slDist ${slDist.toFixed(2)}) — audit E2`,
+          });
+        }
+      }
       // ── TP (v6): the user's fixed-dollar rule — BANK THE PROFIT at +$tpUsd
       //    (default $0.50). The broker-side TP is parked at that price (never
       //    inside the spread); the monitor()'s tick-side close is the exact
       //    primary (bid/ask correct side). tpUsd = 0 → classic R-multiple. ──
       let tp: number;
       if (this.cfg.tpUsd > 0) {
-        const cm = this.cmOf(rule.symbol, entry);
         const tickSize = Math.pow(10, -digits);
-        const tpDist = Math.max(this.cfg.tpUsd / (rule.lots * cm), spread * 1.25 + tickSize * 2);
+        const tpDist = Math.max(this.cfg.tpUsd / (lots * cm), spread * 1.25 + tickSize * 2);
         tp = side === "buy" ? entry + tpDist : entry - tpDist;
       } else {
         tp = side === "buy" ? entry + slDist * tpR : entry - slDist * tpR;
@@ -2087,6 +2151,7 @@ export class AiTrader {
         ` · trend${trendOk ? "✓" : "✗"} · mom${momWith >= 0 ? "+" : ""}${(momWith * 100) | 0}%` +
         ` · SL@structure${Math.abs(structDist - slDist) < 1e-9 ? "✓" : "~"}` +
         ` · ${prio ? "★prio" : `edge×${edge.adaptiveMin.toFixed(2)}`} · spread ${((spread / slDist) * 100) | 0}%` +
+        sizingNote +
         (aiNote ? ` · ${aiNote.slice(0, 60)}` : "");
 
       // serialize trade ops — and a brain that was stopped mid-thought
@@ -2096,16 +2161,17 @@ export class AiTrader {
       // positive, ≥ broker min 0.01, and an exact 0.01-step multiple. The
       // config clamps should have made this impossible; this guard makes
       // it CERTAIN (a legacy persisted rule can't 10014 at the broker).
-      const stepSnapped = Math.round(rule.lots * 100) / 100;
-      if (!(rule.lots > 0) || rule.lots < 0.01 || stepSnapped !== rule.lots) {
+      // v16.9: checks the FINAL volume (risk-% sized or legacy fixed).
+      const stepSnapped = Math.round(lots * 100) / 100;
+      if (!(lots > 0) || lots < 0.01 || stepSnapped !== lots) {
         this.journalLog({
           action: "skip", symbol: rule.symbol,
-          reason: `invalid lots ${rule.lots} (min 0.01, step 0.01) — rejected before broker call`,
+          reason: `invalid lots ${lots} (min 0.01, step 0.01) — rejected before broker call`,
         });
         this.lastEntryAt.set(rule.symbol, Date.now());
         continue;
       }
-      const res = await this.host.marketOrderAt(rule.symbol, side, rule.lots, entry, {
+      const res = await this.host.marketOrderAt(rule.symbol, side, lots, entry, {
         sl: Number(sl.toFixed(digits + 1)),
         tp: Number(tp.toFixed(digits + 1)),
         digits, comment: "ai-brain",
@@ -2113,7 +2179,7 @@ export class AiTrader {
       if (gen !== this.generation && res.retcode === 10009) {
         // order landed but this instance is dead — make sure the next brain
         // adopts it cleanly (it stays tracked via broker sync)
-        this.journalLog({ action: "open", symbol: rule.symbol, side, price: res.price, lots: rule.lots, reason: `handoff: ${reason}` });
+        this.journalLog({ action: "open", symbol: rule.symbol, side, price: res.price, lots, reason: `handoff: ${reason}` });
       }
 
       if (res.retcode === 10009) {
@@ -2124,8 +2190,8 @@ export class AiTrader {
         this.execN++;
         this.execAvgMs = Math.round(this.execAvgMs + 0.25 * (execMs - this.execAvgMs));
         const pos: TraderPosition = {
-          ticket: res.order, symbol: rule.symbol, side, lots: rule.lots,
-          lots0: rule.lots,
+          ticket: res.order, symbol: rule.symbol, side, lots,
+          lots0: lots,
           entry: res.price || entry, sl, tp, openedAt: Date.now(),
           reason, price: res.price || entry, pnl: 0, pnlR: 0, slDist, peakR: 0,
           beMoved: false, partialDone: false, adopted: false,
@@ -2137,8 +2203,8 @@ export class AiTrader {
         this.aiCloseVotes.set(pos.ticket, 0);
         this.lastEntryAt.set(rule.symbol, Date.now());
         this.today.trades++;
-        this.journalLog({ action: "open", symbol: rule.symbol, side, price: res.price, lots: rule.lots, reason });
-        this.think(`${rule.symbol} ${side === "buy" ? "🟢 BUY" : "🔴 SELL"} ${rule.lots} @ ${res.price} — ${reason}`, side === "buy" ? "good" : "warn");
+        this.journalLog({ action: "open", symbol: rule.symbol, side, price: res.price, lots, reason });
+        this.think(`${rule.symbol} ${side === "buy" ? "🟢 BUY" : "🔴 SELL"} ${lots} @ ${res.price} — ${reason}`, side === "buy" ? "good" : "warn");
         this.emit(true);
         // ── anti-phantom: verify the real broker ticket shortly after open ──
         setTimeout(() => { this.verifyTicket(pos).catch(() => {}); }, 2500);

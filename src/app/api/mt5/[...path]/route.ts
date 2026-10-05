@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { traderApiKey } from "@/lib/auth";
+import { MT5_URL } from "@/lib/svc";
 
 export const dynamic = "force-dynamic";
 
@@ -24,9 +25,11 @@ export const dynamic = "force-dynamic";
  *     session before this handler even runs (the audit's Critical #1).
  *   · The session cookie is forwarded too — mt5-service re-validates it,
  *     so both doors check every call.
+ *
+ * v16.9 (audit D3): the service base URL now comes from the single
+ * declaration in lib/svc.ts (MT5_URL) — this route used to keep its own
+ * copy, which is how drift between callers begins.
  */
-
-const MT5_URL = process.env.MT5_SERVICE_URL ?? "http://127.0.0.1:3031";
 
 /** First path segments the browser may reach on the mt5-service. */
 const ALLOWED = new Set([

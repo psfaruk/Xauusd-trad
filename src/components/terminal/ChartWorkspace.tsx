@@ -11,7 +11,7 @@
  */
 
 import { useState } from "react";
-import type { AnalysisResponse, SignalPayload, UserDrawing } from "@/lib/market/types";
+import type { AnalysisResponse, UserDrawing } from "@/lib/market/types";
 import type { Layers, ToolId } from "@/hooks/useTerminal";
 import { useTerminal } from "@/hooks/useTerminal";
 import { useStatus, useSymbolList } from "@/hooks/useFeed";
@@ -65,7 +65,11 @@ export function ChartWorkspace({
   const digits = symbols.find((s) => s.name === symbol)?.digits ?? 2;
   const [sheetOpen, setSheetOpen] = useState(false);
 
-  const signals = ((analysis as any)?.signals ?? []) as SignalPayload[];
+  const signals = analysis?.signals ?? [];
+  // v16.9 (audit §3.3/§2.1): header honesty chips — which timeframes the
+  // engine could NOT feed (partial read) and whether the payload is the
+  // circuit breaker's cached last-good (service down).
+  const missingTfs = analysis?.missingTimeframes ?? [];
   const isPrice = chartView === "price";
   const offline = status?.source === "disconnected" && !(status?.connected ?? false);
 
@@ -103,6 +107,26 @@ export function ChartWorkspace({
       <div className="flex h-10 shrink-0 items-center gap-2 border-b border-border bg-card/60 px-2">
         <ChartViewToggle />
         <TimeframeBar compact />
+        {/* v16.9 (audit §3.3/§2.1): partial-feed + degraded chips — the
+            engine missing timeframes or serving its cached last-good read
+            must be visible on the CHART tab too, not just the Signals tab */}
+        {missingTfs.length > 0 && (
+          <span
+            title={`${t("feedPartialHint")} ${missingTfs.join(" · ")}`}
+            className="rounded border border-gold/40 bg-gold/10 px-1 py-px font-mono text-[9px] font-bold uppercase tracking-wider text-gold/90"
+          >
+            PARTIAL · {missingTfs.slice(0, 3).join("·")}
+            {missingTfs.length > 3 ? ` +${missingTfs.length - 3}` : ""}
+          </span>
+        )}
+        {analysis?.degraded && (
+          <span
+            title="Serving the last-good analysis from cache — MT5 service down"
+            className="rounded border border-gold/40 bg-gold/10 px-1 py-px font-mono text-[9px] font-bold uppercase tracking-wider text-gold/90"
+          >
+            CACHED (svc down)
+          </span>
+        )}
         {/* layers & drawings belong to the price chart only — the trio and
             X-ray views render their charts BARE (no drawing overlays) */}
         {isPrice && <LayersPopover />}

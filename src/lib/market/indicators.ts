@@ -249,14 +249,64 @@ export function swings(bars: Candle[], left = 2, right = 2): Swing[] {
   return dedup;
 }
 
-/** Session name from UTC hour — tokyo 0-7, london 7-13, the London–NY
- *  OVERLAP 13-16 (v16.8: the user audit — the overlap is the highest-quality
- *  tape of the day and was silently labeled "newyork"), newyork 16-21. */
+// ── v16.9 (audit P6.3): DST-aware session walls ──
+// London and New York sessions shift ±1h in March/November; fixed UTC
+// hours mislabeled the first hour of London for eight months a year and
+// put the "overlap" tape in the wrong session. The walls below follow
+// local DST (EU: last Sun Mar–last Sun Oct · US: 2nd Sun Mar–1st Sun Nov),
+// with the transition timestamps cached per year.
+function nthSundayUTC(year: number, month: number, nth: number): number {
+  const d = new Date(Date.UTC(year, month, 1));
+  let count = 0;
+  while (d.getUTCMonth() === month) {
+    if (d.getUTCDay() === 0) {
+      count++;
+      if (count === nth) return Math.floor(d.getTime() / 1000);
+    }
+    d.setUTCDate(d.getUTCDate() + 1);
+  }
+  return 0;
+}
+function lastSundayUTC(year: number, month: number): number {
+  const d = new Date(Date.UTC(year, month + 1, 0)); // last day of the month
+  while (d.getUTCDay() !== 0) d.setUTCDate(d.getUTCDate() - 1);
+  return Math.floor(d.getTime() / 1000);
+}
+const dstYearCache = new Map<number, { euStart: number; euEnd: number; usStart: number; usEnd: number }>();
+function dstWindows(tsSec: number): { euStart: number; euEnd: number; usStart: number; usEnd: number } {
+  const y = new Date(tsSec * 1000).getUTCFullYear();
+  let w = dstYearCache.get(y);
+  if (!w) {
+    w = {
+      // EU clocks: forward last Sun March 01:00 UTC, back last Sun October 01:00 UTC
+      euStart: lastSundayUTC(y, 2) + 3600,
+      euEnd: lastSundayUTC(y, 9) + 3600,
+      // US clocks: forward 2nd Sun March 07:00 UTC (=2am EST), back 1st Sun Nov 06:00 UTC
+      usStart: nthSundayUTC(y, 2, 2) + 7 * 3600,
+      usEnd: nthSundayUTC(y, 10, 1) + 6 * 3600,
+    };
+    dstYearCache.set(y, w);
+  }
+  return w;
+}
+
+/** Session name from UTC time — tokyo → london 7–13 → the London–NY
+ *  OVERLAP 13–16 (v16.8: the overlap is the highest-quality tape of the
+ *  day) → newyork 16–21, all walls DST-shifted (v16.9). */
 export function sessionOf(tsSec: number): "tokyo" | "london" | "overlap" | "newyork" | "off" {
+  const w = dstWindows(tsSec);
+  const euDst = tsSec >= w.euStart && tsSec < w.euEnd ? 1 : 0;
+  const usDst = tsSec >= w.usStart && tsSec < w.usEnd ? 1 : 0;
   const h = new Date(tsSec * 1000).getUTCHours();
-  if (h < 7) return "tokyo";
-  if (h < 13) return "london";
-  if (h < 16) return "overlap";
-  if (h < 21) return "newyork";
+  // winter walls (both DST=0) are identical to the old fixed hours:
+  // tokyo <7 · london <13 · overlap <16 · newyork <21
+  const londonEnd = 13 - euDst;
+  const nyStart = 16 - usDst;
+  const nyEnd = 21 - usDst;
+  const londonStart = 7 - euDst;
+  if (h < londonStart) return "tokyo";
+  if (h < londonEnd) return "london";
+  if (h < nyStart) return "overlap";
+  if (h < nyEnd) return "newyork";
   return "off";
 }

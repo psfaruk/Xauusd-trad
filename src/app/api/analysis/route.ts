@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { db } from "@/lib/db";
 import { evaluate } from "@/lib/market/engine";
-import { SIGNAL_EXPIRY_BARS } from "@/lib/market/engine";
+import { expiryBarsFor } from "@/lib/market/engine";
 import { seedSignals } from "@/lib/market/seed";
 import { atr } from "@/lib/market/indicators";
 import { buildDrawings, magnetsToDrawings, projectSetup, localBias, buildPhaseDrawings, buildMtfStructureDrawings, buildForecastDrawing } from "@/lib/market/drawings";
@@ -10,13 +10,12 @@ import { detectStructure, detectSupplyDemand, detectOrderBlocks, detectFvg, dete
 import { detectConsolidations, detectAmdPhases, detectInstitutionalActivity } from "@/lib/market/phases";
 import { detectPatterns } from "@/lib/market/patterns";
 import type { AnalysisResponse, Candle, SignalPayload, TfSetup } from "@/lib/market/types";
-import { svcHeaders, getBrokerOffsetSec, spreadFor } from "@/lib/svc";
+import { svcHeaders, getBrokerOffsetSec, spreadFor, MT5_URL } from "@/lib/svc";
 
-const MT5_URL = process.env.MT5_SERVICE_URL ?? "http://127.0.0.1:3031";
 const CACHE_TTL = 8_000;
 /** v16.4 (audit §10): the strategy build identity carried in every
  *  response so consumers/caches can compare across deploys. */
-const STRATEGY_VERSION = "v16.8";
+const STRATEGY_VERSION = "v16.9";
 /** v16.4 (audit §10): a candle older than 3× its timeframe (plus a
  *  market-closed weekend allowance) means the FEED is stale — surfaced
  *  via dataFreshness.fresh=false instead of passing silently. */
@@ -26,6 +25,32 @@ const cache = new Map<string, { at: number; data: AnalysisResponse }>();
 /** in-flight backtest seeds (symbol|tf) — never seed the same market twice */
 const seeding = new Set<string>();
 
+/** v16.9 (audit §2.1): CIRCUIT BREAKER — 3 consecutive transport failures
+ *  trip the breaker for 30s. While open, the route stops calling the MT5
+ *  service entirely and serves the LAST GOOD analysis (≤ 5 min old,
+ *  flagged degraded:true) with Retry-After, so a dead service degrades to
+ *  a stale-but-honest snapshot instead of an endless 502 storm. */
+const CB_FAIL_THRESHOLD = 3;
+const CB_OPEN_MS = 30_000;
+const LAST_GOOD_MAX_AGE = 5 * 60_000;
+const cbFails = new Map<string, number>();
+const cbOpenSince = new Map<string, number>();
+const lastGood = new Map<string, { at: number; data: AnalysisResponse }>();
+
+function serveLastGood(mktKey: string, symbol: string, tf: string): NextResponse {
+  const good = lastGood.get(mktKey);
+  if (good && Date.now() - good.at <= LAST_GOOD_MAX_AGE) {
+    return NextResponse.json(
+      { ...good.data, degraded: true } as AnalysisResponse,
+      { headers: { "Cache-Control": "no-store", "Retry-After": "5" } },
+    );
+  }
+  return NextResponse.json(
+    { error: "MT5 service unreachable (circuit open)", code: "MT5_FETCH_FAILED", symbol, timeframe: tf },
+    { status: 502, headers: { "Retry-After": "5" } },
+  );
+}
+
 const ENGINE_TFS = ["M1", "M5", "M15", "M30", "H1", "H4"];
 
 /** v16.4.1 (audit §10): a tf "fed" the engine when it returned at least
@@ -33,17 +58,32 @@ const ENGINE_TFS = ["M1", "M5", "M15", "M30", "H1", "H4"];
 const MIN_TF_BARS = 40;
 
 /** v16.4.1 (audit §2.5/§10): fetch outcomes are now distinguishable —
- *  `ok:false` is a TRANSPORT failure (service down / timeout / non-200),
+ *  `ok:false` is a TRANSPORT failure (service down / timeout / garbage),
  *  `ok:true` + empty bars is "the service answered but has no history"
- *  (unknown symbol / brand-new market). The old version collapsed both
- *  into [] and mislabeled a dead service as a quiet market. */
+ *  (unknown symbol / MT5 not connected / brand-new market). The old
+ *  version collapsed both into [] and mislabeled a dead service as a
+ *  quiet market.
+ *  v16.9 (audit §2.1): a non-200 that still returns the service's
+ *  structured {error} JSON (e.g. "MT5 not connected") means the SERVICE
+ *  is alive — that is ok:true + empty bars (→ 503 DATA_UNAVAILABLE), NOT
+ *  a transport failure (→ 502 MT5_FETCH_FAILED + circuit breaker). Only
+ *  unreachable/timeout/unparsable responses count as transport. */
 async function fetchCandles(symbol: string, tf: string, limit: number): Promise<{ bars: Candle[]; ok: boolean }> {
   try {
     const res = await fetch(
       `${MT5_URL}/api/candles?symbol=${encodeURIComponent(symbol)}&tf=${tf}&limit=${limit}`,
       { cache: "no-store", signal: AbortSignal.timeout(12_000), headers: svcHeaders() },
     );
-    if (!res.ok) return { bars: [], ok: false };
+    if (!res.ok) {
+      // service-answered structured error → it is ALIVE, just data-less
+      try {
+        const err = await res.json();
+        if (err && typeof err.error === "string") return { bars: [], ok: true };
+      } catch {
+        /* unparseable body → true transport failure, fall through */
+      }
+      return { bars: [], ok: false };
+    }
     const data = await res.json();
     return { bars: (data.bars ?? []) as Candle[], ok: true };
   } catch {
@@ -118,24 +158,24 @@ async function trackOpenSignals(symbol: string): Promise<void> {
 
       if (status === "active") {
         for (const b of liveBars) {
-          // pessimistic both-touch (reference rule): a bar spanning SL and TP is a loss
-          const bothTouch = s.direction === "BUY"
-            ? (b.h >= s.tp && b.l <= s.sl)
-            : (b.h >= s.sl && b.l <= s.tp);
-          if (bothTouch) { status = "lost"; resultR = -1; break; }
+          // v16.9 (audit §5.9): LIVE tracking resolves on CLOSES — a wick
+          // spike through SL that closes back is not a loss. The
+          // pessimistic both-touch/wick rule stays in the walk-forward
+          // seeder (seed.ts), where conservative outcomes belong; the live
+          // tracker's job is honest signal-quality stats.
           if (s.direction === "BUY") {
-            if (b.h >= s.tp) { status = "won"; resultR = (s.tp - s.entry) / risk; break; }
-            if (b.l <= s.sl) { status = "lost"; resultR = -1; break; }
+            if (b.c >= s.tp) { status = "won"; resultR = (s.tp - s.entry) / risk; break; }
+            if (b.c <= s.sl) { status = "lost"; resultR = -1; break; }
           } else {
-            if (b.l <= s.tp) { status = "won"; resultR = (s.entry - s.tp) / risk; break; }
-            if (b.h >= s.sl) { status = "lost"; resultR = -1; break; }
+            if (b.c <= s.tp) { status = "won"; resultR = (s.entry - s.tp) / risk; break; }
+            if (b.c >= s.sl) { status = "lost"; resultR = -1; break; }
           }
         }
       }
 
       if (status === s.status) {
         const lastT = closed[closed.length - 1].t;
-        if (lastT - s.barTime > SIGNAL_EXPIRY_BARS * (tfSec[tf] ?? 900)) {
+        if (lastT - s.barTime > expiryBarsFor(tf) * (tfSec[tf] ?? 900)) {
           status = "expired";
           resultR = null;
         }
@@ -179,7 +219,7 @@ async function ensureSeeded(symbol: string, tf: string, bars: Candle[], digits: 
             confidence: s.confidence,
             status: s.status,
             resultR: s.resultR ?? null,
-            trace: JSON.stringify({ checks: s.checks, factors: s.factors, entryNote: s.entryNote, targetNote: s.targetNote }),
+            trace: JSON.stringify({ checks: s.checks, factors: s.factors, entryNote: s.entryNote, targetNote: s.targetNote, tp2: s.tp2 }),
             barTime: s.barTime,
           },
         })
@@ -214,6 +254,18 @@ export async function GET(req: Request) {
     );
   }
 
+  // v16.9 (audit §2.1): circuit-breaker door — while open, never touch
+  // the MT5 service; serve the last good analysis (degraded) or a 502
+  // with Retry-After so the client backs off.
+  const mktKey = `${symbol}|${tf}`;
+  const openSince = cbOpenSince.get(mktKey);
+  if (openSince != null) {
+    if (Date.now() - openSince < CB_OPEN_MS) {
+      return serveLastGood(mktKey, symbol, tf);
+    }
+    cbOpenSince.delete(mktKey); // cooldown elapsed → half-open: try the service again
+  }
+
   const limits: Record<string, number> = {
     M1: 900, M5: 700, M15: 600, M30: 400, H1: 400, H4: 300,
   };
@@ -230,20 +282,31 @@ export async function GET(req: Request) {
   );
   // v16.4.1 (audit §2.5): the REQUESTED tf failing to TRANSPORT (service
   // down / timeout) is a different outage from the service answering with
-  // no history — split the 503 codes so the UI can say which one it is.
+  // no history — split the codes so the UI can say which one it is.
+  // v16.9 (audit §2.1): transport failure = 502 + Retry-After: 5 (a
+  // gateway problem, not a service-unavailable), and 3 consecutive trips
+  // open the circuit breaker above.
   if (!feedOk[tf]) {
+    const fails = (cbFails.get(mktKey) ?? 0) + 1;
+    cbFails.set(mktKey, fails);
+    if (fails >= CB_FAIL_THRESHOLD) {
+      cbOpenSince.set(mktKey, Date.now());
+      cbFails.set(mktKey, 0);
+      return serveLastGood(mktKey, symbol, tf);
+    }
     return NextResponse.json(
       { error: "MT5 service did not answer the candle request", code: "MT5_FETCH_FAILED", symbol, timeframe: tf },
-      { status: 503 },
+      { status: 502, headers: { "Retry-After": "5" } },
     );
   }
+  cbFails.delete(mktKey); // the service answered — breaker resets
   if (!bars[tf]?.length) {
     // v16.4 (audit §2.5/§10): a structured DATA_UNAVAILABLE — the UI can now
     // tell "MT5 service offline / market closed / symbol unknown" apart from
     // "engine looked, found no setup" (status NO_SETUP below).
     return NextResponse.json(
       { error: "no candle data from MT5 service", code: "DATA_UNAVAILABLE", symbol, timeframe: tf },
-      { status: 503 },
+      { status: 503, headers: { "Retry-After": "10" } },
     );
   }
   // v16.4.1 (audit §10): which timeframes fed this evaluation — a partial
@@ -309,7 +372,7 @@ export async function GET(req: Request) {
           rr: s.rr,
           confidence: s.confidence,
           status: s.status,
-          trace: JSON.stringify({ checks: s.checks, factors: s.factors, entryNote: s.entryNote, targetNote: s.targetNote }),
+          trace: JSON.stringify({ checks: s.checks, factors: s.factors, entryNote: s.entryNote, targetNote: s.targetNote, tp2: s.tp2 }),
           barTime: s.barTime,
         },
       });
@@ -354,13 +417,16 @@ export async function GET(req: Request) {
       entry: h.entry,
       sl: h.sl,
       tp: h.tp,
+      tp2: typeof trace.tp2 === "number" ? (trace.tp2 as number) : undefined,
       rr: h.rr,
       confidence: h.confidence,
       status: h.status as any,
       resultR: h.resultR,
       barTime: h.barTime,
-      factors: (trace.factors as string[]) ?? [],
-      checks: (trace.checks as SignalPayload["checks"]) ?? [],
+      // v16.9 (audit §2.2): Array.isArray guards on legacy trace rows — a
+      // malformed factors/checks value must never crash the panel's .map
+      factors: Array.isArray(trace.factors) ? (trace.factors as string[]) : [],
+      checks: Array.isArray(trace.checks) ? (trace.checks as SignalPayload["checks"]) : [],
       entryNote: trace.entryNote as string | undefined,
       targetNote: trace.targetNote as string | undefined,
       createdAt: h.createdAt.toISOString(),
@@ -469,7 +535,7 @@ export async function GET(req: Request) {
     const sig = openByTf.get(t);
     const fresh =
       sig != null &&
-      Date.now() / 1000 - sig.barTime <= SIGNAL_EXPIRY_BARS * (tfSecFull[t] ?? 900) &&
+      Date.now() / 1000 - sig.barTime <= expiryBarsFor(t) * (tfSecFull[t] ?? 900) &&
       Math.abs(sig.entry - priceT) <= 1.2 * atrT;
     if (sig && fresh) {
       tfSetups.push({
@@ -585,6 +651,7 @@ export async function GET(req: Request) {
     digits,
     status: liveSignal ? "OK" : "NO_SETUP",
     signal: liveSignal,
+    signals,
     nextSetup: projection,
     tfSetups,
     nearMiss: result.nearMiss,
@@ -596,8 +663,9 @@ export async function GET(req: Request) {
     strategyVersion: STRATEGY_VERSION,
     generatedAt: Date.now(),
   };
-  (payload as any).signals = signals;
-
   cache.set(cacheKey, { at: Date.now(), data: payload });
+  // v16.9: remember the last GOOD payload for the circuit breaker
+  lastGood.set(`${symbol}|${tf}`, { at: Date.now(), data: payload });
+  if (lastGood.size > 40) lastGood.clear();
   return NextResponse.json(payload, { headers: { "Cache-Control": "no-store" } });
 }

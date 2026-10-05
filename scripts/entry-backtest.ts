@@ -45,6 +45,12 @@ const DEEP_DAYS: Record<string, number> = { M1: 45, M5: 90, M15: 180, M30: 240, 
 const TFS = ["M1", "M5", "M15", "M30", "H1", "H4"];
 const TF_SEC: Record<string, number> = { M1: 60, M5: 300, M15: 900, M30: 1800, H1: 3600, H4: 14400 };
 const SPREAD = 0.3; // XAUUSDm typical (price units) — same class default as lib/svc
+/** audit §7.4 (Phase 4) — ENTRY SLIPPAGE in XAUUSD price units (the audit's
+ *  "$0.5 points"): every simulated entry fill is ADVERSELY slipped (BUY
+ *  entry + SLIPPAGE, SELL entry − SLIPPAGE). Exits (SL/TP price levels) stay
+ *  clean — the audit asked for entry-side modeling only. Spread handling is
+ *  untouched; on typical gold stops this shaves ≈0.1–0.2R off every trade. */
+const SLIPPAGE = 0.5;
 const DIGITS = 3;
 const EXPIRY = 30; // bars — the live tracker's contract
 
@@ -122,7 +128,9 @@ function resolvePlan(p: PlanRec, bars: Bar[]): Outcome {
   if (p.entryType === "market") {
     if (p.idx + 1 > end) return { status: "expired", r: null, fill: null };
     fillIdx = p.idx + 1;
-    fill = bars[fillIdx].o; // the plan appears on close → you enter next open
+    // the plan appears on close → you enter next open — ADVERSELY slipped
+    // (audit §7.4): BUY pays SLIPPAGE above the open, SELL gets SLIPPAGE less
+    fill = bars[fillIdx].o + (p.dir === "BUY" ? SLIPPAGE : -SLIPPAGE);
   } else {
     let found = -1;
     for (let j = p.idx + 1; j <= end; j++) {
@@ -130,7 +138,8 @@ function resolvePlan(p: PlanRec, bars: Bar[]): Outcome {
     }
     if (found === -1) return { status: "cancelled", r: null, fill: null };
     fillIdx = found;
-    fill = p.entry;
+    // limit touched → filled, but never at the pure level (audit §7.4)
+    fill = p.entry + (p.dir === "BUY" ? SLIPPAGE : -SLIPPAGE);
   }
   const risk = Math.abs(fill - p.sl) || 1e-9;
   for (let j = fillIdx; j <= end; j++) {
@@ -207,10 +216,19 @@ async function main() {
       if (ref && ref.atr > 0) sigMaxDist = Math.max(sigMaxDist, Math.abs(s.entry - ref.close) / ref.atr);
     }
     if (sigMaxDist > MAX_ENTRY_DIST_ATR + 0.02) contractViolation = true;
-    const a = stats(seed.signals.map((s) => ({
-      status: (s.status === "pending" || s.status === "active") ? "expired" : (s.status as "won" | "lost" | "expired" | "cancelled"),
-      r: s.resultR, fill: s.entry,
-    })));
+    const a = stats(seed.signals.map((s) => {
+      // audit §7.4: the seed resolves at the signal's own entry level — apply
+      // the SAME adverse entry slippage to the implied fill (BUY +, SELL −).
+      // SL/TP are fixed price levels, so a trade's outcome class never flips;
+      // every FILLED trade's R just shifts down by SLIPPAGE / risk.
+      const risk = Math.abs(s.entry - s.sl) || 1e-9;
+      const adj = SLIPPAGE / risk;
+      return {
+        status: (s.status === "pending" || s.status === "active") ? "expired" : (s.status as "won" | "lost" | "expired" | "cancelled"),
+        r: s.resultR == null ? null : Math.round((s.resultR - adj) * 100) / 100,
+        fill: s.direction === "BUY" ? s.entry + SLIPPAGE : s.entry - SLIPPAGE,
+      };
+    }));
 
     // ── PATH B · projected plans (projectSetup + localBias — the chart ink) ──
     const allZones: Zone[] = [
@@ -254,11 +272,10 @@ async function main() {
     );
   }
 
-  console.log(
-    `\ncontract: signals ≤ ${MAX_ENTRY_DIST_ATR} ATR · plans ≤ ${NEAR_ZONE_ATR} ATR — ${contractViolation ? "❌ VIOLATED (see max columns)" : "✅ HELD on every timeframe"}`,
-  );
+  console.log(`\ncontract: signals ≤ ${MAX_ENTRY_DIST_ATR} ATR · plans ≤ ${NEAR_ZONE_ATR} ATR — ${contractViolation ? "❌ VIOLATED (see max columns)" : "✅ HELD on every timeframe"}`);
   console.log(`notes: market plans fill at next bar open; limits fill when traded through; both-touch bar = loss;`);
   console.log(`       expired plans settle at the window close (clamped ±3R). Broker-clock sessions (no offset).`);
+  console.log(`       entries slip ${SLIPPAGE} ADVERSELY (audit §7.4: BUY +${SLIPPAGE} / SELL −${SLIPPAGE} on fills, exits clean) — RR shifts down by ${SLIPPAGE}/risk per trade (≈0.1–0.2R on typical gold stops).`);
 }
 
 main().catch((e) => {

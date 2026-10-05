@@ -54,7 +54,7 @@ function UpdatedAgo({ at }: { at: number | undefined }) {
 export function SignalsPanel({ analysis }: { analysis: AnalysisResponse | null }) {
   const { t } = useI18n();
   const { selectedSignalId, setSelectedSignalId } = useTerminal();
-  const signals = ((analysis as any)?.signals ?? []) as SignalPayload[];
+  const signals = analysis?.signals ?? [];
   const sig = analysis?.signal ?? null;
   const digits = analysis?.digits ?? 2;
 
@@ -220,7 +220,7 @@ export function SignalsPanel({ analysis }: { analysis: AnalysisResponse | null }
             </div>
           ) : null}
 
-          {sig?.checks?.length ? (
+          {sig && Array.isArray(sig.checks) && sig.checks.length > 0 ? (
             <div className="rounded-lg border border-border bg-card/50 p-3">
               <div className="mb-2 text-[10px] font-bold uppercase tracking-wider text-muted-foreground/70">
                 {t("checks")}
@@ -238,7 +238,7 @@ export function SignalsPanel({ analysis }: { analysis: AnalysisResponse | null }
                   </li>
                 ))}
               </ul>
-              {sig.factors?.length ? (
+              {Array.isArray(sig.factors) && sig.factors.length > 0 ? (
                 <div className="mt-2 flex flex-wrap gap-1">
                   {sig.factors.map((f) => (
                     <span key={f} className="rounded border border-border bg-muted/50 px-1 py-px font-mono text-[9px] text-muted-foreground">
@@ -350,10 +350,15 @@ function SignalCard({
           {t(sig.status)}
         </span>
       </div>
-      <div className="grid grid-cols-4 gap-2">
+      {/* v16.9 (audit §5.5): the partial TP ladder — TP2 (runner) rides next
+          to the bank target when the signal carries one */}
+      <div className={cn("grid gap-2", sig.tp2 != null ? "grid-cols-5" : "grid-cols-4")}>
         <LabeledValue label={t("entry")} value={sig.entry.toFixed(digits)} className="text-gold" />
         <LabeledValue label={t("stopLoss")} value={sig.sl.toFixed(digits)} className="text-down" />
         <LabeledValue label={t("takeProfit")} value={sig.tp.toFixed(digits)} className="text-up" />
+        {sig.tp2 != null && (
+          <LabeledValue label="TP2" value={sig.tp2.toFixed(digits)} className="text-[#2dd4bf]" />
+        )}
         <LabeledValue label={t("riskReward")} value={`1:${sig.rr.toFixed(1)}`} className="text-foreground" />
       </div>
       <div className="mt-2.5">

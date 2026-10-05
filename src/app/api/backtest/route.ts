@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { seedSignals } from "@/lib/market/seed";
 import type { Candle } from "@/lib/market/types";
-import { svcHeaders, getBrokerOffsetSec, spreadFor } from "@/lib/svc";
+import { MT5_URL, svcHeaders, getBrokerOffsetSec, spreadFor } from "@/lib/svc";
 
 /**
  * Engine backtest — walk-forward run of the LIVE engine over real MT5
@@ -10,8 +10,15 @@ import { svcHeaders, getBrokerOffsetSec, spreadFor } from "@/lib/svc";
  * for the exact detectors that produce live signals.
  */
 
-const MT5_URL = process.env.MT5_SERVICE_URL ?? "http://127.0.0.1:3031";
 const CACHE_TTL = 60_000;
+
+/** audit §7.4 (Phase 4) — adverse ENTRY slippage in price units, applied to
+ *  the SIMULATED FILLS: every filled signal's entry fills SLIPPAGE units
+ *  worse than its level (BUY +, SELL −). SL/TP are fixed price levels, so an
+ *  outcome's class (won/lost/expired) never flips — only its R shifts, down
+ *  by SLIPPAGE / |entry − sl|. Exits stay clean (entries only, as the audit
+ *  asked); spread handling is untouched. BACKTEST_SLIPPAGE=0 disables. */
+const BACKTEST_SLIPPAGE = Number(process.env.BACKTEST_SLIPPAGE ?? 0.5);
 const cache = new Map<string, { at: number; data: any }>();
 
 async function fetchCandles(symbol: string, tf: string, limit: number): Promise<Candle[]> {
@@ -60,6 +67,20 @@ export async function GET(req: Request) {
 
   const { signals, scanned } = seedSignals({ symbol, tf, digits, spread, bars, brokerOffsetSec });
 
+  // audit §7.4 (Phase 4): adverse entry slippage on the simulated fills —
+  // applied IN PLACE before the stats below so W/L classes stay identical
+  // (SL/TP are price levels) while every filled trade's R shifts down by
+  // BACKTEST_SLIPPAGE / |entry − sl|. Unfilled (pending/active) and cancelled
+  // signals never filled, so they keep their null R untouched.
+  if (BACKTEST_SLIPPAGE > 0) {
+    for (const s of signals) {
+      if (s.status === "cancelled" || s.status === "pending" || s.status === "active") continue;
+      if (s.resultR == null) continue;
+      const risk = Math.abs(s.entry - s.sl) || 1e-9;
+      s.resultR = Math.round((s.resultR - BACKTEST_SLIPPAGE / risk) * 100) / 100;
+    }
+  }
+
   const won = signals.filter((s) => s.status === "won").length;
   const lost = signals.filter((s) => s.status === "lost").length;
   const expired = signals.filter((s) => s.status === "expired").length;
@@ -80,6 +101,9 @@ export async function GET(req: Request) {
     symbol,
     tf,
     digits,
+    /** audit §7.4: the adverse-entry slippage the stats already carry (price
+     *  units; 0 = off) — surfaced so the UI can label the numbers honestly. */
+    slippage: BACKTEST_SLIPPAGE,
     scanned,
     stats: {
       signals: signals.length,

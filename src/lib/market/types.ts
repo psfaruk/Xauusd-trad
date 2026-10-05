@@ -225,6 +225,11 @@ export interface TraderState {
   locked?: boolean;
   enabled: boolean;
   riskMode: TraderRiskMode;
+  /** v16.9 (audit E2): risk-% position sizing — 0 = legacy fixed lots
+   *  (default, no silent behavior change); > 0 sizes every entry from the
+   *  live balance: lots = (balance × riskPct%) / (stop distance in $ per
+   *  lot), clamped to the symbol's lot step and MAX_LOT. */
+  riskPct?: number;
   /** fixed-dollar take-profit target — every trade banks profit at +$tpUsd.
    *  0 = R-multiple mode (tpR × risk); $-mode requires ≥ 3 (server range
    *  3–50, v14 — the old 0.1–50 UI clamp sent values the server rejects). */
@@ -320,6 +325,8 @@ export type AutoDrawing =
       kind: "setup"; dir: "BUY" | "SELL"; zone: [number, number]; entry: number; sl: number; tp: number; rr: number;
       t0: number; status: "forming" | "triggered" | "pending" | "active" | "projected"; note?: string;
       entryType?: "market" | "limit"; createdAt?: string; symbol?: string; tf?: string; trigger?: string;
+      /** v16.9: the runner leg of the partial TP ladder (TP2) */
+      tp2?: number;
     }
   | { kind: "magnet"; price: number; source: string; dist_atr: number }
   | { kind: "liq"; side: "BSL" | "SSL"; price: number; t: number; state: "untouched" | "swept" | "run" }
@@ -398,7 +405,11 @@ export interface SignalPayload {
   entryType: "market" | "limit";
   entry: number;
   sl: number;
+  /** TP1 — the bank (50% off at the first measured structure target) */
   tp: number;
+  /** v16.9 (audit §5.5): TP2 — the runner target (rest rides to the next
+   *  liquidity pool / zone edge, ≤ 3.5R). Optional: legacy rows lack it. */
+  tp2?: number;
   rr: number;
   confidence: number;
   status: "active" | "pending" | "won" | "lost" | "expired" | "cancelled";
@@ -488,6 +499,8 @@ export interface AnalysisResponse {
    *  DATA_UNAVAILABLE so the UI can tell outage from quiet market. */
   status: "OK" | "NO_SETUP";
   signal: SignalPayload | null;
+  /** v16.9: signal history for this symbol+tf (was smuggled via `as any`) */
+  signals: SignalPayload[];
   /** planned next entry when no live signal exists (entry/SL/TP projection) —
    *  v16.7 PRICE-ANCHORED: entry sits at/below 0.6 ATR from the live price
    *  (near-zone limit or confirmation market entry); `price` is the anchor. */
@@ -531,5 +544,9 @@ export interface AnalysisResponse {
   /** v16.4 (audit §10): the strategy build that produced this payload —
    *  cache keys and consumers can compare across deploys. */
   strategyVersion: string;
+  /** v16.9 (audit §2.1): true when the circuit breaker served the LAST
+   *  GOOD analysis because the MT5 service is down — the payload is a
+   *  stale-but-honest snapshot, not a live read. */
+  degraded?: boolean;
   generatedAt: number;
 }

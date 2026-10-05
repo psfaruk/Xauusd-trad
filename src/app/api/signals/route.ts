@@ -1,19 +1,49 @@
 import { NextResponse } from "next/server";
+import { z } from "zod";
 import { db } from "@/lib/db";
 
-/** Signal history for a symbol (+optional timeframe). */
+/** Signal history for a symbol (+optional timeframe).
+ *  v16.9 (audit §2.2): query params are validated with a Zod schema —
+ *  invalid input gets a 400 with the issue spelled out, never a Prisma
+ *  500; and trace.factors / trace.checks are Array.isArray-guarded (a
+ *  corrupt legacy row used to reach SignalsPanel's .map as a truthy
+ *  non-array and crash it). */
+
+const QUERY_SCHEMA = z.object({
+  symbol: z
+    .string()
+    .regex(/^[A-Za-z0-9_/+.-]{1,24}$/, "invalid symbol")
+    .optional(),
+  tf: z
+    .string()
+    .regex(/^(M1|M5|M15|M30|H1|H4)$/, "unsupported timeframe")
+    .optional(),
+  limit: z.coerce
+    .number()
+    .int("limit must be an integer")
+    .min(1, "limit must be ≥ 1")
+    .max(200, "limit must be ≤ 200")
+    .default(50),
+});
 
 export async function GET(req: Request) {
   const url = new URL(req.url);
-  const symbol = url.searchParams.get("symbol");
-  const timeframe = url.searchParams.get("tf");
-  // v16.3: NaN ("?limit=abc") and negatives ("?limit=-1") used to reach
-  // Prisma's take: and threw PrismaClientValidationError → HTTP 500. Clamp
-  // to a sane integer range — invalid input gets the default, never a 500.
-  const rawLimit = Number(url.searchParams.get("limit") ?? 50);
-  const limit = Number.isFinite(rawLimit)
-    ? Math.max(1, Math.min(200, Math.floor(rawLimit)))
-    : 50;
+  const parsed = QUERY_SCHEMA.safeParse({
+    symbol: url.searchParams.get("symbol") ?? undefined,
+    tf: url.searchParams.get("tf") ?? undefined,
+    limit: url.searchParams.get("limit") ?? undefined,
+  });
+  if (!parsed.success) {
+    return NextResponse.json(
+      {
+        error: "invalid query parameters",
+        code: "INVALID_QUERY",
+        issues: parsed.error.issues.map((i) => ({ path: i.path.join("."), message: i.message })),
+      },
+      { status: 400 },
+    );
+  }
+  const { symbol, tf: timeframe, limit } = parsed.data;
   const rows = await db.signalRecord.findMany({
     where: {
       ...(symbol ? { symbol } : {}),
@@ -43,13 +73,15 @@ export async function GET(req: Request) {
         entry: h.entry,
         sl: h.sl,
         tp: h.tp,
+        tp2: typeof trace.tp2 === "number" ? trace.tp2 : undefined,
         rr: h.rr,
         confidence: h.confidence,
         status: h.status,
         resultR: h.resultR,
         barTime: h.barTime,
-        factors: trace.factors ?? [],
-        checks: trace.checks ?? [],
+        // v16.9 (§2.2): shape-guarded — corrupt rows degrade to [], never crash
+        factors: Array.isArray(trace.factors) ? trace.factors : [],
+        checks: Array.isArray(trace.checks) ? trace.checks : [],
         createdAt: h.createdAt.toISOString(),
       };
     }),

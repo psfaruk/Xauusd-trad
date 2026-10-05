@@ -17,6 +17,8 @@ next-env.d.ts
 # databases (generated at build / runtime, never committed)
 db/*.db
 db/*.db-journal
+db/*.db-shm
+db/*.db-wal
 *.sqlite
 *.sqlite-journal
 

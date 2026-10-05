@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { db } from "@/lib/db";
 import { mt5ServiceStatus } from "@/lib/mt5-spawn";
-import { svcHeaders } from "@/lib/svc";
+import { MT5_URL, svcHeaders } from "@/lib/svc";
 
 export const dynamic = "force-dynamic";
 
@@ -42,7 +42,7 @@ export async function GET() {
   let broker: { source: string; server: string; reason: string } | null = null;
   try {
     const r = await fetch(
-      `${process.env.MT5_SERVICE_URL ?? "http://127.0.0.1:3031"}/api/status`,
+      `${MT5_URL}/api/status`,
       // v14: market REST is guarded now — attach the derived trader key
       { cache: "no-store", signal: AbortSignal.timeout(4000), headers: svcHeaders() },
     );
@@ -76,7 +76,7 @@ export async function GET() {
     // DATABASE_URL connection string never leaves the process.
     database: { ok: dbOk, persistent: (process.env.DATABASE_URL ?? "").includes("/data/") },
     authLocked: !!(process.env.APP_PASSWORD || process.env.TRADER_API_KEY),
-    service: { ...service, url: process.env.MT5_SERVICE_URL ?? "http://127.0.0.1:3031" },
+    service: { ...service, url: MT5_URL },
     broker,
     hint: process.env.MT5_LOGIN && process.env.MT5_PASSWORD
       ? null

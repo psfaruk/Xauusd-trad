@@ -328,7 +328,11 @@ const restServer = createServer((req, res) => {
       });
     }
 
-    if (url.pathname === "/health") {
+    // audit §2.3: /healthz is the standard k8s/Railway probe path — returns the
+    // EXACT same JSON as /health (which stays for humans). No method guard, so
+    // GET and HEAD both serve it (Node's ServerResponse discards the body on
+    // HEAD automatically — the probes' headers-only checks work as-is).
+    if (url.pathname === "/health" || url.pathname === "/healthz") {
       return json(res, 200, {
         ok: true, service: "mt5-service", source: manager.source,
         connected: manager.connected, uptime: Math.floor(process.uptime()),

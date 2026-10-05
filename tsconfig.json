@@ -37,6 +37,11 @@
     ".next/dev/types/**/*.ts"
   ],
   "exclude": [
-    "node_modules"
+    "node_modules",
+    "mini-services",
+    "mt5-poc",
+    "scripts",
+    "skills",
+    "tool-results"
   ]
 }

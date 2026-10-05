@@ -27,6 +27,7 @@ import {
   LineStyle,
   type IChartApi,
   type ISeriesApi,
+  type Logical,
   type SeriesMarker,
   type Time,
   type UTCTimestamp,
@@ -34,7 +35,7 @@ import {
 import { useTheme } from "next-themes";
 import { feed, useBars, restUrl } from "@/hooks/useFeed";
 import { useI18n } from "@/lib/i18n";
-import { SIGNAL_EXPIRY_BARS } from "@/lib/market/engine";
+import { expiryBarsFor } from "@/lib/market/engine";
 import type {
   AutoDrawing,
   Candle,
@@ -263,7 +264,7 @@ export default function TradingChart(props: Props) {
       handleScale: {
         mouseWheel: true, pinch: true,
         axisPressedMouseMove: { time: true, price: true },
-        axisDoubleClick: { time: true, price: true },
+        axisDoubleClickReset: { time: true, price: true },
       },
     });
     const series = chart.addCandlestickSeries({
@@ -476,7 +477,7 @@ export default function TradingChart(props: Props) {
     const markers: SeriesMarker<Time>[] = signals
       .filter((s) => s.barTime)
       .slice(-40)
-      .map((s) => ({
+      .map((s): SeriesMarker<Time> => ({
         time: s.barTime as UTCTimestamp,
         position: s.direction === "BUY" ? "belowBar" : "aboveBar",
         color: s.direction === "BUY" ? "#10b981" : "#f43f5e",
@@ -598,11 +599,11 @@ export default function TradingChart(props: Props) {
         if (idx > 0) {
           const prev = bs[idx - 1];
           const frac = (t - prev.t) / Math.max(1e-9, bs[idx].t - prev.t);
-          const lc = ts.logicalToCoordinate(idx - 1 + frac);
+          const lc = ts.logicalToCoordinate((idx - 1 + frac) as Logical);
           if (lc != null) return lc;
         }
         if (t <= bs[0].t) {
-          const lc0 = ts.logicalToCoordinate(0);
+          const lc0 = ts.logicalToCoordinate(0 as Logical);
           if (lc0 != null) return lc0;
         }
       }
@@ -741,17 +742,21 @@ export default function TradingChart(props: Props) {
       for (const d of autoRef.current) {
         const layer = LAYER_OF[d.kind] ?? "zones";
         if (!layersRef.current[layer]) continue;
-        try { renderAuto(d); } catch (e) { console.warn("[chart] renderAuto failed:", d.kind, e); }
+        try { renderAuto(ctx, d); } catch (e) { console.warn("[chart] renderAuto failed:", d.kind, e); }
       }
 
       // ── AI chart-read layer — what the trading brain sees right now ──
       if (layersRef.current.ai) {
         for (const d of aiRef.current) {
-          try { renderAuto(d); } catch { /* one bad level must not blank the chart */ }
+          try { renderAuto(ctx, d); } catch { /* one bad level must not blank the chart */ }
         }
       }
 
-      function renderAuto(d: AutoDrawing) {
+      // ctx arrives as a PARAMETER, not a closure capture: renderAuto is a
+      // hoisted function declaration, so TypeScript's `if (!ctx) return`
+      // narrowing above does NOT cross into it — the non-null context must
+      // be threaded through explicitly (v16.9: fixes ~130 null-guard errors).
+      function renderAuto(ctx: CanvasRenderingContext2D, d: AutoDrawing) {
         switch (d.kind) {
           case "hline": {
             const y = yOfPrice(d.price);
@@ -987,7 +992,12 @@ export default function TradingChart(props: Props) {
             const projected = d.status === "projected";
             const waiting = d.status === "pending" || projected;
             // anchor x — the bar the setup was born on, snapped to the grid
-            let xs = xOfTime(d.t0) ?? rightEdge - 24;
+            const xEntry = xOfTime(d.t0);
+            // v16.9 (audit §6.5): a limit entry projected into the future can
+            // place the box anchor beyond the right edge (or off the time
+            // scale entirely) — the pinned chevron below keeps it visible.
+            const offscreen = xEntry === null || xEntry > rightEdge;
+            let xs = xEntry ?? rightEdge - 24;
             xs = clamp(xs, -2, rightEdge - 24);
             // risk shading (red entry↔SL, green entry↔TP) — reads at a glance
             // v14: LIVE/pending setups ONLY. A PLAN (projected) setup draws
@@ -1015,6 +1025,14 @@ export default function TradingChart(props: Props) {
             ctx.restore();
             hardSeg(ctx, xs, yS, rightEdge, yS, `rgba(255,120,132,${(0.92 * inkM).toFixed(2)})`, "rgba(248,113,113,0.07)", 0.6, [5, 4]);
             hardSeg(ctx, xs, yT, rightEdge, yT, `rgba(52,211,153,${(0.92 * inkM).toFixed(2)})`, "rgba(52,211,153,0.07)", 0.6, [5, 4]);
+            // v16.9 (audit §5.5): TP2 — the RUNNER leg of the partial TP
+            // ladder. Same whisper-dashed grammar as TP, teal so it never
+            // reads as a second bank target.
+            const tp2 = d.tp2 != null && d.tp2 !== d.tp ? d.tp2 : null;
+            const yT2 = tp2 != null ? yOfPrice(tp2) : null;
+            if (tp2 != null && yT2 !== null) {
+              hardSeg(ctx, xs, yT2, rightEdge, yT2, `rgba(20,184,166,${(0.85 * inkM).toFixed(2)})`, "rgba(20,184,166,0.06)", 0.55, [5, 4]);
+            }
             // right-edge contract badges (setup labels always win — force register)
             const verb = projected ? "PLAN" : waiting ? "WAIT" : "ENTRY";
             const lE = `${d.dir} ${verb} ${d.entry.toFixed(digits)}`;
@@ -1026,6 +1044,31 @@ export default function TradingChart(props: Props) {
             badgeTag(rightEdge, yE - 11, lE, "#fbbf24", "rgba(94,63,10,0.92)", "rgba(251,191,36,0.6)", projected, 10);
             badgeTag(rightEdge, yS + 11, lS, "#fecaca", "rgba(96,28,33,0.92)", "rgba(255,120,132,0.6)", projected, 10);
             badgeTag(rightEdge, yT - 11, lT, "#a7f3d0", "rgba(12,64,44,0.92)", "rgba(52,211,153,0.6)", projected, 10);
+            if (tp2 != null && yT2 !== null) {
+              const lT2 = `TP2 ${tp2.toFixed(digits)}`;
+              tryLabel(rightEdge - 4, yT2 - 11, lT2, 9, "right", true);
+              badgeTag(rightEdge, yT2 - 11, lT2, "#99f6e4", "rgba(4,47,46,0.92)", "rgba(20,184,166,0.55)", projected, 9);
+            }
+            // v16.9 (audit §6.5): off-screen setup — the entry lives beyond
+            // the right edge, so a small chevron pinned at the edge + a
+            // compact price tag at the entry's y keep the signal visible
+            // even when its box can't be drawn in full (null/off-scale y skips).
+            if (offscreen && yE > -4 && yE < h + 4) {
+              ctx.save();
+              ctx.strokeStyle = `rgba(230,190,70,${(0.9 * inkM).toFixed(2)})`;
+              ctx.lineWidth = 1.1;
+              ctx.lineCap = "round";
+              ctx.beginPath();
+              ctx.moveTo(rightEdge - 16, yE - 5);
+              ctx.lineTo(rightEdge - 11, yE);
+              ctx.lineTo(rightEdge - 16, yE + 5);
+              ctx.moveTo(rightEdge - 9, yE - 5);
+              ctx.lineTo(rightEdge - 4, yE);
+              ctx.lineTo(rightEdge - 9, yE + 5);
+              ctx.stroke();
+              ctx.restore();
+              hardText(ctx, d.entry.toFixed(digits), rightEdge - 4, yE + 13, `rgba(230,190,70,${(0.85 * inkM).toFixed(2)})`, 8, "right");
+            }
             // the trade words — head block at the setup's birth
             const headX = Math.max(8, xs + 6);
             const headY = clamp((yE + yT) / 2 - 34, 20, h - 64);
@@ -1041,7 +1084,10 @@ export default function TradingChart(props: Props) {
                 : null;
               // expiry countdown: bars this setup has left to resolve
               const barsSinceSetup = d.t0 ? Math.max(0, Math.floor((bs[bs.length - 1].t - d.t0) / tf)) : 0;
-              const barsLeft = Math.max(0, SIGNAL_EXPIRY_BARS - barsSinceSetup);
+              // v16.9 (audit A6): per-TF expiry — 45min of market time
+              // (M1=30 bars, M5=9, M15/H4=3), never the flat 30-bar window
+              // that lived 5 days on H4.
+              const barsLeft = Math.max(0, expiryBarsFor(d.tf ?? timeframe) - barsSinceSetup);
               const meta = [
                 d.entryType === "limit" ? "limit order" : "market entry",
                 ageMin !== null ? `${ageMin}m ago` : null,

@@ -13,7 +13,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "@/hooks/use-toast";
 import TerminalShell from "@/components/terminal/TerminalShell";
 import { useTerminal } from "@/hooks/useTerminal";
-import { useBars } from "@/hooks/useFeed";
+import { useBars, useFeedAnalysisResync } from "@/hooks/useFeed";
 import type { AnalysisResponse, UserDrawing } from "@/lib/market/types";
 
 async function fetchAnalysis(symbol: string, tf: string): Promise<AnalysisResponse> {
@@ -32,6 +32,10 @@ async function fetchDrawings(symbol: string, tf: string): Promise<UserDrawing[]>
 export default function Home() {
   const { symbol, timeframe } = useTerminal();
   const qc = useQueryClient();
+  // v16.9 (audit §3.3): a REAL socket reconnect may have missed bar closes
+  // and engine signals — invalidate every ["analysis", …] query immediately
+  // instead of waiting out the 15s poll.
+  useFeedAnalysisResync();
 
   // live analysis (engine + roadmap + auto-drawings + signal history)
   const analysisQ = useQuery({

@@ -49,6 +49,7 @@ export function buildDrawings(
       dir,
       zone: [Math.min(s.entry, s.sl), Math.max(s.entry, s.sl)],
       entry: s.entry, sl: s.sl, tp: s.tp, rr: s.rr,
+      tp2: s.tp2, // v16.9 §5.5: the runner leg of the partial TP ladder
       t0: s.barTime,
       status: s.status === "pending" ? "pending" : s.status === "active" ? "active" : "triggered",
       note: s.entryNote,

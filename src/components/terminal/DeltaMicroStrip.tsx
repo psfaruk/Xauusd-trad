@@ -115,7 +115,11 @@ export default function DeltaMicroStrip() {
   useEffect(() => {
     if (lastTfRef.current !== timeframe) {
       lastTfRef.current = timeframe;
-      setWinSec(TF_SEC[timeframe] * 2 ?? defWin);
+      // v16.9: TF_SEC[timeframe] is typed number (Record<string, number>), so
+      // the old `TF_SEC[timeframe] * 2 ?? defWin` right operand was dead code
+      // (TS2869) — and NaN is never nullish, so the fallback never fired
+      // anyway. defWin IS the 2-candle spec (tfSec already 900-fallback).
+      setWinSec(defWin);
       setPanMs(0);
     }
   }, [timeframe, defWin]);

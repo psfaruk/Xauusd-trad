@@ -39,11 +39,26 @@
  * HARD gates (unchanged philosophy — the ONLY blockers):
  *   trigger · trigger-aware cooldown · ATR floor · spread sanity · geometry
  * Everything else modulates confidence: 0.45 + 0.5 × passRatio.
+ *
+ * v16.9 (2026-10-05 audit pass):
+ *   §5.1  counter-trend blanket block → QUALIFIED allow (quality ≥ 0.62 +
+ *         CHoCH / RSI divergence / OTE side / fresh sweep) — shared with
+ *         the seeder via counterTrendGate(); the 0.62 zone threshold that
+ *         was dead code in v16.8 is live again
+ *   §5.3  zone penetration 40% → 25% + wick-rejection alternative
+ *   §5.5  TP ladder: partial TP1 (bank, 1.2–2.0R) + TP2 runner (≤3.5R) —
+ *         the flat 2.0R reward cap is gone
+ *   §5.7  SFP threshold ATR: aPrev → 5-bar EMA of ATR (atrSmooth)
+ *   §5.8  pullback trigger banned on M1 (EMA21 whipsaw) + near-touch band
+ *   §5.10/A4 volume factors de-weighted (cluster-capped bonus),
+ *         displacement earns its own weight
+ *   A6    signal expiry: flat 30 bars → 45 minutes of market time
+ *         (expiryBarsFor) — 30 bars was 7.5h on M15, 5 days on H4
  */
 
 import type { Candle, CheckItem, IndicatorSnapshot, SignalPayload } from "./types";
 import {
-  adx, atr, efficiencyRatio, ema, macd, rsi, stochastic, bollinger, volZ, sessionOf, last,
+  adx, atr, efficiencyRatio, ema, macd, rsi, stochastic, bollinger, volZ, sessionOf, last, swings,
 } from "./indicators";
 import {
   detectStructure, detectOrderBlocks, detectFvg, detectLiquidity, detectSupplyDemand,
@@ -59,7 +74,16 @@ export const COOLDOWN_BARS_DEFAULT = 5;
 const MAX_SPREAD_BPS = 3.0;
 /** ATR must exceed this fraction of price (dead-feed guard) */
 const MIN_ATR_PCT = 0.0004;
-/** signal + tracking expiry (bars) — SHARED by live tracking & backtest seed */
+/** signal + tracking expiry — v16.9 (audit A6): TIME-based, not bar-based.
+ *  A flat 30 bars meant 30min on M1 but 7.5h on M15 and 5 days on H4.
+ *  Expiry is now capped at 45 minutes of market time (min 3 bars so an
+ *  HTF setup is never stillborn). */
+export const SIGNAL_EXPIRY_MS = 45 * 60;
+export function expiryBarsFor(tf: string): number {
+  const sec = TF_SEC[tf] ?? 900;
+  return Math.max(3, Math.min(30, Math.round(SIGNAL_EXPIRY_MS / sec)));
+}
+/** legacy flat window (30 bars) — kept ONLY for reference/replay tooling */
 export const SIGNAL_EXPIRY_BARS = 30;
 
 export interface EngineInput {
@@ -150,11 +174,13 @@ const BULL_ZONES = ["demand", "ob_bull", "fvg_bull"];
 const BEAR_ZONES = ["supply", "ob_bear", "fvg_bear"];
 
 /**
- * Zone retest — REAL rejections only (P5 + v16.8 audit hardening):
+ * Zone retest — REAL rejections only (P5 + v16.8 hardening + v16.9 tuning):
  *  · zone exists & fresh as-of the trigger bar (mitT null or == trigger t)
  *  · height ≤ 1.25 ATR (wide zones are noise magnets)
- *  · last 3 bars PENETRATED ≥ 40% of the zone height (was 25% — an edge
- *    kiss is not a test; v16.8)
+ *  · last 3 bars PENETRATED ≥ 25% of the zone height (v16.9 §5.3: the
+ *    v16.8 40% floor demanded a deep pierce — XAUUSD rejections commonly
+ *    cap at 25–35%), OR a hard wick-rejection qualifies on its own:
+ *    rejection wick ≥ 60% of the trigger range with ≥ 12% depth
  *  · LIQUIDITY SWEEP first: the test's wick took out the prior 20-bar
  *    low (bull) / high (bear) — a real ICT retest grabs stops before it
  *    turns; a touch without a sweep is just noise visiting the zone
@@ -200,16 +226,20 @@ export function detectZoneRetest(
     for (const z of [...candidates].sort((x, y) => Math.abs(dist(x)) - Math.abs(dist(y)))) {
       const zh = z.hi - z.lo;
       if (zh <= 0) continue;
-      // penetration: last 3 bars entered the zone by ≥ 40% of its height
-      const depth = bull
-        ? z.hi - Math.min(...win.map((w) => w.l))
-        : Math.max(...win.map((w) => w.h)) - z.lo;
-      if (depth < 0.4 * zh) continue;
       const range = b.h - b.l;
       if (range <= 0) continue;
       const bodyPos = (b.c - b.l) / range;
       const lowerWick = Math.min(b.o, b.c) - b.l;
       const upperWick = b.h - Math.max(b.o, b.c);
+      // penetration (v16.9 §5.3): ≥ 25% of the zone height, OR a hard
+      // wick-rejection (rejection wick ≥ 60% of the trigger range with
+      // ≥ 12% depth) — gold's fast rejections often pierce only 25–35%
+      const depth = bull
+        ? z.hi - Math.min(...win.map((w) => w.l))
+        : Math.max(...win.map((w) => w.h)) - z.lo;
+      const penOk = depth >= 0.25 * zh;
+      const wickAlt = (bull ? lowerWick / range : upperWick / range) >= 0.6 && depth >= 0.12 * zh;
+      if (!penOk && !wickAlt) continue;
       const mid = (z.hi + z.lo) / 2;
       const strongReject = bull ? b.c > z.hi : b.c < z.lo;
       const mildReject = bull ? b.c > mid : b.c < mid;
@@ -249,31 +279,145 @@ export function detectZoneRetest(
   return first ?? (biasDir === "SELL" ? trySide(true) : trySide(false));
 }
 
-/** Pullback: EMA21 SLOPE (e21 vs e21 five bars ago — P3) + touch + rejection. */
+/** Pullback: EMA21 SLOPE (e21 vs e21 five bars ago — P3) + touch + rejection.
+ *  v16.9 (§5.8): M1 pullbacks are GONE — EMA21 on M1 is noise (the audit's
+ *  whipsaw finding: 5-bar slope on a 21-bar mean of 60s bars); the trigger
+ *  runs on M5 and above. Slope is ATR-normalized and the touch allows a
+ *  0.15-ATR near-miss (an exact wick-touch on gold is rarer than a
+ *  near-touch that holds). */
 export function detectPullback(
-  bars: Candle[], e21: number, e21Prev: number, a: number,
+  bars: Candle[], e21: number, e21Prev: number, a: number, tf = "M15",
 ): TriggerResult | null {
+  if (tf === "M1") return null; // EMA21 whipsaw guard — M5+ only
   if (bars.length < 25 || a <= 0) return null;
   const b = bars[bars.length - 1];
   const prev = bars[bars.length - 2];
-  const slope = e21 - e21Prev;
-  if (Math.abs(slope) < 0.08 * a) return null; // dead EMA — no trend to pull back to
-  const rising = slope > 0;
-  const falling = slope < 0;
+  const slopeAtr = Math.abs(e21 - e21Prev) / a; // 5-bar slope in ATR units
+  if (slopeAtr < 0.08) return null; // dead EMA — no trend to pull back to
+  const rising = e21 > e21Prev;
+  const falling = e21 < e21Prev;
   const range = b.h - b.l;
   if (range <= 0) return null;
   const bodyPos = (b.c - b.l) / range;
   const lowerWick = Math.min(b.o, b.c) - b.l;
   const upperWick = b.h - Math.max(b.o, b.c);
-  if (rising && b.l <= e21 && b.c > prev.c && lowerWick / range >= 0.4 && bodyPos >= 0.5) {
+  const near = 0.15 * a; // near-touch band around EMA21
+  if (rising && b.l <= e21 + near && b.c > prev.c && lowerWick / range >= 0.4 && bodyPos >= 0.5) {
     const q = 0.6 * (lowerWick / range) + 0.4 * bodyPos;
     return { kind: "pullback", dir: "BUY", quality: Math.min(1, q), note: `EMA21 pullback held (${e21.toFixed(2)})` };
   }
-  if (falling && b.h >= e21 && b.c < prev.c && upperWick / range >= 0.4 && bodyPos <= 0.5) {
+  if (falling && b.h >= e21 - near && b.c < prev.c && upperWick / range >= 0.4 && bodyPos <= 0.5) {
     const q = 0.6 * (upperWick / range) + 0.4 * (1 - bodyPos);
     return { kind: "pullback", dir: "SELL", quality: Math.min(1, q), note: `EMA21 pullback rejected (${e21.toFixed(2)})` };
   }
   return null;
+}
+
+// ═══════════════ v16.9 counter-trend qualifier (§5.1) ═══════════════
+
+/** RSI divergence at the last two same-kind swings (3/3 fractals):
+ *  price LL + RSI higher low (bull) / price HH + RSI lower high (bear). */
+function rsiDivergence(bars: Candle[], rsiArr: (number | null)[], bull: boolean): boolean {
+  const win = Math.min(48, bars.length);
+  const sliceStart = bars.length - win;
+  const sw = swings(bars.slice(sliceStart), 3, 3);
+  const rsiAt = (i: number) => (i >= 0 && i < rsiArr.length ? rsiArr[i] : null);
+  if (bull) {
+    const lows = sw.filter((s) => s.kind === "low").slice(-2);
+    if (lows.length < 2) return false;
+    const [a, b2] = lows;
+    const ra = rsiAt(sliceStart + a.index);
+    const rb = rsiAt(sliceStart + b2.index);
+    return b2.price < a.price && ra != null && rb != null && rb > ra + 1.5;
+  }
+  const highs = sw.filter((s) => s.kind === "high").slice(-2);
+  if (highs.length < 2) return false;
+  const [a, b2] = highs;
+  const ra = rsiAt(sliceStart + a.index);
+  const rb = rsiAt(sliceStart + b2.index);
+  return b2.price > a.price && ra != null && rb != null && rb < ra - 1.5;
+}
+
+export interface CounterTrendCtx {
+  bars: Candle[];
+  tf: string;
+  rsiArr: (number | null)[];
+  structure: StructureRead;
+  pools: LiquidityPool[];
+  pd: ReturnType<typeof premiumDiscount>;
+}
+export interface CounterTrendVerdict {
+  allowed: boolean;
+  reason: string;
+  factors: string[];
+}
+
+/**
+ * v16.9 (§5.1) — the v16.8 blanket counter-trend block also killed every
+ * REAL reversal (a CHoCH is counter-trend by definition; the bias it
+ * fights is 11+ bars late since v16.8's 5/5 fractals). A signal against a
+ * non-neutral bias now survives ONLY with strict evidence:
+ *   · trigger quality ≥ 0.62 (the threshold that was dead code in v16.8)
+ *   · AND at least one of: fresh CHoCH against the bias (≤ 6 bars) · RSI
+ *     divergence · entry from the OTE side (discount for BUY / premium
+ *     for SELL) · opposing liquidity sweep within the last 3 bars.
+ * ONE rule shared by the live engine and the walk-forward seeder.
+ */
+export function counterTrendGate(
+  trig: TriggerResult,
+  biasDir: "BUY" | "SELL" | "NEUTRAL",
+  ctx: CounterTrendCtx,
+): CounterTrendVerdict {
+  if (biasDir === "NEUTRAL" || biasDir === trig.dir) {
+    return { allowed: true, reason: "", factors: [] };
+  }
+  const bull = trig.dir === "BUY";
+  const lastBar = ctx.bars[ctx.bars.length - 1];
+  const tfSec = TF_SEC[ctx.tf] ?? 900;
+  const factors: string[] = [];
+  if (ctx.structure.events.some((e) =>
+    e.label === "CHoCH" && (bull ? e.dir === "up" : e.dir === "down") && lastBar.t - e.t <= 6 * tfSec,
+  )) factors.push("counter_choch");
+  if (rsiDivergence(ctx.bars, ctx.rsiArr, bull)) factors.push("counter_divergence");
+  if (bull ? ctx.pd.state === "discount" : ctx.pd.state === "premium") factors.push("counter_ote");
+  if (ctx.pools.some((p) =>
+    (bull ? p.side === "SSL" : p.side === "BSL") && p.sweptT != null && lastBar.t - p.sweptT <= 3 * tfSec,
+  )) factors.push("counter_sweep");
+  const allowed = trig.quality >= 0.62 && factors.length > 0;
+  const ev = factors.map((f) => f.replace("counter_", "")).join("/") || "no choch/div/ote/sweep evidence";
+  return {
+    allowed,
+    reason: allowed
+      ? `counter-trend qualified (q=${trig.quality.toFixed(2)} + ${ev})`
+      : `counter-trend blocked (bias ${biasDir} vs ${trig.dir}, q=${trig.quality.toFixed(2)}, ${ev})`,
+    factors,
+  };
+}
+
+/** v16.9 (§5.7): 5-bar EMA of the ATR series (caller excludes the trigger
+ *  bar) — one stale aPrev under-sized the SFP wick threshold in vol
+ *  expansion (false SFPs) and over-sized it in contraction (missed ones). */
+export function atrSmooth(atrArr: (number | null)[], n = 5): number {
+  const tail: number[] = [];
+  for (let i = atrArr.length - 1; i >= 0 && tail.length < 12; i--) {
+    if (atrArr[i] != null) tail.unshift(atrArr[i] as number);
+  }
+  if (tail.length < n) return 0;
+  return (last(ema(tail, n)) as number) || 0;
+}
+
+/** v16.9 (§5.10/A4): factor clusters for the confluence bonus — each
+ *  cluster contributes at most its cap, so double-counted trend reads
+ *  (bias + mtf + structure + htf) can't inflate confidence alone, and
+ *  tick-volume factors (broker-relative on XAUUSD) count for nothing. */
+const FACTOR_CLUSTERS: { names: Set<string>; cap: number }[] = [
+  { names: new Set(["bias_aligned", "mtf_aligned", "structure_tf", "htf_structure"]), cap: 2 }, // trend
+  { names: new Set(["liquidity_sweep", "ob_retest", "zone", "fresh_zone", "counter_sweep"]), cap: 2 }, // liquidity
+  { names: new Set(["rsi_aligned", "displacement", "sfp_rejection", "zone_rejection", "trend_pullback", "counter_choch", "counter_divergence"]), cap: 2 }, // momentum
+  { names: new Set(["prime_session", "premium_discount", "counter_ote"]), cap: 1 }, // timing
+];
+function countClustered(factors: string[]): number {
+  return FACTOR_CLUSTERS.reduce((sum, c) => sum + Math.min(c.cap, factors.filter((f) => c.names.has(f)).length), 0);
 }
 
 // ═══════════════════════ geometry (setup-true SL/TP) ═══════════════════════
@@ -285,7 +429,15 @@ export function detectPullback(
 const SL_PAD_ATR = 0.5;
 const LIQ_PROTECT_ATR = 0.12;
 const TP_MIN_RR = 0.8;
-const TP_FLOOR_RR = 1.0;
+/** v16.9 (§5.5/B3): TP1 floor raised 1.0 → 1.2R — a 1.0R bank doesn't pay
+ *  for a 45–55% miss rate on gold. */
+const TP_FLOOR_RR = 1.2;
+/** v16.9 (§5.5): TP1 (the bank, 50% off) caps at 2.0R; the TP2 RUNNER
+ *  runs to the next measured structure up to 3.5R. The old flat 2.0R/2.5R
+ *  caps cut every real runner short while SL risk ran to 1.8 ATR —
+ *  asymmetric by construction. */
+const TP_BANK_CAP_RR = 2.0;
+const TP_RUNNER_CAP_RR = 3.5;
 const MAX_RISK_ATR = 1.8;
 /** v16.8: a stop closer than half an ATR is wick-food by construction —
  *  the old 0.28 floor let "risk too small vs spread" be the only guard. */
@@ -302,7 +454,10 @@ export const MAX_ENTRY_DIST_ATR = 0.75;
 export interface Geometry {
   entry: number;
   sl: number;
+  /** TP1 — the bank (50% off here) */
   tp: number;
+  /** TP2 — the runner (rest rides to the next structure, ≤ 3.5R) */
+  tp2: number;
   rr: number;
   targetNote: string;
   /** v16.7: |entry − price| / ATR at trigger time — the price-anchored
@@ -331,7 +486,6 @@ export function setupGeometry(
   const bull = trig.dir === "BUY";
   const asOfT = bars[bars.length - 1].t;
   const price = bars[bars.length - 1].c;
-  const scalp = tf === "M1" || tf === "M5";
   const pad = SL_PAD_ATR * a + 0.5 * spread; // structure pad + spread allowance
   let entry: number;
   let sl: number;
@@ -392,21 +546,35 @@ export function setupGeometry(
   const valid = targets
     .filter((t) => (bull ? t.price > entry + TP_MIN_RR * risk : t.price < entry - TP_MIN_RR * risk))
     .sort((x, y) => (bull ? x.price - y.price : y.price - x.price));
-  const capR = scalp ? 2.0 : 2.5;
+  // ── v16.9 PARTIAL TP LADDER (§5.5/B3) ──
+  //   TP1 (`tp`) — the bank: first real structure target, floored 1.2R,
+  //                capped 2.0R — 50% comes off here
+  //   TP2         — the runner: the NEXT structure beyond TP1, capped
+  //                3.5R; fallback = TP1 + 1R (or 1.5R/2.5R with no target)
   let tp: number;
+  let tp2: number;
   let targetNote: string;
   if (valid.length) {
     tp = bull ? valid[0].price - 0.15 * a : valid[0].price + 0.15 * a;
     targetNote = valid[0].note;
+    tp2 = valid[1]
+      ? (bull ? valid[1].price - 0.15 * a : valid[1].price + 0.15 * a)
+      : (bull ? tp + risk : tp - risk);
   } else {
-    tp = bull ? entry + 1.4 * risk : entry - 1.4 * risk;
-    targetNote = "fallback 1.4R";
+    tp = bull ? entry + 1.5 * risk : entry - 1.5 * risk;
+    tp2 = bull ? entry + 2.5 * risk : entry - 2.5 * risk;
+    targetNote = "fallback ladder 1.5R/2.5R";
   }
   const rrRaw = Math.abs(tp - entry) / risk;
   if (rrRaw < TP_FLOOR_RR) tp = bull ? entry + TP_FLOOR_RR * risk : entry - TP_FLOOR_RR * risk;
-  if (rrRaw > capR) tp = bull ? entry + capR * risk : entry - capR * risk;
+  if (rrRaw > TP_BANK_CAP_RR) tp = bull ? entry + TP_BANK_CAP_RR * risk : entry - TP_BANK_CAP_RR * risk;
+  // TP2 sits strictly beyond TP1, inside the runner cap
+  if (bull ? tp2 <= tp : tp2 >= tp) tp2 = bull ? tp + risk : tp - risk;
+  if (Math.abs(tp2 - entry) / risk > TP_RUNNER_CAP_RR) {
+    tp2 = bull ? entry + TP_RUNNER_CAP_RR * risk : entry - TP_RUNNER_CAP_RR * risk;
+  }
   const rr = Math.abs(tp - entry) / risk;
-  return { entry, sl, tp, rr, targetNote, entryDistAtr: Math.abs(entry - price) / (a || 1) };
+  return { entry, sl, tp, tp2, rr, targetNote, entryDistAtr: Math.abs(entry - price) / (a || 1) };
 }
 
 // ═══════════════════════ soft-check bundle ═══════════════════════
@@ -437,6 +605,10 @@ export function softChecks(
     spreadBps: number;
     mtfAligned: boolean;
     volZNow: number;
+    /** v16.9: qualifier factors from counterTrendGate (counter_choch /
+     *  counter_divergence / counter_ote / counter_sweep) — merged into the
+     *  signal's factor list so the UI shows WHY a counter-trend fired. */
+    counterFactors?: string[];
   },
 ): SoftChecks {
   const bull = trig.dir === "BUY";
@@ -497,6 +669,8 @@ export function softChecks(
   if (trig.kind === "pullback") factors.push("trend_pullback");
   // displacement: trigger bar body ≥ 0.55 ATR (momentum behind the rejection)
   if (Math.abs(b.c - b.o) >= 0.55 * ctx.a) factors.push("displacement");
+  // v16.9: counter-trend qualifier evidence rides along for visibility
+  if (ctx.counterFactors?.length) factors.push(...ctx.counterFactors);
 
   const passed = checks.filter((c) => c.ok).length;
   return { checks, factors, passRatio: passed / checks.length };
@@ -555,6 +729,9 @@ export function evaluate(input: EngineInput): {
   const atrArr = atr(base, 14);
   const a = (last(atrArr) as number) || 0;
   const aPrev = (atrArr[atrArr.length - 2] as number) || a; // P4
+  // v16.9 (§5.7): the SFP wick threshold uses the SMOOTHED ATR (5-bar EMA,
+  // trigger bar excluded) — not one possibly-stale print
+  const aSfp = atrSmooth(atrArr.slice(0, -1)) || aPrev;
   const rsiArr = rsi(base, 14);
   const r = (last(rsiArr) as number) ?? 50;
   const ema21Arr = ema(closes, 21);
@@ -594,9 +771,9 @@ export function evaluate(input: EngineInput): {
   const pd = premiumDiscount(base, 60, price);
 
   // ── triggers (quality arbitration; direction from the trigger) ──
-  const trigSfp = detectSfp(base, aPrev, vz);
+  const trigSfp = detectSfp(base, aSfp, vz);
   const trigZone = detectZoneRetest(base, a, price, zones, biasDir);
-  const trigPullback = detectPullback(base, e21, e21Prev, a);
+  const trigPullback = detectPullback(base, e21, e21Prev, a, tf);
   const candidates = [trigSfp, trigZone, trigPullback].filter(Boolean) as TriggerResult[];
   // with-bias triggers win ties (bias as a tiebreak, not a gate)
   candidates.sort((x, y) => (y.quality + (biasDir === y.dir ? 0.1 : 0)) - (x.quality + (biasDir === x.dir ? 0.1 : 0)));
@@ -607,14 +784,16 @@ export function evaluate(input: EngineInput): {
   checks.push({ name: "Trigger", ok: !!best, value: best ? `${best.kind} ${best.dir} q=${best.quality.toFixed(2)}` : "none" });
   if (!best) nearMiss.push("no trigger (sweep / zone-retest / pullback)");
 
-  // ── v16.8 HARD COUNTER-TREND FILTER (user audit) ──
-  // The old code only shaved −0.05 confidence off a signal fighting the
-  // H1/H4 multi-source bias — those were the "এন্ট্রি নিলেই SL" trades: an
-  // M5 bullish wick inside a hard H4 downtrend is liquidity, not a reversal.
-  // Now: NO signal against a non-neutral bias, period. NEUTRAL bias (range
-  // regime) keeps both directions live.
+  // ── v16.9 COUNTER-TREND QUALIFIER (§5.1 — replaces v16.8's blanket
+  // block). The blanket filter also killed every REAL reversal: a CHoCH
+  // is counter-trend by definition, and the bias it fights lags 11+ bars
+  // (5/5 fractals). Now a counter-bias signal needs quality ≥ 0.62 AND
+  // hard reversal evidence (fresh CHoCH / RSI divergence / OTE side /
+  // fresh opposing sweep) — ONE shared rule with the walk-forward seeder.
+  let counter: CounterTrendVerdict | null = null;
   if (best && biasDir !== "NEUTRAL" && biasDir !== best.dir) {
-    nearMiss.push(`counter-trend blocked (bias ${biasDir} vs ${best.dir})`);
+    counter = counterTrendGate(best, biasDir, { bars: base, tf, rsiArr, structure, pools, pd });
+    if (!counter.allowed) nearMiss.push(counter.reason);
   }
 
   // ── HARD GATES ──
@@ -653,6 +832,7 @@ export function evaluate(input: EngineInput): {
       bars: base, tf, a, r, biasDir, structure,
       stH1, stH4, stM15, stM5, pools, zones, pd,
       spreadBps, mtfAligned, volZNow: vz,
+      counterFactors: counter?.factors,
     });
 
     // ── geometry ──
@@ -670,10 +850,18 @@ export function evaluate(input: EngineInput): {
         } else {
           // ── confidence: reference formula (0.45 + 0.5 × passRatio) ──
           let confidence = 0.45 + 0.5 * soft.passRatio;
-          if (soft.factors.length >= 5) confidence += 0.05;
+          // v16.9 (§5.10/A4): the confluence bonus counts factors by
+          // CLUSTER (trend ≤2 · liquidity ≤2 · momentum ≤2 · timing ≤1) —
+          // the old raw ≥5 count triple-credited trend alignment, and
+          // tick-volume factors (volume_surge/whale_pulse — broker-
+          // relative on XAUUSD) no longer buy confidence at all.
+          // Displacement (body ≥ 0.55 ATR) is the honest momentum tell
+          // and earns its own +0.04.
+          if (countClustered(soft.factors) >= 5) confidence += 0.05;
+          if (soft.factors.includes("displacement")) confidence += 0.04;
           if (best.quality >= 0.7) confidence += 0.03;
-          // (v16.8: the old −0.05 counter-trend penalty is gone — the hard
-          // filter above already blocks those signals outright)
+          // v16.9: qualified counter-trend pays a small honesty tax
+          if (counter) confidence -= 0.04;
           confidence = Math.max(0.4, Math.min(0.95, confidence));
 
           const entryType: "market" | "limit" =
@@ -688,6 +876,7 @@ export function evaluate(input: EngineInput): {
             entry: round(geo.entry, input.digits),
             sl: round(geo.sl, input.digits),
             tp: round(geo.tp, input.digits),
+            tp2: round(geo.tp2, input.digits),
             rr: round(geo.rr, 2),
             confidence: round(confidence, 3),
             status: entryType === "limit" ? "pending" : "active",

@@ -6,7 +6,7 @@
  */
 
 import type { Candle, RoadmapData, Tone } from "./types";
-import { atr, ema } from "./indicators";
+import { atr, ema, sessionOf } from "./indicators";
 import {
   detectStructure, detectLiquidity, premiumDiscount, type LiquidityPool, type StructureRead, type Zone,
 } from "./smc";
@@ -63,19 +63,31 @@ export function buildRoadmap(
   const swept = ctx.pools.find((p) => p.state === "swept");
   let direction: RoadmapData["direction"];
   let directionWhy: string;
-  // v16.8 (user audit): the draw-on-liquidity target is the NEAREST
-  // untouched pool by DISTANCE — pools arrive as [BSL..., SSL...] so the old
-  // find() hit the first BSL almost by construction and the roadmap read
-  // BULL regardless of where price actually sat. Near-tie (≤ 0.35 ATR):
-  // prefer the side the bias/structure already faces.
-  const untouchedRanked = ctx.pools
+  // v16.9 (audit §5.6): the draw-on-liquidity target is chosen by SCORE,
+  // not raw distance — score = recency × strength × (1/distance), with a
+  // same-session boost. The old pure-distance pick chased the nearest
+  // pool even when it was a stale Asian-session level the London tape no
+  // longer cares about; pools arrive as [BSL..., SSL...] so the pre-v16.8
+  // find() additionally hit the first BSL almost by construction.
+  const tfS = tfSec(tf);
+  const sessNow = sessionOf(lastBar.t);
+  const scored = ctx.pools
     .filter((p) => p.state === "untouched")
-    .map((p) => ({ p, d: Math.abs(p.price - price) }))
-    .sort((x, y) => x.d - y.d);
-  let nearestUntouched: LiquidityPool | null = untouchedRanked[0]?.p ?? null;
-  if (untouchedRanked.length >= 2) {
-    const [n1, n2] = untouchedRanked;
-    if (n2.d - n1.d <= 0.35 * a) {
+    .map((p) => {
+      const d = Math.abs(p.price - price);
+      const ageBars = Math.max(1, (lastBar.t - p.t) / tfS);
+      const recency = Math.pow(0.5, (ageBars - 1) / 24); // half-life: 24 bars of THIS tf
+      const strength = p.hits >= 2 ? 1 : 0.6; // equal-highs pools are stronger magnets
+      const sessionBoost = sessionOf(p.t) === sessNow && sessNow !== "off" ? 1.2 : 1;
+      const distScore = a > 0 ? Math.min(4, (2 * a) / Math.max(d, 1e-9)) : 0; // ~2 at 1 ATR, ~1 at 2 ATR
+      return { p, d, score: recency * strength * sessionBoost * distScore };
+    })
+    .sort((x, y) => y.score - x.score);
+  let nearestUntouched: LiquidityPool | null = scored[0]?.p ?? null;
+  // near-tie (scores within 15%): prefer the side the bias/structure faces
+  if (scored.length >= 2) {
+    const [n1, n2] = scored;
+    if (n2.score >= n1.score * 0.85) {
       const bullFace = ctx.biasDir === "BUY" || (ctx.biasDir === "NEUTRAL" && ctx.structure.trend === "bullish");
       const bearFace = ctx.biasDir === "SELL" || (ctx.biasDir === "NEUTRAL" && ctx.structure.trend === "bearish");
       if (bullFace && n2.p.side === "BSL") nearestUntouched = n2.p;
@@ -86,8 +98,9 @@ export function buildRoadmap(
     direction = swept.side === "SSL" ? "BULL" : "BEAR";
     directionWhy = `${swept.side} swept at ${swept.price.toFixed(2)} — expect draw back inside`;
   } else if (nearestUntouched) {
+    const pick = scored.find((s) => s.p === nearestUntouched);
     direction = nearestUntouched.side === "BSL" ? "BULL" : "BEAR";
-    directionWhy = `draw on liquidity — nearest untouched ${nearestUntouched.side} at ${nearestUntouched.price.toFixed(2)} (${(Math.abs(nearestUntouched.price - price) / a).toFixed(1)} ATR away)`;
+    directionWhy = `draw on liquidity — best-scored untouched ${nearestUntouched.side} at ${nearestUntouched.price.toFixed(2)} (${(Math.abs(nearestUntouched.price - price) / a).toFixed(1)} ATR away, score ${pick ? pick.score.toFixed(2) : "—"})`;
   } else if (ctx.biasDir === "BUY") {
     direction = "BULL";
     directionWhy = `multi-source bias ${(ctx.biasScore).toFixed(2)} (H1/H4 structure + EMA)`;

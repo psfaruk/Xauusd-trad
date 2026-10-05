@@ -26,13 +26,15 @@ export interface StructureRead {
 }
 
 /**
- * v16.8 (user audit) — MAJOR structure swings: 5-left/5-right fractals.
- * The old 2/2 fractals turned every M1/M5 micro-wick into a "swing", so
- * BOS/CHoCH fired on noise and the structure flipped every 2–3 minutes.
- * 5/5 = confirmed major structure (lag accepted: a swing confirms 5 bars
- * after its extreme — that is the price of a structure read that is real).
+ * v16.9 (audit §5.2) — MAJOR structure swings: 3-left/3-right fractals.
+ * History: 2/2 (v16.7) turned every micro-wick into a "swing"; v16.8 went
+ * to 5/5, but a swing confirming 5 bars late means 11+ bars of lag — on
+ * M5 that is ~an hour, and every real CHoCH reversal arrived AFTER the
+ * move was gone (the audit's "লেগি স্ট্রাকচার" finding). 3/3 keeps the
+ * major-structure filter (noise still needs 3 clean bars each side) while
+ * cutting confirmation lag to 3 bars.
  */
-export function detectStructure(bars: Candle[], left = 5, right = 5, maxEvents = 6): StructureRead {
+export function detectStructure(bars: Candle[], left = 3, right = 3, maxEvents = 6): StructureRead {
   const sw = swings(bars, left, right);
   // label swings HH/LH/HL/LL vs previous same-kind — in swing order, each
   // label remembered WITH its swing index so the event walk can vote the
