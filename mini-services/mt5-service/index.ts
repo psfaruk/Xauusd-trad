@@ -45,7 +45,7 @@ import { Server } from "socket.io";
 import { Mt5Manager } from "./src/manager";
 import { AiTrader, type TraderConfig } from "./src/trader";
 import { authorizeTradingReq, authorizeHandshake, rateLimit, clientIp } from "./src/auth";
-import { loadCredentials, saveCredentials, clearCredentials, maskLogin } from "./src/credentials";
+import { loadCredentials, saveCredentials, clearCredentials, maskLogin, credentialsStatus } from "./src/credentials";
 
 const IO_PORT = 3030;
 const REST_PORT = 3031;
@@ -333,9 +333,13 @@ const restServer = createServer((req, res) => {
     // GET and HEAD both serve it (Node's ServerResponse discards the body on
     // HEAD automatically — the probes' headers-only checks work as-is).
     if (url.pathname === "/health" || url.pathname === "/healthz") {
+      // audit P2: masked credential-store diagnostics — configured flag, key
+      // version + key SOURCE (never key material), savedAt and the masked
+      // login only. Zero passwords, zero full logins, zero secrets.
       return json(res, 200, {
         ok: true, service: "mt5-service", source: manager.source,
         connected: manager.connected, uptime: Math.floor(process.uptime()),
+        credentials: credentialsStatus(),
       });
     }
     if (url.pathname === "/api/status") {

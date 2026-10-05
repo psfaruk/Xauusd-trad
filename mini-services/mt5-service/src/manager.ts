@@ -13,6 +13,7 @@
 
 import { Mt5WsClient, TF_CODE, type SymbolInfo, type AccountInfo, type Mt5Position, type Mt5Order, type Mt5Deal, type TradeResult, type TradeSide, type BrokerPush } from "./mt5-client";
 import { FlowTracker, TickRecorder, type FlowPayload } from "./flow";
+import { maskLogin } from "./credentials";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -40,17 +41,149 @@ export interface StatusPayload {
 
 /** Verified access IPs for Exness-MT5Trial6 (PROTOCOL.md, 2026-09-27).
  *  Any OTHER server's IPs are resolved live via the MetaQuotes broker
- *  directory (search.mtapi.io) — the exact discovery an MT5 terminal does —
- *  and cached with the stored credentials. */
+ *  directory under the hardened discovery contract below (audit P2) and
+ *  cached with the stored credentials. */
 const TRIAL6_GATEWAYS = [
   "47.130.41.116", "57.182.183.85", "16.79.3.122", "18.61.99.175",
   "8.219.172.6", "47.236.224.248", "47.81.62.132", "43.210.112.100",
   "35.154.31.85",
 ];
 
+// ── discovery hardening (audit P2: external discovery dependency) ──
+// The broker directory is an EXTERNAL endpoint this service used to trust
+// over plain http with no allowlist, no retry and no result validation.
+
+/** Strict dot-quad parse → octets, or null when malformed (bad shape,
+ *  out-of-range octets, leading zeros). Anything unparseable is dropped. */
+function ipv4Octets(ip: string): [number, number, number, number] | null {
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(ip);
+  if (!m) return null;
+  const out: [number, number, number, number] = [0, 0, 0, 0];
+  for (let i = 0; i < 4; i++) {
+    const s = m[i + 1];
+    if (s.length > 1 && s.startsWith("0")) return null; // strict: no "010" style
+    const n = Number(s);
+    if (!Number.isInteger(n) || n > 255) return null;
+    out[i] = n;
+  }
+  return out;
+}
+
+/** Public-unicast IPv4 test — rejects 0.0.0.0/8 ("this network"),
+ *  10.0.0.0/8 + 172.16.0.0/12 + 192.168.0.0/16 (RFC1918 private),
+ *  100.64.0.0/10 (CGNAT), 127.0.0.0/8 (loopback), 169.254.0.0/16
+ *  (link-local), 224.0.0.0/4 (multicast) and 240.0.0.0/4 (reserved,
+ *  incl. 255.255.255.255). */
+function isPublicIpv4(ip: string): boolean {
+  const o = ipv4Octets(ip);
+  if (!o) return false;
+  const [a, b] = o;
+  if (a === 0 || a === 10 || a === 127) return false;
+  if (a === 100 && b >= 64 && b <= 127) return false; // 100.64.0.0/10 CGNAT
+  if (a === 169 && b === 254) return false;           // 169.254.0.0/16
+  if (a === 172 && b >= 16 && b <= 31) return false;  // 172.16.0.0/12
+  if (a === 192 && b === 168) return false;           // 192.168.0.0/16
+  if (a >= 224) return false;                         // 224.0.0.0/4 + 240.0.0.0/4
+  return true;
+}
+
+/** Expand a strict IPv6 literal to its 8 numeric groups, or null when
+ *  invalid (double compression, wrong group count, bad hex, zone ids).
+ *  Embedded IPv4 tails (::ffff:1.2.3.4) are folded into their hex groups. */
+function ipv6Groups(ip: string): number[] | null {
+  if (!ip.includes(":") || ip.includes("%")) return null; // zone ids rejected
+  let s = ip;
+  const v4 = /^(.*):(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/.exec(s);
+  if (v4) {
+    const oct = ipv4Octets(v4[2]);
+    if (!oct) return null;
+    s = `${v4[1]}:${((oct[0] << 8) | oct[1]).toString(16)}:${((oct[2] << 8) | oct[3]).toString(16)}`;
+  }
+  const halves = s.split("::");
+  if (halves.length > 2) return null;
+  const parse = (part: string): number[] | null => {
+    if (!part) return [];
+    const gs: number[] = [];
+    for (const g of part.split(":")) {
+      if (!/^[0-9a-fA-F]{1,4}$/.test(g)) return null;
+      gs.push(parseInt(g, 16));
+    }
+    return gs;
+  };
+  const head = parse(halves[0]);
+  if (!head) return null;
+  const tail = halves.length === 2 ? parse(halves[1]) : [];
+  if (!tail) return null;
+  if (halves.length === 2) {
+    if (head.length + tail.length > 7) return null; // "::" must cover ≥1 group
+    const zeros = new Array<number>(8 - head.length - tail.length).fill(0);
+    return [...head, ...zeros, ...tail];
+  }
+  return head.length === 8 ? head : null;
+}
+
+/** Public-unicast IPv6 test — rejects ::/96 (unspecified "::", loopback
+ *  "::1", deprecated v4-compatible), fc00::/7 (unique-local), fe80::/10
+ *  (link-local) and ff00::/8 (multicast). IPv4-mapped ::ffff:x.x.x.x
+ *  addresses are unwrapped and re-checked with the IPv4 rules. */
+function isPublicIpv6(ip: string): boolean {
+  const g = ipv6Groups(ip);
+  if (!g || g.length !== 8) return false;
+  if (g[0] === 0 && g[1] === 0 && g[2] === 0 && g[3] === 0 && g[4] === 0 && g[5] === 0xffff) {
+    // IPv4-mapped — unwrap the embedded IPv4 and re-check it
+    return isPublicIpv4(`${g[6] >> 8}.${g[6] & 0xff}.${g[7] >> 8}.${g[7] & 0xff}`);
+  }
+  if (g.slice(0, 6).every((x) => x === 0)) return false; // ::, ::1, ::x.y
+  if ((g[0] & 0xfe00) === 0xfc00) return false;          // fc00::/7
+  if ((g[0] & 0xffc0) === 0xfe80) return false;          // fe80::/10
+  if ((g[0] & 0xff00) === 0xff00) return false;          // ff00::/8
+  return true;
+}
+
+/** SSRF guard for discovery RESULTS (untrusted input): keep only
+ *  strict-format public unicast addresses, deduped. A tampered endpoint
+ *  must never be able to aim the WS client at internal addresses. */
+function filterPublicIps(candidates: string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const cand of candidates) {
+    const ip = String(cand ?? "").trim();
+    if (!ip || seen.has(ip)) continue;
+    const ok = ip.includes(":") ? isPublicIpv6(ip) : isPublicIpv4(ip);
+    if (!ok) continue;
+    seen.add(ip);
+    out.push(ip);
+  }
+  return out;
+}
+
 /** Resolve a server name (e.g. "Exness-MT5Real8") to its access IPs.
+ *
+ *  Hardened contract (audit P2 — discovery is an EXTERNAL dependency this
+ *  service must not blindly trust):
+ *   · MT5_DISCOVERY_URL — endpoint, default https://search.mtapi.io/Search.
+ *     MUST be https: — a non-https configuration throws immediately (fail
+ *     closed; never a silent fallback to plain http).
+ *   · MT5_DISCOVERY_ALLOW_HOST — discovery-hostname allowlist (default:
+ *     exactly "search.mtapi.io"; comma-separated list allowed). Any other
+ *     host throws — blocks URL/userinfo tricks that redirect the lookup.
+ *   · MT5_DISCOVERY_ENABLED=0 — opt-out for offline/private installs: no
+ *     network call at all; resolution falls through to MT5_GATEWAYS.
+ *   · MT5_GATEWAYS — manual fallback configuration: comma-separated
+ *     IPs/hostnames used when discovery is disabled or unreachable.
+ *     Operator-trusted, so NOT run through the public-IP filter (private
+ *     installs may legitimately point at LAN gateways).
+ *   · Retry: up to 2 attempts, each with a 6s timeout. Only network
+ *     errors, 5xx and malformed bodies consume an attempt — a clean 200
+ *     without the requested server is a definitive "not found".
+ *   · SSRF guard on results: every discovered IP must be a strict-format
+ *     PUBLIC unicast address (see filterPublicIps); private, loopback,
+ *     link-local, CGNAT, multicast and reserved ranges (v4 and v6) are
+ *     dropped, and an all-filtered answer throws.
+ *
  *  Throws a human-readable error when the server is unknown — the connect
- *  endpoint surfaces it straight into the Settings form. */
+ *  endpoint surfaces it straight into the Settings form. Logging is one
+ *  concise line per resolution; NEVER credentials. */
 export async function resolveGateways(server: string): Promise<string[]> {
   // cheap sanity gate: 3–64 chars of letters/digits/dash/dot/underscore.
   // Discovery itself decides whether the server truly exists.
@@ -58,34 +191,117 @@ export async function resolveGateways(server: string): Promise<string[]> {
     throw new Error(`invalid server name "${server}"`);
   }
   if (/^Exness-MT5Trial6$/i.test(server)) return [...TRIAL6_GATEWAYS];
-  try {
-    const r = await fetch(
-      `http://search.mtapi.io/Search?company=${encodeURIComponent(server)}&mt5=true`,
-      { signal: AbortSignal.timeout(6000) },
+
+  const discoveryUrl = (process.env.MT5_DISCOVERY_URL ?? "https://search.mtapi.io/Search").trim();
+  const allowHosts = (process.env.MT5_DISCOVERY_ALLOW_HOST ?? "search.mtapi.io")
+    .split(",").map((h) => h.trim().toLowerCase()).filter(Boolean);
+  if (!allowHosts.length) allowHosts.push("search.mtapi.io");
+  const manualGateways = (process.env.MT5_GATEWAYS ?? "")
+    .split(",").map((g) => g.trim()).filter(Boolean);
+  const discoveryEnabled = process.env.MT5_DISCOVERY_ENABLED !== "0";
+
+  const fail = (msg: string): never => {
+    console.log("[mt5] discovery:", server, "→", msg);
+    throw new Error(msg);
+  };
+
+  // opt-out: offline / private installs never touch the network
+  if (!discoveryEnabled) {
+    if (manualGateways.length) {
+      console.log("[mt5] discovery:", server, "→", manualGateways.length, "gateways (MT5_GATEWAYS — discovery disabled)");
+      return manualGateways;
+    }
+    return fail(
+      `server "${server}" not found — live discovery disabled (MT5_DISCOVERY_ENABLED=0) and no manual gateways configured (set MT5_GATEWAYS=ip1,ip2)`,
     );
-    if (r.ok) {
-      const j = (await r.json()) as {
-        result?: { results?: { name?: string; access?: string[] }[] }[];
-      };
-      for (const block of j.result ?? []) {
-        for (const s of block.results ?? []) {
-          if (
-            s.name === server &&
-            Array.isArray(s.access) && s.access.length
-          ) {
-            const ips = s.access
-              .map((a) => String(a).split(":")[0])
-              .filter(Boolean);
-            if (ips.length) return ips;
-          }
+  }
+
+  // fail CLOSED on config, before any network call: https-only + allowlist
+  let base: URL;
+  try {
+    base = new URL(discoveryUrl);
+  } catch {
+    return fail(`invalid MT5_DISCOVERY_URL "${discoveryUrl}"`);
+  }
+  if (base.protocol !== "https:") {
+    return fail(`discovery endpoint must be https (got ${discoveryUrl})`);
+  }
+  if (!allowHosts.includes(base.hostname)) {
+    return fail(`discovery host ${base.hostname} not allowlisted (set MT5_DISCOVERY_ALLOW_HOST to override)`);
+  }
+
+  // live discovery — ≤ 2 attempts, 6s timeout each. Only network errors,
+  // 5xx and malformed bodies consume an attempt; a parsed 200 is definitive.
+  let resolved: string[] | null = null; // discovery's answer (public IPs only)
+  let emptyAnswer = false;              // answered, but every IP was filtered
+  let answered = false;                 // got a clean, parseable 200
+  let lastErr = "";
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    let r: Response;
+    try {
+      const u = new URL(base);
+      u.searchParams.set("company", server);
+      u.searchParams.set("mt5", "true");
+      r = await fetch(u, { signal: AbortSignal.timeout(6000) });
+    } catch (e) {
+      lastErr = `network: ${String((e as Error)?.message ?? "error").slice(0, 120)}`;
+      continue;
+    }
+    if (r.status >= 500) {
+      lastErr = `http ${r.status}`;
+      continue; // 5xx — retry
+    }
+    if (!r.ok) {
+      lastErr = `http ${r.status}`;
+      break; // 4xx — the endpoint refused; retrying cannot help
+    }
+    let j: { result?: { results?: { name?: string; access?: string[] }[] }[] };
+    try {
+      j = (await r.json()) as { result?: { results?: { name?: string; access?: string[] }[] }[] };
+    } catch {
+      lastErr = "malformed response";
+      continue; // garbage body — retry once
+    }
+    answered = true;
+    for (const block of j.result ?? []) {
+      for (const s of block.results ?? []) {
+        if (
+          s.name === server &&
+          Array.isArray(s.access) && s.access.length
+        ) {
+          const ips = filterPublicIps(s.access.map((a) => String(a).split(":")[0]));
+          if (ips.length) resolved = ips;
+          else emptyAnswer = true;
+          break;
         }
       }
+      if (resolved || emptyAnswer) break;
     }
-  } catch {
-    /* discovery unreachable → fall through to the error */
+    break; // a parsed 200 is a definitive answer — never retry it
   }
-  throw new Error(
-    `server "${server}" not found — check the exact name in your MT5 app (e.g. Exness-MT5Trial6)`,
+
+  if (resolved) {
+    console.log("[mt5] discovery:", server, "→", resolved.length, "gateways");
+    return resolved;
+  }
+  if (emptyAnswer) {
+    return fail(
+      `all resolved gateways for "${server}" were rejected (non-public addresses) — the discovery response may be tampered`,
+    );
+  }
+  if (answered) {
+    return fail(
+      `server "${server}" not found — check the exact name in your MT5 app (e.g. Exness-MT5Trial6)`,
+    );
+  }
+  // discovery unreachable / refused → manual fallback (the audit's "fallback
+  // configuration"), else the standard not-found error
+  if (manualGateways.length) {
+    console.log("[mt5] discovery:", server, "→", manualGateways.length, `gateways (MT5_GATEWAYS fallback — discovery ${lastErr || "unreachable"})`);
+    return manualGateways;
+  }
+  return fail(
+    `server "${server}" not found — discovery unreachable (${lastErr || "no route"}); configure MT5_GATEWAYS=ip1,ip2 as a manual fallback`,
   );
 }
 
@@ -540,8 +756,10 @@ export class Mt5Manager {
       this.firstFailAt = 0; // recovered — reset the wedge clock
       this.cache.clear(); // server/account switchover → fresh data
       this.emitStatus();
+      // audit P2 (credential-log audit): the FULL account number never goes
+      // to the logs either — masked form only, same as the API payloads
       console.log(
-        `[mt5] connected via ${gw} — account ${this.login} (${acct.balance.toFixed(2)} ${acct.currency}), ${symbols.size} symbols, watching ${w.length}`,
+        `[mt5] connected via ${gw} — account ${maskLogin(this.login) ?? "—"} (${acct.balance.toFixed(2)} ${acct.currency}), ${symbols.size} symbols, watching ${w.length}`,
       );
 
       client.onClose(() => {

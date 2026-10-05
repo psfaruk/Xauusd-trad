@@ -2,6 +2,13 @@
  * Next.js instrumentation — runs once when the server process boots.
  *
  * Boot responsibilities, in order:
+ *   0. Production fail-closed auth gate (audit Phase 0, lib/env.ts
+ *      assertProductionEnv) — a production boot with NEITHER
+ *      APP_PASSWORD NOR TRADER_API_KEY THROWS here, aborting startup.
+ *      Deliberately OUTSIDE any try/catch: the throw IS the feature.
+ *      No-op in development and during `next build`
+ *      (NEXT_PHASE=phase-production-build) so CI/Docker image builds
+ *      never see APP_PASSWORD and still pass.
  *   1. Environment validation (audit §4.2, lib/env.ts) — a missing
  *      required var is reported HERE, at boot, with a clear message —
  *      not later as a stack trace inside some route. Production refuses
@@ -28,6 +35,15 @@
 
 export async function register() {
   if (process.env.NEXT_RUNTIME !== "nodejs") return;
+
+  // ── 0. production fail-closed auth gate (audit Phase 0) ──
+  // MUST run before any try/catch — a throw from assertProductionEnv()
+  // propagates out of register() and aborts server startup (fail-closed).
+  // NODE_ENV=development dev server: never reaches the throw (no-op).
+  if (process.env.NODE_ENV === "production") {
+    const { assertProductionEnv } = await import("./lib/env");
+    assertProductionEnv();
+  }
 
   // ── 1. environment validation (audit §4.2) ──
   try {

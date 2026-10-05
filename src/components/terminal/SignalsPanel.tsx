@@ -104,6 +104,7 @@ export function SignalsPanel({ analysis }: { analysis: AnalysisResponse | null }
             <SignalCard
               sig={sig}
               digits={digits}
+              liveSpread={analysis?.spread}
               selected={selectedSignalId === sig.id}
               onSelect={() => setSelectedSignalId(selectedSignalId === sig.id ? null : sig.id ?? null)}
             />
@@ -306,16 +307,27 @@ export function SignalsPanel({ analysis }: { analysis: AnalysisResponse | null }
 function SignalCard({
   sig,
   digits,
+  liveSpread,
   selected,
   onSelect,
 }: {
   sig: SignalPayload;
   digits: number;
+  /** v17.0: the analysis payload's live spread — shown next to the
+   *  spread captured at signal time so cost drift is visible */
+  liveSpread?: number;
   selected: boolean;
   onSelect: () => void;
 }) {
   const { t } = useI18n();
   const bull = sig.direction === "BUY";
+  const risk = Math.abs(sig.entry - sig.sl);
+  const spreadAt = sig.spreadAt ?? liveSpread;
+  const spreadLive = liveSpread != null && sig.spreadAt != null && Math.abs((liveSpread ?? 0) - sig.spreadAt) > 1e-9
+    ? liveSpread
+    : null;
+  const fmtT = (sec: number) =>
+    new Date(sec * 1000).toISOString().slice(11, 16) + " UTC";
   return (
     <button
       onClick={onSelect}
@@ -349,7 +361,19 @@ function SignalCard({
         >
           {t(sig.status)}
         </span>
+        {/* v17.0: source TF + creation time — the audit's "timestamp, source" */}
+        <span className="tnum ml-auto font-mono text-[9px] text-muted-foreground">
+          {sig.timeframe} · {(sig.createdAt ?? new Date().toISOString()).slice(5, 16).replace("T", " ")}
+        </span>
       </div>
+      {/* v17.0: lifecycle sentence — what keeps this signal alive */}
+      {(sig.status === "active" || sig.status === "pending") && (
+        <p className="mb-2 text-[9px] font-semibold uppercase tracking-wider text-muted-foreground/80">
+          {sig.status === "active"
+            ? t("cardHolding")
+            : `${t("cardPending")}${sig.expiryBars != null ? ` · ${sig.expiryBars} ${t("cardBars")}` : ""}`}
+        </p>
+      )}
       {/* v16.9 (audit §5.5): the partial TP ladder — TP2 (runner) rides next
           to the bank target when the signal carries one */}
       <div className={cn("grid gap-2", sig.tp2 != null ? "grid-cols-5" : "grid-cols-4")}>
@@ -375,11 +399,67 @@ function SignalCard({
           />
         </div>
       </div>
+
+      {/* ── v17.0 (audit P2): WHY / INVALIDATION / COSTS / SOURCE ── */}
       {sig.entryNote && (
-        <p className="mt-2 text-[10px] leading-snug text-muted-foreground">{sig.entryNote}</p>
+        <div className="mt-2.5 rounded-md border border-border/70 bg-muted/20 px-2 py-1.5">
+          <div className="mb-0.5 text-[8px] font-bold uppercase tracking-wider text-muted-foreground/70">
+            {t("cardWhy")}
+          </div>
+          <p className="text-[10px] leading-snug text-muted-foreground">{sig.entryNote}</p>
+        </div>
+      )}
+      <div className="mt-2 rounded-md border border-down/20 bg-down/5 px-2 py-1.5">
+        <div className="mb-0.5 flex items-center justify-between">
+          <span className="text-[8px] font-bold uppercase tracking-wider text-muted-foreground/70">
+            {t("cardInvalidation")}
+          </span>
+          <span className="tnum font-mono text-[10px] font-bold text-down">{sig.sl.toFixed(digits)}</span>
+        </div>
+        <p className="text-[9px] leading-snug text-muted-foreground/80">{t("cardInvalidationHint")}</p>
+      </div>
+      <div className="mt-2 grid grid-cols-3 gap-2 rounded-md border border-border/70 bg-card/40 px-2 py-1.5">
+        <div>
+          <div className="text-[8px] font-bold uppercase tracking-wider text-muted-foreground/60">{t("cardSpread")}</div>
+          <div className="tnum font-mono text-[10px] font-bold text-foreground">
+            {spreadAt != null ? spreadAt.toFixed(digits) : "—"}
+            {spreadLive != null && (
+              <span className="ml-1 font-normal text-muted-foreground" title={t("cardSpreadLive")}>
+                ({spreadLive.toFixed(digits)})
+              </span>
+            )}
+          </div>
+        </div>
+        <div>
+          <div className="text-[8px] font-bold uppercase tracking-wider text-muted-foreground/60">{t("cardAtr")}</div>
+          <div className="tnum font-mono text-[10px] font-bold text-foreground">
+            {sig.atrAt != null ? (
+              <>
+                {sig.atrAt.toFixed(digits)}
+                <span className="ml-1 font-normal text-muted-foreground">({(risk / sig.atrAt).toFixed(1)}×ATR)</span>
+              </>
+            ) : (
+              `1R ${risk.toFixed(digits)}`
+            )}
+          </div>
+        </div>
+        <div>
+          <div className="text-[8px] font-bold uppercase tracking-wider text-muted-foreground/60">{t("cardRiskPerTrade")}</div>
+          <div className="tnum font-mono text-[10px] font-bold text-foreground">1R = {risk.toFixed(digits)}</div>
+        </div>
+      </div>
+      {sig.sourceBar && (
+        <div className="mt-2 flex items-center justify-between gap-2 rounded-md border border-border/70 bg-muted/10 px-2 py-1">
+          <span className="shrink-0 text-[8px] font-bold uppercase tracking-wider text-muted-foreground/60">
+            {t("cardSourceBar")}
+          </span>
+          <span className="tnum truncate font-mono text-[9px] text-muted-foreground">
+            {fmtT(sig.sourceBar.t)} · O {sig.sourceBar.o.toFixed(digits)} H {sig.sourceBar.h.toFixed(digits)} L {sig.sourceBar.l.toFixed(digits)} C {sig.sourceBar.c.toFixed(digits)}
+          </span>
+        </div>
       )}
       {sig.targetNote && (
-        <p className="mt-0.5 text-[10px] leading-snug text-muted-foreground/70">
+        <p className="mt-2 text-[10px] leading-snug text-muted-foreground/70">
           {t("takeProfit")}: {sig.targetNote}
         </p>
       )}

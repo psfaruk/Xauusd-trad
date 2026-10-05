@@ -35,6 +35,22 @@ export interface Layers {
   ai: boolean;
 }
 
+/** v17.0 (audit §dedup) — the ink filters: how much auto-ink the chart
+ *  shows. Layers are coarse on/off switches; these are the fine controls
+ *  for the level-clustering pass: the visible-level budget, HTF-sourced
+ *  ink, faded/stale ink, and absorbed merge duplicates. */
+export interface InkFilters {
+  /** how many clustered level winners show at once (rank-ordered, 1 =
+   *  nearest to price) — the audit's "default visible count সীমাবদ্ধ" */
+  maxLevels: number;
+  /** show H1/H4-sourced drawings on the active chart */
+  htf: boolean;
+  /** show faded/mitigated/broken/swept ink */
+  faded: boolean;
+  /** show the duplicates the clustering absorbed (default: hidden) */
+  merged: boolean;
+}
+
 interface TerminalState {
   symbol: string;
   timeframe: string;
@@ -43,6 +59,7 @@ interface TerminalState {
   autoView: AutoView;
   tool: ToolId;
   layers: Layers;
+  ink: InkFilters;
   selectedSignalId: string | null;
   setSymbol: (s: string) => void;
   setTimeframe: (tf: string) => void;
@@ -53,12 +70,17 @@ interface TerminalState {
   openChart: (symbol?: string) => void;
   setTool: (t: ToolId) => void;
   toggleLayer: (k: keyof Layers) => void;
+  setInk: (patch: Partial<InkFilters>) => void;
   setSelectedSignalId: (id: string | null) => void;
 }
 
 const DEFAULT_LAYERS: Layers = {
   ema: true, killzones: true, zones: true, levels: true,
   structure: true, volume: true, setup: true, signals: true, ai: true,
+};
+
+const DEFAULT_INK: InkFilters = {
+  maxLevels: 8, htf: true, faded: true, merged: false,
 };
 
 const savedLayers = (): Layers => {
@@ -76,6 +98,23 @@ const savedLayers = (): Layers => {
     }
   } catch {}
   return DEFAULT_LAYERS;
+};
+
+/** persisted ink filters (v17.0) — same pattern as layers */
+const savedInk = (): InkFilters => {
+  if (typeof window === "undefined") return DEFAULT_INK;
+  try {
+    const raw = localStorage.getItem("aurum-ink");
+    if (raw) {
+      const parsed = JSON.parse(raw) as Partial<InkFilters>;
+      return {
+        ...DEFAULT_INK,
+        ...parsed,
+        maxLevels: Math.min(16, Math.max(3, Number(parsed.maxLevels ?? DEFAULT_INK.maxLevels) || DEFAULT_INK.maxLevels)),
+      };
+    }
+  } catch {}
+  return DEFAULT_INK;
 };
 
 /** persisted chart view (migrates the old aurum-chart-type "area" value) */
@@ -107,6 +146,7 @@ export const useTerminal = create<TerminalState>((set, get) => ({
   autoView: savedAutoView(),
   tool: "cursor",
   layers: savedLayers(),
+  ink: savedInk(),
   selectedSignalId: null,
   setSymbol: (symbol) => set({ symbol, selectedSignalId: null }),
   setTimeframe: (timeframe) => set({ timeframe }),
@@ -130,6 +170,13 @@ export const useTerminal = create<TerminalState>((set, get) => ({
       localStorage.setItem("aurum-layers", JSON.stringify(layers));
     } catch {}
     set({ layers });
+  },
+  setInk: (patch) => {
+    const ink = { ...get().ink, ...patch };
+    try {
+      localStorage.setItem("aurum-ink", JSON.stringify(ink));
+    } catch {}
+    set({ ink });
   },
   setSelectedSignalId: (selectedSignalId) => set({ selectedSignalId }),
 }));

@@ -71,4 +71,15 @@ RUN chmod +x ./start-railway.sh
 # previously misled operators into typing "80" as the domain target port —
 # nothing listens on 80, so the domain 502'd. The ONLY public listener is
 # Caddy; Next.js + mt5-service bind 127.0.0.1 (see start-railway.sh).
+
+# audit Phase 0: container-level self-healing. The aggregate healthz
+# (app + database + mt5) is PUBLIC (middleware PUBLIC_PATHS) and
+# secret-free, so an unauthenticated loopback probe is all it takes.
+# `degraded` (MT5 down, app+DB alive) still answers 200 — a broker/MT5
+# outage is NOT fixed by restarting the container, so it does not trip
+# the check; only DB-down / dead server (503) marks the container
+# unhealthy. Operators wanting restarts on MT5 death too: the start
+# script's probe could add ?strict=1 (that mode 503s on degraded).
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 CMD curl -sf http://127.0.0.1:3000/api/healthz || exit 1
+
 CMD ["bash", "./start-railway.sh"]

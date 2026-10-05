@@ -5,6 +5,7 @@ import { expiryBarsFor } from "@/lib/market/engine";
 import { seedSignals } from "@/lib/market/seed";
 import { atr } from "@/lib/market/indicators";
 import { buildDrawings, magnetsToDrawings, projectSetup, localBias, buildPhaseDrawings, buildMtfStructureDrawings, buildForecastDrawing } from "@/lib/market/drawings";
+import { clusterLevels } from "@/lib/market/cluster";
 import { buildRoadmap } from "@/lib/market/roadmap";
 import { detectStructure, detectSupplyDemand, detectOrderBlocks, detectFvg, detectLiquidity } from "@/lib/market/smc";
 import { detectConsolidations, detectAmdPhases, detectInstitutionalActivity } from "@/lib/market/phases";
@@ -342,6 +343,17 @@ export async function GET(req: Request) {
   // v14: broker clock offset → PDH/PDL day cut at server-local midnight (NY 17:00)
   const brokerOffsetSec = await getBrokerOffsetSec();
 
+  // v17.0: shared context — closed bars of the active tf + its ATR + the
+  // live price. The signal-provenance capture below, the projection, the
+  // level-clustering pass and the payload all read from these.
+  const closedBars = bars[tf].filter((b) => !b.f);
+  const price = bars[tf][bars[tf].length - 1].c;
+  const atrNow = (() => {
+    const arr = atr(closedBars, 14);
+    for (let i = arr.length - 1; i >= 0; i--) if (arr[i] != null) return arr[i] as number;
+    return 0;
+  })() || price * 0.001;
+
   const lastSig = await db.signalRecord.findFirst({
     where: { symbol, timeframe: tf },
     orderBy: { barTime: "desc" },
@@ -361,8 +373,39 @@ export async function GET(req: Request) {
     lastSignalTrigger: lastSig?.trigger ?? null,
   });
 
+  // v17.0 (audit P2 — signal contract): the engine's verdict must satisfy
+  // the geometry invariants BEFORE it is allowed to touch the DB or the
+  // chart: finite numbers, positive RR, sane confidence, and the direction
+  // invariant — a BUY risks BELOW entry and targets ABOVE it, a SELL the
+  // mirror. A violation is an engine bug; the honest response is to drop
+  // the signal loudly, never to draw it.
   if (result.signal) {
     const s = result.signal;
+    const contractOk =
+      Number.isFinite(s.entry) && Number.isFinite(s.sl) && Number.isFinite(s.tp) &&
+      s.rr > 0 && s.confidence >= 0 && s.confidence <= 1 &&
+      (s.direction === "BUY" ? s.sl < s.entry && s.tp > s.entry : s.sl > s.entry && s.tp < s.entry);
+    if (!contractOk) {
+      console.warn(
+        "[analysis] signal contract violated — dropped:",
+        s.trigger, s.direction, `E${s.entry} SL${s.sl} TP${s.tp} RR${s.rr}`,
+      );
+      result.signal = null;
+    }
+  }
+
+  if (result.signal) {
+    const s = result.signal;
+    // v17.0 (audit P2): the source candle the setup was read from — the
+    // card shows exactly which bar minted this signal
+    const srcBar = bars[tf].find((b) => b.t === s.barTime) ?? null;
+    const traceBlob = JSON.stringify({
+      checks: s.checks, factors: s.factors, entryNote: s.entryNote, targetNote: s.targetNote, tp2: s.tp2,
+      // v17.0: cost & provenance context (spread paid, ATR regime, the
+      // pending window, the source candle OHLC)
+      spread, atr: atrNow, expiry: expiryBarsFor(tf),
+      src: srcBar ? { t: srcBar.t, o: srcBar.o, h: srcBar.h, l: srcBar.l, c: srcBar.c } : undefined,
+    });
     try {
       const created = await db.signalRecord.create({
         data: {
@@ -377,7 +420,7 @@ export async function GET(req: Request) {
           rr: s.rr,
           confidence: s.confidence,
           status: s.status,
-          trace: JSON.stringify({ checks: s.checks, factors: s.factors, entryNote: s.entryNote, targetNote: s.targetNote, tp2: s.tp2 }),
+          trace: traceBlob,
           barTime: s.barTime,
         },
       });
@@ -435,6 +478,18 @@ export async function GET(req: Request) {
       entryNote: trace.entryNote as string | undefined,
       targetNote: trace.targetNote as string | undefined,
       createdAt: h.createdAt.toISOString(),
+      // v17.0 (audit P2): provenance fields — guarded against legacy rows
+      // whose trace predates them
+      spreadAt: typeof trace.spread === "number" ? (trace.spread as number) : undefined,
+      atrAt: typeof trace.atr === "number" ? (trace.atr as number) : undefined,
+      expiryBars: typeof trace.expiry === "number" ? (trace.expiry as number) : undefined,
+      sourceBar: (() => {
+        const sb = trace.src as { t?: number; o?: number; h?: number; l?: number; c?: number } | undefined;
+        if (sb && [sb.t, sb.o, sb.h, sb.l, sb.c].every((v) => typeof v === "number")) {
+          return { t: sb.t!, o: sb.o!, h: sb.h!, l: sb.l!, c: sb.c! };
+        }
+        return undefined;
+      })(),
     };
   });
 
@@ -447,9 +502,7 @@ export async function GET(req: Request) {
   });
 
   const activeSignal = signals.find((s) => s.status === "active" || s.status === "pending") ?? null;
-  const closedBars = bars[tf].filter((b) => !b.f);
   const liveSignal = activeSignal ?? result.signal;
-  const price = bars[tf][bars[tf].length - 1].c;
 
   // ── v16.5 market phases: consolidation ranges / AMD sequences /
   //    institutional footprints — on the ACTIVE tf's closed bars (walk-forward
@@ -635,8 +688,23 @@ export async function GET(req: Request) {
     });
   }
   // v16.4 (audit §4/§10): data identity + freshness on every payload
-  const lastCandleTime = lastClosedT;
   const tfSecMap: Record<string, number> = { M1: 60, M5: 300, M15: 900, M30: 1800, H1: 3600, H4: 14400 };
+  // v17.0 (audit §dedup) — CROSS-SOURCE LEVEL CLUSTERING: all the level
+  // ink (HTF zones, local zones/OB/FVG, liquidity pools, magnets, EQ)
+  // passes through one price/ATR clustering + priority pass. Levels that
+  // agree within 0.22 ATR collapse into their best-tier representative
+  // (HTF key level > fresh OB/FVG > local S/R; pattern confluence credited
+  // in the merge rationale), every drawing gains a stable id, and level
+  // winners gain a distance rank the chart's ink filter caps. The
+  // renderer shows the merge story as an ×N badge + hover tooltip.
+  clusterLevels(drawings, {
+    atr: atrNow,
+    price,
+    activeTf: tf,
+    lastBarT: lastClosedT,
+    tfSec: tfSecMap[tf] ?? 900,
+  });
+  const lastCandleTime = lastClosedT;
   const ageSec = Math.max(0, Math.round(Date.now() / 1000 - lastCandleTime) - (tfSecMap[tf] ?? 900));
   const dataFreshness = {
     lastCandleTime,
@@ -666,6 +734,9 @@ export async function GET(req: Request) {
     lastCandleTime,
     dataFreshness,
     strategyVersion: STRATEGY_VERSION,
+    // v17.0: the live spread this evaluation ran with — the signal card's
+    // "actual spread" context and the engine's risk floor share it
+    spread,
     generatedAt: Date.now(),
   };
   cache.set(cacheKey, { at: Date.now(), data: payload });

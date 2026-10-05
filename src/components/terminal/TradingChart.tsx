@@ -42,7 +42,8 @@ import type {
   SignalPayload,
   UserDrawing,
 } from "@/lib/market/types";
-import type { Layers, ToolId } from "@/hooks/useTerminal";
+import type { Layers, ToolId, InkFilters } from "@/hooks/useTerminal";
+import { TF_ORDER } from "@/lib/market/cluster";
 import {
   TONES,
   ZONE_STYLE,
@@ -118,6 +119,9 @@ interface Props {
   timeframe: string;
   digits: number;
   layers: Layers;
+  /** v17.0: the ink filters (level budget / HTF / faded / merged) — optional
+   *  so the bare trio charts keep working without them */
+  inkFilters?: InkFilters;
   tool: ToolId;
   onToolDone: () => void;
   autoDrawings: AutoDrawing[];
@@ -138,13 +142,26 @@ interface PendingCreate {
   move?: { x: number; y: number; t: number; p: number };
 }
 
+/** v17.0 — one hoverable level band (a clustered level winner): the
+ *  rectangle in canvas coordinates + the merge rationale it carries. */
+interface LevelTip {
+  x1: number; y1: number; x2: number; y2: number;
+  title: string;
+  price: string;
+  sourceTf?: string;
+  mergedFrom?: string[];
+}
+
 export default function TradingChart(props: Props) {
   const {
     symbol, timeframe, digits, layers, tool, onToolDone,
     autoDrawings, signals, selectedSignalId,
     userDrawings, onCreateDrawing, onUpdateDrawing, onDeleteDrawing,
+    inkFilters,
     bare = false,
   } = props;
+
+  const DEFAULT_INK: InkFilters = { maxLevels: 8, htf: true, faded: true, merged: false };
 
   const { resolvedTheme } = useTheme();
   const bars = useBars(symbol, timeframe);
@@ -160,6 +177,7 @@ export default function TradingChart(props: Props) {
   const autoRef = useRef(autoDrawings);
   const userRef = useRef(userDrawings);
   const layersRef = useRef(layers);
+  const inkRef = useRef<InkFilters>(inkFilters ?? DEFAULT_INK);
   const signalsRef = useRef(signals);
   const toolRef = useRef(tool);
   // BARE mode = no on-canvas legend / badges (the trio's candle section —
@@ -183,6 +201,14 @@ export default function TradingChart(props: Props) {
   const [textValue, setTextValue] = useState("");
   const hitRef = useRef<Map<string, { pts: { x: number; y: number }[]; rects: { x1: number; y1: number; x2: number; y2: number }[] }>>(new Map());
   const drawOverlayRef = useRef<() => void>(() => {});
+  // v17.0 — merge-rationale tooltip: hover targets registered by the level
+  // renderer (one band per clustered level winner) + the currently shown tip
+  const tipRef = useRef<LevelTip[]>([]);
+  const [tip, setTip] = useState<{
+    key: string; x: number; y: number; vw: number; vh: number;
+    title: string; price: string;
+    sourceTf?: string; mergedFrom?: string[];
+  } | null>(null);
   // free-zoom follow mode (auto-follow the live right edge)
   const [follow, setFollow] = useState(true);
   const followRef = useRef(true);
@@ -542,6 +568,7 @@ export default function TradingChart(props: Props) {
     autoRef.current = autoDrawings;
     userRef.current = userDrawings;
     layersRef.current = layers;
+    inkRef.current = inkFilters ?? DEFAULT_INK;
     signalsRef.current = signals;
     toolRef.current = tool;
     selectedRef.current = selectedId;
@@ -739,11 +766,35 @@ export default function TradingChart(props: Props) {
         path: "structure",
         tf_setup: "setup",
       };
+      // v17.0 — INK FILTERS (the audit's dedup/count/freshness controls):
+      //  · merged duplicates stay hidden unless explicitly asked for
+      //  · faded ink (mitigated zones, broken trendlines, swept pools,
+      //    broken ranges) can be silenced
+      //  · HTF-sourced ink (H1/H4 drawings on a lower-tf chart) can be silenced
+      //  · level winners beyond the visible budget (rank > maxLevels) hide
+      const chartTfRank = TF_ORDER[timeframe] ?? 3;
+      const ink = inkRef.current;
+      const tips: LevelTip[] = [];
       for (const d of autoRef.current) {
         const layer = LAYER_OF[d.kind] ?? "zones";
         if (!layersRef.current[layer]) continue;
+        if (d.mergedInto && !ink.merged) continue;
+        if (!ink.faded) {
+          const fadedInk =
+            (d.kind === "zone" && (d.state === "faded" || d.mitT != null)) ||
+            (d.kind === "trendline" && (d.broken || d.state === "faded")) ||
+            (d.kind === "liq" && d.state !== "untouched") ||
+            (d.kind === "range" && d.state !== "forming");
+          if (fadedInk) continue;
+        }
+        if (!ink.htf) {
+          const srcTf = (d as { source_tf?: string }).source_tf;
+          if (srcTf && (TF_ORDER[srcTf] ?? 0) > chartTfRank) continue;
+        }
+        if (d.rank != null && d.rank > ink.maxLevels) continue;
         try { renderAuto(ctx, d); } catch (e) { console.warn("[chart] renderAuto failed:", d.kind, e); }
       }
+      tipRef.current = tips;
 
       // ── AI chart-read layer — what the trading brain sees right now ──
       if (layersRef.current.ai) {
@@ -763,9 +814,13 @@ export default function TradingChart(props: Props) {
             if (y === null) return;
             const tone = TONES[d.tone] ?? TONES.neutral;
             const faded = d.style === "dash";
+            // v17.0: a clustered winner wears the ×N merge badge
+            const mc = d.mergedFrom?.length ?? 0;
+            const hl = mc ? `${d.label} ×${mc + 1}` : d.label;
             hardSeg(ctx, 0, y, rightEdge, y, tone.line(faded ? 0.45 : 0.9), tone.halo(0.08), 0.6, faded ? [4, 4] : []);
-            if (tryLabel(rightEdge - 4, y - 8, d.label, 8.5, "right")) {
-              pillLabel(ctx, d.label, rightEdge - 4, y - 8, tone.text, tone.line(0.5), "right", 8.5);
+            if (mc) tips.push({ x1: rightEdge - 240, y1: y - 9, x2: rightEdge, y2: y + 9, title: hl, price: d.price.toFixed(digits), mergedFrom: d.mergedFrom });
+            if (tryLabel(rightEdge - 4, y - 8, hl, 8.5, "right")) {
+              pillLabel(ctx, hl, rightEdge - 4, y - 8, tone.text, tone.line(0.5), "right", 8.5);
             }
             break;
           }
@@ -799,7 +854,18 @@ export default function TradingChart(props: Props) {
             };
             // v16.5: INST tag — the zone's origin bar carried a ≥1.5σ volume
             // spike (institutional footprint: banks/funds were active there)
-            const zl = `${sideName[d.side] ?? d.side}${d.source_tf ? " · " + d.source_tf : ""}${d.institutional ? " · INST" : ""}`;
+            // v17.0: ×N merge badge when this zone won its price cluster
+            const zmc = d.mergedFrom?.length ?? 0;
+            const zl = `${sideName[d.side] ?? d.side}${d.source_tf ? " · " + d.source_tf : ""}${d.institutional ? " · INST" : ""}${zmc ? ` ×${zmc + 1}` : ""}`;
+            if (zmc) {
+              tips.push({
+                x1: x0, y1: Math.min(y1, y2), x2: xEnd, y2: Math.max(y1, y2),
+                title: zl,
+                price: `${d.lo.toFixed(digits)}–${d.hi.toFixed(digits)}`,
+                sourceTf: d.source_tf,
+                mergedFrom: d.mergedFrom,
+              });
+            }
             if (tryLabel(x0 + 4, Math.min(y1, y2) + 9, zl, 8.5, "left")) {
               pillLabel(ctx, zl, x0 + 4, Math.min(y1, y2) + 9, st.border, st.border, "left", 8.5);
             }
@@ -1224,7 +1290,9 @@ export default function TradingChart(props: Props) {
             const y = yOfPrice(d.price);
             if (y === null) return;
             hardSeg(ctx, rightEdge - 220, y, rightEdge, y, "rgba(251,191,36,0.6)", "rgba(245,158,11,0.06)", 0.6, [2, 4]);
-            const ml = `MAGNET · ${d.source}`;
+            const mmc = d.mergedFrom?.length ?? 0;
+            const ml = `MAGNET · ${d.source}${mmc ? ` ×${mmc + 1}` : ""}`;
+            if (mmc) tips.push({ x1: rightEdge - 220, y1: y - 9, x2: rightEdge, y2: y + 9, title: ml, price: d.price.toFixed(digits), mergedFrom: d.mergedFrom });
             if (tryLabel(rightEdge - 4, y - 8, ml, 8, "right")) {
               pillLabel(ctx, ml, rightEdge - 4, y - 8, "rgba(251,191,36,0.92)", "rgba(251,191,36,0.45)", "right", 8);
             }
@@ -1237,7 +1305,9 @@ export default function TradingChart(props: Props) {
             const color = d.side === "BSL" ? "rgba(255,120,132," : "rgba(52,211,153,";
             hardSeg(ctx, 0, y, rightEdge, y, color + (faded ? "0.32)" : "0.72)"), color + "0.06)", 0.62, faded ? [3, 4] : []);
             const state = d.state === "untouched" ? "" : d.state === "swept" ? " · SWEPT" : " · RUN";
-            const ll = `${d.side} ${d.price.toFixed(digits)}${state}`;
+            const lmc = d.mergedFrom?.length ?? 0;
+            const ll = `${d.side} ${d.price.toFixed(digits)}${state}${lmc ? ` ×${lmc + 1}` : ""}`;
+            if (lmc) tips.push({ x1: 0, y1: y - 9, x2: rightEdge, y2: y + 9, title: `${d.side} LIQUIDITY ×${lmc + 1}`, price: d.price.toFixed(digits), mergedFrom: d.mergedFrom });
             if (tryLabel(6, y - 8, ll, 8.5, "left")) {
               pillLabel(ctx, ll, 6, y - 8, color + (faded ? "0.55)" : "0.95)"), color + "0.5)", "left", 8.5);
             }
@@ -1710,7 +1780,9 @@ export default function TradingChart(props: Props) {
 
   useEffect(() => {
     scheduleRedraw();
-  }, [bars, autoDrawings, userDrawings, layers, selectedId, signals, emaArrays, symbol, timeframe, drawOverlay]);
+    // v17.0: ink filter changes (level budget / HTF / faded / merged toggles)
+    // re-filter the SAME drawings — an immediate repaint, no data refetch
+  }, [bars, autoDrawings, userDrawings, layers, inkFilters, selectedId, signals, emaArrays, symbol, timeframe, drawOverlay, scheduleRedraw]);
 
   // crosshair tracking (for legend) — via ref, no re-render
   const crosshairRef = useRef<{ t: number | null }>({ t: null });
@@ -1971,19 +2043,51 @@ export default function TradingChart(props: Props) {
       if (!tp) return;
       const hit = hitTestUser(tp.x, tp.y);
       setPe(hit ? "auto" : "none");
+      // v17.0 — merge-rationale tooltip: the topmost clustered level band
+      // under the cursor carries the story (what was merged into it). The
+      // tip is keyed by band identity so mouse travel inside one band does
+      // not re-render; leaving every band clears it.
+      const rect = canvas.getBoundingClientRect();
+      const mx = e.clientX - rect.left;
+      const my = e.clientY - rect.top;
+      let found: LevelTip | null = null;
+      const bands = tipRef.current;
+      for (let i = bands.length - 1; i >= 0; i--) {
+        const b = bands[i];
+        if (mx >= b.x1 && mx <= b.x2 && my >= b.y1 && my <= b.y2) {
+          found = b;
+          break;
+        }
+      }
+      if (found) {
+        const f = found;
+        const key = `${f.title}|${f.price}`;
+        const vw = rect.width;
+        const vh = rect.height;
+        setTip((prev) =>
+          prev && prev.key === key
+            ? prev
+            : { key, x: mx, y: my, vw, vh, title: f.title, price: f.price, sourceTf: f.sourceTf, mergedFrom: f.mergedFrom },
+        );
+      } else {
+        setTip((prev) => (prev ? null : prev));
+      }
     };
+    const onHostLeave = () => setTip(null);
 
     canvas.addEventListener("pointerdown", onDown);
     canvas.addEventListener("pointermove", onMove);
     canvas.addEventListener("pointerup", onUp);
     canvas.addEventListener("pointerleave", onLeave);
     host.addEventListener("mousemove", onContainerMove);
+    host.addEventListener("mouseleave", onHostLeave);
     return () => {
       canvas.removeEventListener("pointerdown", onDown);
       canvas.removeEventListener("pointermove", onMove);
       canvas.removeEventListener("pointerup", onUp);
       canvas.removeEventListener("pointerleave", onLeave);
       host.removeEventListener("mousemove", onContainerMove);
+      host.removeEventListener("mouseleave", onHostLeave);
     };
   }, [tool, symbol, timeframe, digits, toTimePrice, hitTestUser, onCreateDrawing, onUpdateDrawing, onToolDone]);
 
@@ -2027,6 +2131,45 @@ export default function TradingChart(props: Props) {
         className="pointer-events-none absolute inset-0 z-10 h-full w-full"
         style={{ touchAction: "none" }}
       />
+
+      {/* v17.0 — MERGE-RATIONALE TOOLTIP: hover a clustered level (×N badge)
+          to see exactly which sources agreed on that price and which one won
+          the priority hierarchy (HTF key level > fresh OB/FVG > local S/R) */}
+      {tip && (
+        <div
+          className="pointer-events-none absolute z-30 w-52 rounded-md border border-border bg-popover/95 p-2 shadow-lg backdrop-blur-sm"
+          style={{
+            left: Math.min(Math.max(tip.x - 216, 4), Math.max(4, tip.vw - 216)),
+            top: Math.min(Math.max(tip.y + 12, 4), Math.max(4, tip.vh - 110)),
+          }}
+          role="tooltip"
+        >
+          <div className="flex items-baseline justify-between gap-2">
+            <span className="truncate text-[10px] font-bold uppercase tracking-wider text-foreground">{tip.title}</span>
+            <span className="tnum shrink-0 font-mono text-[10px] font-bold text-gold">{tip.price}</span>
+          </div>
+          {tip.sourceTf && (
+            <div className="mt-0.5 text-[9px] uppercase tracking-wider text-muted-foreground">
+              source TF · {tip.sourceTf}
+            </div>
+          )}
+          {tip.mergedFrom?.length ? (
+            <div className="mt-1.5 border-t border-border pt-1.5">
+              <div className="text-[8px] font-bold uppercase tracking-wider text-muted-foreground/70">
+                {t("mergedLevels")}
+              </div>
+              <ul className="mt-0.5 space-y-px">
+                {tip.mergedFrom.map((m, i) => (
+                  <li key={i} className="flex items-start gap-1 text-[9px] leading-snug text-muted-foreground">
+                    <span className="mt-px shrink-0 text-gold/80">≡</span>
+                    <span className="truncate">{m}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
+        </div>
+      )}
 
       {/* candle-loading state — shown until the first bars arrive */}
       {!bars.length && (

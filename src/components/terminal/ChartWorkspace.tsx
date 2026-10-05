@@ -22,7 +22,7 @@ import TripleChartView from "./TripleChartView";
 import { DrawingToolbar } from "./DrawingToolbar";
 import { TimeframeBar, ChartViewToggle } from "./TimeframeBar";
 import { FlowPanel } from "./FlowPanel";
-import { LayersPopover } from "./TopBar";
+import { LayersPopover, InkFiltersPopover } from "./TopBar";
 import { Button } from "@/components/ui/button";
 import {
   Sheet,
@@ -58,7 +58,7 @@ export function ChartWorkspace({
   onClearDrawings,
   mobile = false,
 }: Props) {
-  const { symbol, timeframe, chartView, tool, setTool, setMainTab, layers, selectedSignalId } = useTerminal();
+  const { symbol, timeframe, chartView, tool, setTool, setMainTab, layers, ink, selectedSignalId } = useTerminal();
   const symbols = useSymbolList();
   const status = useStatus();
   const { t } = useI18n();
@@ -89,6 +89,7 @@ export function ChartWorkspace({
       timeframe={timeframe}
       digits={digits}
       layers={layers}
+      inkFilters={ink}
       tool={tool}
       onToolDone={() => setTool("cursor")}
       autoDrawings={analysis?.drawings ?? []}
@@ -130,6 +131,7 @@ export function ChartWorkspace({
         {/* layers & drawings belong to the price chart only — the trio and
             X-ray views render their charts BARE (no drawing overlays) */}
         {isPrice && <LayersPopover />}
+        {isPrice && <InkFiltersPopover />}
         {isPrice && (
           <Sheet open={sheetOpen} onOpenChange={setSheetOpen}>
             <SheetTrigger asChild>

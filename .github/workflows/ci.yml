@@ -1,12 +1,18 @@
 # ════════════════════════════════════════════════════════════════════
-# CI (audit §4.1) — the repo had NO pipeline: type errors, lint breaks
-# and build regressions all shipped silently (that is exactly how
+# CI — production gate (audit §4.1 + Phase 0.2): install / lint /
+# typecheck / prisma / build must ALL pass before anything ships.
+# The repo previously had NO pipeline: type errors, lint breaks and
+# build regressions all shipped silently (that is exactly how
 # ignoreBuildErrors stayed on for releases).
 #
 # Two domains, two jobs:
-#   app          — the Next.js terminal (root project): tsc + lint + build
-#   mt5-service  — mini-services/mt5-service, its own bun project with
-#                  its own tsconfig (target ES2022) and lockfile
+#   gate        — the production gate for the Next.js terminal (root
+#                 project): bun install → prisma generate → lint →
+#                 tsc → fresh-SQLite `prisma db push` (validates the
+#                 schema exactly the way the Dockerfile applies it) →
+#                 `next build` against that throwaway DB.
+#   mt5-service — mini-services/mt5-service, its own bun project with
+#                 its own tsconfig (target ES2022) and lockfile
 #
 # NOTE on the app tsc gate: the root tsconfig.json EXCLUDES the sibling
 # bun projects (mini-services, mt5-poc, scripts, skills, tool-results),
@@ -20,31 +26,29 @@ on:
   push:
     branches: [main]
   pull_request:
+    branches: [main]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  # ───────────────────────── Next.js app (the terminal) ─────────────────────────
-  app:
-    name: app — typecheck / lint / build
+  # ───────────────── production gate (Next.js app / the terminal) ─────────────────
+  gate:
+    name: gate — install / lint / typecheck / prisma / build
     runs-on: ubuntu-latest
     permissions:
       contents: read
     env:
-      # prisma generate + next build resolve the datasource at import
-      # time (see Dockerfile) — point them at a throwaway file.
-      # MT5_SKIP_SPAWN=1 keeps instrumentation.ts from trying to spawn
-      # the mt5-service sidecar inside the build container.
-      DATABASE_URL: file:/tmp/build.db
+      # keeps instrumentation.ts from trying to spawn the mt5-service
+      # sidecar inside the build container (it early-returns on this).
       MT5_SKIP_SPAWN: "1"
     steps:
       - uses: actions/checkout@v4
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest # 1.x line
+          bun-version: latest # 1.x line — matches oven/bun:1.2-slim in the Dockerfile
           cache: true # bun install cache, keyed on bun.lock
 
       - name: Install dependencies
@@ -56,18 +60,27 @@ jobs:
         # @prisma/client auto-generate may not run on a cold install —
         # without this step tsc cannot resolve @prisma/client types.
 
-      - name: Type-check (app domain)
-        run: bunx tsc --noEmit
-
       - name: Lint
         run: bun run lint
 
-      - name: Build (standalone)
+      - name: Type-check (app domain)
+        run: bunx tsc --noEmit
+
+      - name: Apply schema to a fresh SQLite DB
         run: |
           # fresh clone has no db/ (gitignored) — mirror the Dockerfile
-          # so anything expecting the datasource parent dir finds it
+          # builder stage: create the parent dir, then push the schema to
+          # a THROWAWAY database (never the dev one). --skip-generate:
+          # the client was generated two steps ago.
           mkdir -p db
-          bun run build
+          DATABASE_URL=file:/tmp/ci.db bunx prisma db push --skip-generate
+
+      - name: Build (standalone)
+        run: DATABASE_URL=file:/tmp/ci.db bun run build
+        # build script = next build + standalone copy (package.json).
+        # DATABASE_URL is exported for the build: PrismaClient resolves
+        # its datasource at import time, so the build would fail without
+        # it (same as the Dockerfile builder stage).
 
   # ───────────────────── mt5-service (market-data sidecar) ─────────────────────
   # Separate bun project (own package.json + bun.lock + tsconfig). It

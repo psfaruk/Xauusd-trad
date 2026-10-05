@@ -4,11 +4,14 @@ import { NextResponse } from "next/server";
  * v12.1 API gate (the audit's Critical #1, Next.js side).
  *
  * When APP_PASSWORD is set (Railway always sets it — see
- * start-railway.sh), every /api/* route except the two public ones
+ * start-railway.sh), every /api/* route except the three public ones
  * requires a valid `aurum_sess` session cookie:
  *
  *   PUBLIC  /api/auth          — the login endpoint itself
  *   PUBLIC  /api/setup-status  — deployment healthcheck (secret-free)
+ *   PUBLIC  /api/healthz       — aggregate healthcheck (booleans only;
+ *                                Docker HEALTHCHECK + Railway probe it
+ *                                without a session, audit Phase 0)
  *   GUARDED everything else    — settings, drawings, ai-brain, analysis,
  *                                signals, backtest, mt5-ensure …
  *
@@ -28,7 +31,7 @@ import { NextResponse } from "next/server";
 
 const SESSION_COOKIE = "aurum_sess";
 const SESSION_LABEL = "aurum-session-v1";
-const PUBLIC_PATHS = new Set(["/api/auth", "/api/setup-status"]);
+const PUBLIC_PATHS = new Set(["/api/auth", "/api/setup-status", "/api/healthz"]);
 
 async function hmacHex(secret: string, label: string): Promise<string> {
   const enc = new TextEncoder();

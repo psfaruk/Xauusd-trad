@@ -17,7 +17,7 @@ import { SymbolPicker } from "./SymbolPicker";
 import { Button } from "@/components/ui/button";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Switch } from "@/components/ui/switch";
-import { Sun, Moon, MonitorSmartphone, Languages, Maximize2, Layers } from "lucide-react";
+import { Sun, Moon, MonitorSmartphone, Languages, Maximize2, Layers, SlidersHorizontal } from "lucide-react";
 
 export function BrandMark({ className }: { className?: string }) {
   return (
@@ -70,6 +70,61 @@ export function LayersPopover() {
           <label key={key} className="flex cursor-pointer items-center justify-between rounded px-1.5 py-1.5 hover:bg-muted/60">
             <span className="text-[11px]">{label}</span>
             <Switch checked={layers[key]} onCheckedChange={() => toggleLayer(key)} />
+          </label>
+        ))}
+      </PopoverContent>
+    </Popover>
+  );
+}
+
+/** v17.0 — INK FILTERS: the dedup/count/freshness controls for the level
+ *  clustering pass. Layers are coarse on/off; this is the fine tuning:
+ *  how many clustered levels show (rank-ordered by distance to price),
+ *  HTF-sourced ink, faded ink, and the absorbed merge duplicates. */
+export function InkFiltersPopover() {
+  const { ink, setInk } = useTerminal();
+  const { t } = useI18n();
+  const toggles: { key: "htf" | "faded" | "merged"; label: string; hint: string }[] = [
+    { key: "htf", label: t("inkHtf"), hint: t("inkHtfHint") },
+    { key: "faded", label: t("inkFaded"), hint: t("inkFadedHint") },
+    { key: "merged", label: t("inkMerged"), hint: t("inkMergedHint") },
+  ];
+  return (
+    <Popover>
+      <PopoverTrigger asChild>
+        <Button variant="outline" size="sm" className="h-7 w-7 p-0" aria-label={t("inkFilters")}>
+          <SlidersHorizontal className="h-3.5 w-3.5" />
+        </Button>
+      </PopoverTrigger>
+      <PopoverContent align="end" className="w-64 p-2">
+        <div className="mb-1 text-[10px] font-bold uppercase tracking-wider text-muted-foreground/70">
+          {t("inkFilters")}
+        </div>
+        {/* visible level budget — the audit's "default visible count" cap */}
+        <div className="px-1.5 pb-2 pt-1">
+          <div className="flex items-center justify-between">
+            <span className="text-[11px]" title={t("inkMaxLevelsHint")}>
+              {t("inkMaxLevels")}
+            </span>
+            <span className="tnum font-mono text-[10px] font-bold text-gold">{ink.maxLevels}</span>
+          </div>
+          <input
+            type="range"
+            min={3}
+            max={16}
+            step={1}
+            value={ink.maxLevels}
+            onChange={(e) => setInk({ maxLevels: Number(e.target.value) })}
+            className="mt-1.5 h-1 w-full cursor-pointer accent-[var(--color-gold)]"
+            aria-label={t("inkMaxLevels")}
+          />
+          <p className="mt-1 text-[9px] leading-snug text-muted-foreground/70">{t("inkMaxLevelsHint")}</p>
+        </div>
+        <div className="h-px bg-border" />
+        {toggles.map(({ key, label, hint }) => (
+          <label key={key} className="flex cursor-pointer items-center justify-between gap-2 rounded px-1.5 py-1.5 hover:bg-muted/60" title={hint}>
+            <span className="text-[11px]">{label}</span>
+            <Switch checked={ink[key]} onCheckedChange={() => setInk({ [key]: !ink[key] })} />
           </label>
         ))}
       </PopoverContent>

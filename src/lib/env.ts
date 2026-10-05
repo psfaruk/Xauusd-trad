@@ -1,5 +1,6 @@
 /**
- * env.ts (v16.9) — environment validation (audit §4.2).
+ * env.ts (v16.9 → audit Phase 0) — environment validation + the
+ * production AUTH GATE.
  *
  * The app used to read process.env.* in ~10 places with no single
  * chokepoint: a missing var failed at RUNTIME, deep in a route, with a
@@ -9,13 +10,20 @@
  *     vars that are truly required (DATABASE_URL — without it nothing
  *     works at all). Development just warns loudly: the sandbox must
  *     never die on a missing OPTIONAL var.
+ *   · assertProductionEnv() — audit Phase 0 FAIL-CLOSED auth gate: a
+ *     production server boot with NEITHER APP_PASSWORD NOR a usable
+ *     TRADER_API_KEY THROWS, aborting startup. An unlocked public deploy
+ *     is the audit's worst finding, so “operator may want it open” is no
+ *     longer an accepted default — the explicit escape hatch
+ *     ALLOW_INSECURE_MISSING_SECRETS=1 (ephemeral demos) is the only way
+ *     past, and it announces itself loudly in the logs.
  *   · envInfo — resolved, REDACTED view for diagnostics/status pages:
  *     booleans and URLs only. Never a secret's value — only whether it
  *     is set.
  *
- * Optional-with-warning policy: APP_PASSWORD missing in production is
- * the "both auth doors inert" deploy — worth a loud warning, but the
- * operator may genuinely want an open instance, so it never blocks boot.
+ * Import-safe on the client: no node APIs at module top level — every
+ * check is a plain process.env string read (the crypto-free twin of
+ * mt5-service's auth.authConfigured).
  */
 import { z } from "zod";
 
@@ -35,8 +43,8 @@ export type EnvSchema = z.infer<typeof envSchema>;
 /**
  * Validate the environment. Returns `{ ok: true }` or
  * `{ ok: false, issues: ["DATABASE_URL: must be …"] }`.
- * Soft checks (APP_PASSWORD in production) only console.warn — they
- * never turn the result false.
+ * (The auth gate is NOT soft-checked here anymore — assertProductionEnv()
+ * below owns it, fail-closed, so the two policies can never diverge.)
  */
 export function validateEnv(): { ok: true } | { ok: false; issues: string[] } {
   const parsed = envSchema.safeParse(process.env);
@@ -49,16 +57,53 @@ export function validateEnv(): { ok: true } | { ok: false; issues: string[] } {
     };
   }
 
-  // ── soft checks (warn-only, never fail boot) ──
-  if (!parsed.data.APP_PASSWORD && process.env.NODE_ENV === "production") {
+  return { ok: true };
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Audit Phase 0 — production fail-closed auth gate.
+// Mirrors mt5-service's auth.authConfigured(): locked when APP_PASSWORD
+// is set, or an explicit TRADER_API_KEY of ≥ 8 chars is present.
+// ─────────────────────────────────────────────────────────────────────
+
+/** True when at least one auth door is configured (public deploys must be). */
+export function authConfigured(): boolean {
+  return !!(
+    process.env.APP_PASSWORD ||
+    (process.env.TRADER_API_KEY && process.env.TRADER_API_KEY.length >= 8)
+  );
+}
+
+/**
+ * FAIL-CLOSED production gate — call from instrumentation register()
+ * BEFORE any try/catch so the throw aborts server startup:
+ *   · NODE_ENV !== "production"       → no-op (dev/test never fail)
+ *   · NEXT_PHASE === phase-production-build → no-op: `next build` runs
+ *     with NODE_ENV=production, and the CI/Docker BUILDS (which never
+ *     see APP_PASSWORD) must not be held hostage by a runtime-only
+ *     gate. Only a real server boot enforces it.
+ *   · ALLOW_INSECURE_MISSING_SECRETS=1 → one loud structured warning,
+ *     boot continues (explicit ephemeral-demo opt-in)
+ *   · auth not configured              → THROW — the container dies at
+ *     boot instead of quietly serving an unlocked public deploy
+ */
+export function assertProductionEnv(): void {
+  if (process.env.NODE_ENV !== "production") return;
+  if (process.env.NEXT_PHASE === "phase-production-build") return;
+
+  if (process.env.ALLOW_INSECURE_MISSING_SECRETS === "1") {
     console.warn(
-      "[env] APP_PASSWORD is not set — this deploy runs with BOTH auth doors " +
-        "open (login + market REST). Set APP_PASSWORD if this instance is reachable " +
-        "by anyone but you.",
+      "[env] ⚠ auth is UNLOCKED in production (ALLOW_INSECURE_MISSING_SECRETS=1) — this deploy is not safe to expose",
     );
+    return;
   }
 
-  return { ok: true };
+  if (!authConfigured()) {
+    throw new Error(
+      "production started without APP_PASSWORD/TRADER_API_KEY — refusing to run unlocked " +
+        "(set APP_PASSWORD, or ALLOW_INSECURE_MISSING_SECRETS=1 for an ephemeral demo)",
+    );
+  }
 }
 
 /**

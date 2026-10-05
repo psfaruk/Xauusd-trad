@@ -293,6 +293,7 @@ export type Tone = "bull" | "bear" | "gold" | "violet" | "neutral";
 
 /** Auto-drawing kinds — same visual grammar as the reference engine. */
 export type AutoDrawing =
+  (
   | { kind: "hline"; price: number; label: string; tone: Tone; style?: "solid" | "dash" }
   | {
       kind: "zone";
@@ -377,7 +378,24 @@ export type AutoDrawing =
       entry: number; sl: number; tp: number; rr: number;
       status: "signal" | "planned"; source: string; reason?: string;
       price: number; distAtr: number; entryType: "market" | "limit";
-    };
+    }
+
+  /** v17.0 (audit §dedup) — every auto-drawing carries cluster metadata:
+   *  a deterministic stable ID (comparable across polls), a visibility
+   *  RANK for level-type ink (1 = nearest to price; the renderer caps how
+   *  many show), and the cross-source MERGE story — when several sources
+   *  (HTF zone, local OB, liquidity pool, magnet, EQ) claim the same price
+   *  area, the priority winner keeps the ink and lists what it absorbed. */
+  ) & {
+    /** deterministic identity: kind:tf:anchors — stable across polls */
+    id?: string;
+    /** level visibility rank (1 = best/nearest); > inkFilters.maxLevels hides */
+    rank?: number;
+    /** winner only: labels of the duplicates it absorbed ("M15 bull OB") */
+    mergedFrom?: string[];
+    /** absorbed items only: the winner's id they were merged into */
+    mergedInto?: string;
+  };
 
 /** User-created drawings (persisted). */
 export interface UserDrawing {
@@ -421,6 +439,14 @@ export interface SignalPayload {
   factors: string[];
   checks: CheckItem[];
   createdAt?: string;
+  /** v17.0 (audit P2 — trade-plan usability): provenance captured at
+   *  signal time so the card can show the REAL cost & origin context:
+   *  the live spread the engine paid for, the ATR regime, the pending
+   *  window (bars), and the exact source candle the setup was read from. */
+  spreadAt?: number;
+  atrAt?: number;
+  expiryBars?: number;
+  sourceBar?: { t: number; o: number; h: number; l: number; c: number };
 }
 
 export interface RoadmapData {
@@ -544,6 +570,10 @@ export interface AnalysisResponse {
   /** v16.4 (audit §10): the strategy build that produced this payload —
    *  cache keys and consumers can compare across deploys. */
   strategyVersion: string;
+  /** v17.0: the live spread (price units) this evaluation ran with —
+   *  every signal's risk floor and the card's "actual spread" line come
+   *  from the same number the engine used. */
+  spread: number;
   /** v16.9 (audit §2.1): true when the circuit breaker served the LAST
    *  GOOD analysis because the MT5 service is down — the payload is a
    *  stale-but-honest snapshot, not a live read. */

@@ -131,15 +131,19 @@ PIDS+=("$!"); NAMES+=("caddy")
 # the container "crashed" 2s after every healthy boot, 11 restart loops
 # in 25s on Railway. After reporting (or timing out) it parks forever,
 # so `wait -n` only ever fires for a REAL app process (mt5/next/caddy).
+# v16.11 (audit Phase 0): the Next.js side of the probe now hits the
+# AGGREGATE /api/healthz instead of `/` — same -sf -m 2 semantics:
+# `degraded` (200, MT5 down but app+DB alive) counts as READY (a broker
+# outage is not a boot failure); only DB-down (503) keeps waiting.
 (
   REPORTED=0
   for i in $(seq 1 60); do
     sleep 2
     REST=0; NEXT=0
     curl -sf -m 2 http://127.0.0.1:3031/health >/dev/null 2>&1 && REST=1
-    curl -sf -m 2 http://127.0.0.1:3000/ >/dev/null 2>&1 && NEXT=1
+    curl -sf -m 2 http://127.0.0.1:3000/api/healthz >/dev/null 2>&1 && NEXT=1
     if [ "$REST" = 1 ] && [ "$NEXT" = 1 ]; then
-      echo "[ready] mt5-service REST ✓ + Next.js ✓ (after $((i*2))s)"
+      echo "[ready] mt5-service REST ✓ + Next.js aggregate healthz ✓ (after $((i*2))s)"
       REPORTED=1
       break
     fi
