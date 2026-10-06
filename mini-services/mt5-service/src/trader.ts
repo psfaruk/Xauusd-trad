@@ -261,7 +261,7 @@ export interface TraderState {
 /** What the host (manager) must provide — keeps trader.ts decoupled. */
 export interface TraderHost {
   readonly connected: boolean;
-  readonly source: "mt5" | "disconnected";
+  readonly source: "mt5" | "disconnected" | "demo";
   getQuote(symbol: string): { bid: number; ask: number; mid: number } | null;
   digits(symbol: string): number;
   getCandles(symbol: string, tf: string, limit: number): Promise<{ t: number; o: number; h: number; l: number; c: number; v: number }[]>;

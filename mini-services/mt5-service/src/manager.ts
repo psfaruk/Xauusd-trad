@@ -3,15 +3,20 @@
  * gateway IPs, live tick → bar building for every timeframe, a candle cache,
  * broker→UTC offset detection.
  *
- * v13: NO SIMULATOR. The owner connects their Exness account from the app
- * (Settings → MT5 Account → POST /api/mt5-connect) or via MT5_LOGIN /
- * MT5_PASSWORD env. Without credentials the manager sits in a labelled
- * "disconnected" state and every data call fails loudly — fake prices are
+ * v13: NO SILENT SIMULATOR. Fake prices masquerading as the real market are
  * strictly worse than no prices (they once fed the trading brain and the
  * chart while the user believed they were watching the real market).
+ * v20 replaces that with an HONEST demo mode: when (and only when) no
+ * credentials exist, the manager serves a clearly-labelled synthetic feed
+ * (source "demo") so the terminal stays explorable — the demo state is
+ * visible in every status surface, the trader NEVER trades on it (its
+ * execution gates stay locked to source === "mt5"), and demo ticks are
+ * never recorded into the real-tick archive. Connecting a real MT5 account
+ * from Settings (or MT5_LOGIN / MT5_PASSWORD env) replaces it instantly.
  */
 
 import { Mt5WsClient, TF_CODE, type SymbolInfo, type AccountInfo, type Mt5Position, type Mt5Order, type Mt5Deal, type TradeResult, type TradeSide, type BrokerPush } from "./mt5-client";
+import { DemoFeed } from "./demo";
 import { FlowTracker, TickRecorder, type FlowPayload } from "./flow";
 import { maskLogin } from "./credentials";
 import fs from "node:fs";
@@ -27,7 +32,7 @@ export interface Tick {
   symbol: string; bid: number; ask: number; mid: number; ts: number; // UTC sec
 }
 export type BarEvent = { symbol: string; tf: string; ev: "open" | "update" | "close"; bar: Bar };
-export type FeedSource = "mt5" | "disconnected";
+export type FeedSource = "mt5" | "disconnected" | "demo";
 export interface StatusPayload {
   connected: boolean;
   source: FeedSource;
@@ -371,6 +376,15 @@ export class Mt5Manager {
   private lastKnownMid = new Map<string, number>();
   private reconciles = new Set<string>();
 
+  // ── v20 DEMO DATA MODE ── when no MT5 account is configured the manager
+  //    serves a clearly-labelled synthetic feed (see demo.ts) so the whole
+  //    terminal stays explorable; a real connect (Settings → MT5 Account)
+  //    replaces it instantly.
+  private demo: DemoFeed | null = null;
+  /** first no-credentials sighting — demo waits 3s so a stored-credential
+   *  auto-connect (boot order race) never flashes through demo first */
+  private demoGraceAt = 0;
+
   // ── callbacks (set by server) ──
   onTick: ((t: Tick) => void) | null = null;
   onBar: ((e: BarEvent) => void) | null = null;
@@ -562,6 +576,8 @@ export class Mt5Manager {
    *  cache (credentials.ts) to skip discovery on boot. */
   applyCredentials(creds: { login: number; password: string; server: string; gateways?: string[] }): void {
     this.manualDisconnect = false;
+    this.stopDemo(); // a real account replaces the demo feed instantly
+    this.demoGraceAt = 0; // a future no-cred cycle starts its grace fresh
     this._login = creds.login;
     this._password = creds.password;
     this.serverName = creds.server;
@@ -584,6 +600,7 @@ export class Mt5Manager {
    *  (A plain network drop does NOT set this — connectLoop keeps retrying.) */
   disconnect(reason = "disconnected by owner"): void {
     this.manualDisconnect = true;
+    this.stopDemo(); // the owner chose no data — demo must not linger
     this.stopClient();
     this.connected = false;
     this.source = "disconnected";
@@ -601,6 +618,54 @@ export class Mt5Manager {
     if (this.acctTimer) { clearInterval(this.acctTimer); this.acctTimer = null; }
     try { this.client?.close(); } catch { /* already closed */ }
     this.client = null;
+  }
+
+  // ═══════════════ v20: HONEST DEMO MODE ═══════════════
+  /** Start the clearly-labelled synthetic feed (only when no credentials
+   *  exist). Populates the symbol universe, seeds the quote path and flips
+   *  the manager into source "demo" — every downstream consumer (quotes,
+   *  bars, flow, analysis) works unchanged; trading stays locked. */
+  startDemo(): void {
+    if (this.demo) return;
+    const feed = new DemoFeed(
+      () => this.nowSec(),
+      (symbol) => [...(this.activeTfs.get(symbol) ?? [])],
+    );
+    // demo quotes ride the NORMAL quote path: offset detection, quote map,
+    // tick emit, bar building, flow trackers — everything stays consistent
+    feed.injectQuote = (symbol, digits, bid, ask) => {
+      const div = 10 ** digits;
+      this.handleQuote(0, this.nowSec(), Math.round(bid * div), Math.round(ask * div), symbol, digits);
+    };
+    this.demo = feed;
+    // symbol universe + watch list (same shape a real session provides)
+    let id = 900000;
+    this.symbols.clear();
+    for (const name of feed.symbolNames()) {
+      this.symbols.set(name, { id: id++, digits: feed.symbolDigits(name), name });
+    }
+    this.watch = [...this.symbols.keys()];
+    this.account = null;          // NO fake balance — demo is data-only
+    this.connected = true;        // data flows (quotes/bars), source says demo
+    this.source = "demo";
+    this.reason = "demo data — connect your MT5 account in Settings for live prices";
+    this.cache.clear();
+    this.emitStatus();
+    feed.start();
+    this.preloadDayCloses().catch(() => {}); // change% on the watchlist
+    console.log(`[mt5] DEMO DATA MODE — ${this.watch.length} synthetic symbols (no MT5 account connected; trading locked)`);
+  }
+
+  /** Stop the demo feed and clear its caches (a real connect, an owner
+   *  disconnect, or shutdown). The next state transition owns the status. */
+  stopDemo(): void {
+    if (!this.demo) return;
+    this.demo.stop();
+    this.demo = null;
+    this.cache.clear();
+    this.quotes.clear();
+    this.dayClose.clear();
+    this.lastKnownMid.clear();
   }
 
   nowSec() { return Math.floor(Date.now() / 1000); }
@@ -663,6 +728,7 @@ export class Mt5Manager {
 
   stop() {
     this.stopped = true;
+    this.stopDemo();
     this.client?.close();
     if (this.hbTimer) clearInterval(this.hbTimer);
     if (this.acctTimer) clearInterval(this.acctTimer);
@@ -692,11 +758,36 @@ export class Mt5Manager {
 
   private async connectLoop() {
     if (this.stopped) return;
-    // v13: NO simulator. Without credentials (or after an owner-initiated
-    // disconnect) the manager sits in a labelled "disconnected" state and
-    // re-checks every 30s — applyCredentials() pokes connectLoop immediately
-    // when the owner connects from Settings, so this poll is only a safety.
+    // v20: without credentials (and after an owner-initiated disconnect) the
+    // HONEST DEMO feed keeps the terminal explorable — clearly labelled,
+    // trading stays locked. applyCredentials() pokes connectLoop immediately
+    // when the owner connects from Settings; a 3s grace on first boot keeps
+    // the stored-credential auto-connect from racing the demo start.
     if (!this.hasCredentials || this.manualDisconnect) {
+      if (!this.manualDisconnect && !this.demo) {
+        if (!this.demoGraceAt) {
+          this.demoGraceAt = Date.now();
+          this.connected = false;
+          this.source = "disconnected";
+          this.reason = "MT5 account not connected — open Settings → MT5 Account";
+          this.emitStatus();
+          if (this.retryTimer) clearTimeout(this.retryTimer);
+          this.retryTimer = setTimeout(() => this.connectLoop(), 3200);
+          return;
+        }
+        if (Date.now() - this.demoGraceAt < 3000) {
+          if (this.retryTimer) clearTimeout(this.retryTimer);
+          this.retryTimer = setTimeout(() => this.connectLoop(), 3200);
+          return;
+        }
+        this.startDemo();
+      }
+      if (this.demo) {
+        // demo owns the state — no polling churn, just a slow env re-check
+        if (this.retryTimer) clearTimeout(this.retryTimer);
+        this.retryTimer = setTimeout(() => this.connectLoop(), 60_000);
+        return;
+      }
       this.connected = false;
       this.source = "disconnected";
       this.reason = this.manualDisconnect
@@ -873,8 +964,12 @@ export class Mt5Manager {
     this.onTick?.({ symbol: name, bid, ask, mid, ts: tsUtc });
     this.buildBars(name, mid, tsUtc);
     this.updateFlow(name, mid, tsUtc);
-    this.recordTick(name, mid);
-    this.recordTickRing(name, mid);
+    // v20: demo ticks must NEVER land in the real-tick archive — the
+    // backtest + delta deep-seed replay real tape only
+    if (this.source !== "demo") {
+      this.recordTick(name, mid);
+      this.recordTickRing(name, mid);
+    }
   }
 
   // ── raw-tick recorder (persists every tick for backtest replay) ──
@@ -1107,6 +1202,16 @@ export class Mt5Manager {
     limit = Math.max(10, Math.min(3000, limit));
     const key = `${symbol}|${tf}`;
     const tfSec = TF_SEC[tf] ?? 60;
+
+    // v20 — DEMO MODE: deterministic synthetic history + the live tick-built
+    // continuation (the cache's forming bars win for their timestamps)
+    if (this.source === "demo" && this.demo) {
+      const entry = this.cache.get(key);
+      const bars = this.demo.serveCandles(symbol, tf, limit, entry?.bars ?? null);
+      this.cache.set(key, { bars, fetchedAt: Date.now() });
+      return bars;
+    }
+
     const entry = this.cache.get(key);
     const stale = !entry || Date.now() - entry.fetchedAt > Math.min(tfSec * 1000 * 0.5, 60000);
 

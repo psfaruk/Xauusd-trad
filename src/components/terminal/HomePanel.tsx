@@ -48,6 +48,7 @@ export function HomePanel({ analysis }: { analysis: AnalysisResponse | null }) {
 
   const connected = status?.connected ?? false;
   const source = status?.source ?? "mt5";
+  const isDemo = source === "demo";
   const offline = source === "disconnected" && !connected;
   const today = trader?.today;
   const hasTrade = !!today && (today.wins + today.losses) > 0;
@@ -68,17 +69,20 @@ export function HomePanel({ analysis }: { analysis: AnalysisResponse | null }) {
                 "flex items-center gap-1.5 rounded border px-1.5 py-0.5 font-mono text-[9px] font-bold tracking-wider",
                 offline
                   ? "border-red-500/40 bg-red-500/10 text-red-500"
-                  : connected
-                    ? "border-up/40 bg-up/10 text-up"
-                    : "border-amber-500/40 bg-amber-500/10 text-amber-500",
+                  : isDemo
+                    ? "border-amber-500/40 bg-amber-500/10 text-amber-400"
+                    : connected
+                      ? "border-up/40 bg-up/10 text-up"
+                      : "border-amber-500/40 bg-amber-500/10 text-amber-500",
               )}
+              title={isDemo ? "Demo data — connect your MT5 account in Settings for live prices" : undefined}
             >
-              {connected ? (
+              {connected && !isDemo ? (
                 <ShieldCheck className="h-3 w-3" />
               ) : (
                 <ShieldAlert className="h-3 w-3" />
               )}
-              {connected ? t("live") : offline ? t("mt5Offline") : t("connecting")}
+              {isDemo ? "DEMO DATA" : connected ? t("live") : offline ? t("mt5Offline") : t("connecting")}
             </span>
           </CardHeader>
           <CardContent className="grid grid-cols-2 gap-3 py-3 sm:grid-cols-4">

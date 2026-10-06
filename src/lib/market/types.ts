@@ -70,9 +70,11 @@ export interface FlowPayload {
 
 export interface FeedStatus {
   connected: boolean;
-  /** v13: the simulator is gone — when MT5 is not connected the whole app
-   *  shows a disconnected/offline state (no fake prices ever). */
-  source: "mt5" | "disconnected";
+  /** v13: no silent simulator — when MT5 is not connected the app shows a
+   *  disconnected/offline state. v20 adds the honest DEMO source: a clearly
+   *  labelled synthetic feed served when no MT5 account is configured (data
+   *  only — trading stays locked; connecting a real account replaces it). */
+  source: "mt5" | "disconnected" | "demo";
   server: string;
   account: { balance: number; equity: number; currency: string } | null;
   latencyMs: number | null;

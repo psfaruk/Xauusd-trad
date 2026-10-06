@@ -464,9 +464,9 @@ export function SettingsPanel() {
           </CardHeader>
           <CardContent className="py-1">
             {[
-              [t("dataSource"), status?.source === "mt5" ? "MetaTrader 5 (direct WS)" : status?.source === "disconnected" ? t("mt5Offline") : "—"],
+              [t("dataSource"), status?.source === "mt5" ? "MetaTrader 5 (direct WS)" : status?.source === "demo" ? "Demo data (synthetic — connect your MT5 account for live prices)" : t("mt5Offline")],
               [t("server"), status?.server ?? "Exness-MT5Trial6"],
-              [t("connection"), status?.connected ? t("live") : status?.source === "disconnected" ? t("mt5Offline") : t("connecting")],
+              [t("connection"), status?.source === "demo" ? "DEMO" : status?.connected ? t("live") : status?.source === "disconnected" ? t("mt5Offline") : t("connecting")],
               [t("latency"), status?.latencyMs != null ? `${status.latencyMs} ms` : "—"],
               [t("symbolsWatched"), String(symbols.length || "—")],
               [t("serverTime"), status ? `${new Date((status.serverTime - (status.offsetSec ?? 0)) * 1000).toISOString().slice(11, 19)} UTC` : "—"],

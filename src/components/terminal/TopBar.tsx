@@ -50,6 +50,7 @@ export function LayersPopover() {
     { key: "levels", label: t("layerLevels") },
     { key: "structure", label: t("layerStructure") },
     { key: "momentum", label: t("layerMomentum") },
+    { key: "narrative", label: t("layerNarrative") },
     { key: "ema", label: t("layerEma") },
     { key: "killzones", label: t("layerKillzones") },
     { key: "volume", label: t("layerVolume") },
@@ -111,8 +112,8 @@ export function InkFiltersPopover() {
           </div>
           <input
             type="range"
-            min={3}
-            max={16}
+            min={2}
+            max={6}
             step={1}
             value={ink.maxLevels}
             onChange={(e) => setInk({ maxLevels: Number(e.target.value) })}
@@ -138,24 +139,28 @@ export function ConnectionChip() {
   const { t } = useI18n();
   const source = status?.source ?? "mt5";
   const connected = status?.connected ?? false;
+  const isDemo = source === "demo";
   const offline = source === "disconnected" && !connected;
-  const label = connected ? t("live") : offline ? t("mt5Offline") : t("connecting");
+  const label = isDemo ? "DEMO" : connected ? t("live") : offline ? t("mt5Offline") : t("connecting");
   const cls = offline
     ? "border-red-500/40 bg-red-500/10 text-red-500"
-    : connected
-      ? "border-up/40 bg-up/10 text-up"
-      : "border-amber-500/40 bg-amber-500/10 text-amber-500";
+    : isDemo
+      ? "border-amber-500/40 bg-amber-500/10 text-amber-400"
+      : connected
+        ? "border-up/40 bg-up/10 text-up"
+        : "border-amber-500/40 bg-amber-500/10 text-amber-500";
   return (
     <span
       className={cn(
         "flex items-center gap-1.5 rounded border px-1.5 py-0.5 font-mono text-[9px] font-bold tracking-wider",
         cls,
       )}
+      title={isDemo ? "Demo data — connect your MT5 account in Settings for live prices" : undefined}
     >
       <span
         className={cn(
           "h-1.5 w-1.5 rounded-full",
-          connected ? "bg-up live-dot" : offline ? "bg-red-500" : "bg-amber-500 live-dot",
+          isDemo ? "bg-amber-400" : connected ? "bg-up live-dot" : offline ? "bg-red-500" : "bg-amber-500 live-dot",
         )}
       />
       {label}

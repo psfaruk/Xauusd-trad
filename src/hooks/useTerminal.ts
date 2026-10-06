@@ -32,6 +32,12 @@ export interface Layers {
   structure: boolean;
   /** v17.1 — the momentum ribbon + structure/momentum state pills */
   momentum: boolean;
+  /** v20 — the market-structure NARRATIVE ink (AMD phases, consolidations,
+   *  institutional marks, the forecast map, path arrows). Default OFF: the
+   *  user audit called the all-on chart "এলোমেলো" — the narrative layers
+   *  were the loudest clutter. Only the CURRENT instance of each story
+   *  draws when enabled (inkSelect caps it). */
+  narrative: boolean;
   volume: boolean;
   setup: boolean;
   signals: boolean;
@@ -79,11 +85,14 @@ interface TerminalState {
 
 const DEFAULT_LAYERS: Layers = {
   ema: true, killzones: true, zones: true, levels: true,
-  structure: true, momentum: true, volume: true, setup: true, signals: true, ai: true,
+  structure: true, momentum: true, narrative: false,
+  volume: true, setup: true, signals: true, ai: true,
 };
 
 const DEFAULT_INK: InkFilters = {
-  maxLevels: 8, htf: true, faded: true, merged: false,
+  /** v20 clean-chart default: 2 levels above + 2 below the live price —
+   *  the old 8-line stack was the core of the “এলোমেলো” complaint */
+  maxLevels: 4, htf: true, faded: true, merged: false,
 };
 
 const savedLayers = (): Layers => {
@@ -113,7 +122,7 @@ const savedInk = (): InkFilters => {
       return {
         ...DEFAULT_INK,
         ...parsed,
-        maxLevels: Math.min(16, Math.max(3, Number(parsed.maxLevels ?? DEFAULT_INK.maxLevels) || DEFAULT_INK.maxLevels)),
+        maxLevels: Math.min(6, Math.max(2, Number(parsed.maxLevels ?? DEFAULT_INK.maxLevels) || DEFAULT_INK.maxLevels)),
       };
     }
   } catch {}

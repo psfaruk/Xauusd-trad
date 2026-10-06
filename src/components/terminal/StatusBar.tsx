@@ -33,6 +33,7 @@ export function StatusBar() {
 
   const source = status?.source ?? "mt5";
   const connected = status?.connected ?? false;
+  const isDemo = source === "demo";
   // v16.3 TRUE UTC: serverTime is BROKER wall-clock (UTC + offsetSec —
   // Exness runs GMT+2/+3). The old code fed it straight into sessionOf() and
   // printed it with a "UTC" suffix: sessions mislabeled ~6h/day (TOKYO read
@@ -52,9 +53,10 @@ export function StatusBar() {
   const ccy = trader?.currency ?? status?.account?.currency ?? "";
   const sourceLabel =
     offline ? t("mt5Offline")
+    : isDemo ? "DEMO DATA"
     : connected ? `MT5 ${t("live").toUpperCase()}`
     : t("connecting").toUpperCase();
-  const sourceClass = offline ? "text-red-500" : connected ? "text-up" : "text-amber-500";
+  const sourceClass = offline ? "text-red-500" : isDemo ? "text-amber-400" : connected ? "text-up" : "text-amber-500";
 
   return (
     <footer className="flex h-6 shrink-0 items-center gap-3 overflow-hidden border-t border-border bg-card/80 px-3 text-[10px] text-muted-foreground">
