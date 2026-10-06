@@ -4,8 +4,9 @@ import { evaluate } from "@/lib/market/engine";
 import { expiryBarsFor } from "@/lib/market/engine";
 import { seedSignals } from "@/lib/market/seed";
 import { atr } from "@/lib/market/indicators";
-import { buildDrawings, magnetsToDrawings, projectSetup, localBias, buildPhaseDrawings, buildMtfStructureDrawings, buildForecastDrawing } from "@/lib/market/drawings";
+import { buildDrawings, magnetsToDrawings, projectSetup, localBias, buildPhaseDrawings, buildMtfStructureDrawings, buildForecastDrawing, buildMomentumDrawing } from "@/lib/market/drawings";
 import { clusterLevels } from "@/lib/market/cluster";
+import { detectKeyLevels } from "@/lib/market/levels";
 import { buildRoadmap } from "@/lib/market/roadmap";
 import { detectStructure, detectSupplyDemand, detectOrderBlocks, detectFvg, detectLiquidity } from "@/lib/market/smc";
 import { detectConsolidations, detectAmdPhases, detectInstitutionalActivity } from "@/lib/market/phases";
@@ -16,7 +17,7 @@ import { svcHeaders, getBrokerOffsetSec, spreadFor, MT5_URL } from "@/lib/svc";
 const CACHE_TTL = 8_000;
 /** v16.4 (audit §10): the strategy build identity carried in every
  *  response so consumers/caches can compare across deploys. */
-const STRATEGY_VERSION = "v16.9";
+const STRATEGY_VERSION = "v17.1";
 /** v16.4 (audit §10): a candle older than 3× its timeframe (plus a
  *  market-closed weekend allowance) means the FEED is stale — surfaced
  *  via dataFreshness.fresh=false instead of passing silently. */
@@ -687,6 +688,35 @@ export async function GET(req: Request) {
       price: s.price, distAtr: s.distAtr, entryType: s.entryType,
     });
   }
+  // v17.1 — MTF S/R KEY LEVELS (user report: "সকল টাইম ফ্রেমে সাপোর্ট এন্ড
+  //    রেসিসটেন্স লেভেল ড্রয়িং হচ্ছে না"): EVERY fed timeframe answers with
+  //    its OWN live swing levels — unbroken swing highs = resistance,
+  //    unbroken swing lows = support, hit-counted, source-tf tagged. H1/H4
+  //    keep 3 per side (the key HTF levels), the fast tfs 2. The clustering
+  //    pass then merges duplicates at the same price into ONE line (×N
+  //    badge) and the ink budget caps how many show — nearest to price first.
+  for (const t of sourceTimeframes) {
+    const closedT = (bars[t] ?? []).filter((b) => !b.f).slice(-260);
+    if (closedT.length < 40) continue;
+    const perSide = t === "H1" || t === "H4" ? 3 : 2;
+    for (const lv of detectKeyLevels(closedT, perSide)) {
+      drawings.push({
+        kind: "hline",
+        price: lv.price,
+        label: "S/R",
+        tone: lv.side === "resistance" ? "bear" : "bull",
+        style: lv.hits >= 2 ? "solid" : "dash",
+        source_tf: t,
+        side: lv.side,
+        hits: lv.hits,
+        t: lv.t,
+      });
+    }
+  }
+  // v17.1 — the momentum + structure ribbon (per-bar velocity strip + the
+  //    two state pills) — the active tf's own read
+  const momentumInk = buildMomentumDrawing(closedBars, tf, result.context.structure.trend);
+  if (momentumInk) drawings.push(momentumInk);
   // v16.4 (audit §4/§10): data identity + freshness on every payload
   const tfSecMap: Record<string, number> = { M1: 60, M5: 300, M15: 900, M30: 1800, H1: 3600, H4: 14400 };
   // v17.0 (audit §dedup) — CROSS-SOURCE LEVEL CLUSTERING: all the level

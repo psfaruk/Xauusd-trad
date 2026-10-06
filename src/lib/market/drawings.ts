@@ -551,6 +551,44 @@ export function magnetsToDrawings(
   }));
 }
 
+/**
+ * v17.1 — the momentum + structure DRAWING (user report: "মার্কেট মোমেন্টাম
+ * ও মার্কেট স্ট্রাকচার ভালো ভাবে ড্রয়িং হচ্ছে না" — both reads existed in
+ * the engine but neither was INKED on the chart).
+ *
+ * Momentum = velocity of the last `look` closes normalized by ATR:
+ *   m_i = (c_i − c_{i−look}) / (ATR_i · √look), clamped to [-1, 1]
+ * — the honest "how fast is price actually moving" ruler (a +3$ run on a
+ * 12$ ATR M15 is a whim; the same run on a 4$ ATR is a train). The ribbon
+ * renders per-bar: strong/mild bull green, strong/mild bear red, flat
+ * gray. The structure trend rides along so the two state pills together
+ * answer "structure কী বলছে + momentum কী বলছে" at a glance.
+ */
+export function buildMomentumDrawing(
+  bars: Candle[],
+  tf: string,
+  trend: "bullish" | "bearish" | "neutral",
+): AutoDrawing | null {
+  const look = 5;
+  if (bars.length < look + 12) return null;
+  const a = atr(bars, 14);
+  const out: { t: number; m: number }[] = [];
+  for (let i = look; i < bars.length; i++) {
+    let atrI: number | null = null;
+    for (let k = i; k >= 0; k--) {
+      if (a[k] != null) { atrI = a[k] as number; break; }
+    }
+    if (atrI == null || !(atrI > 0)) continue;
+    const v = (bars[i].c - bars[i - look].c) / (atrI * Math.sqrt(look));
+    out.push({ t: bars[i].t, m: Math.max(-1, Math.min(1, v)) });
+  }
+  if (out.length < 10) return null;
+  const m = out[out.length - 1].m;
+  const state: "strong_bull" | "bull" | "flat" | "bear" | "strong_bear" =
+    m >= 0.55 ? "strong_bull" : m >= 0.18 ? "bull" : m <= -0.55 ? "strong_bear" : m <= -0.18 ? "bear" : "flat";
+  return { kind: "momentum", bars: out.slice(-140), m, state, trend, source_tf: tf };
+}
+
 export function pathToDrawing(path: { dir: "up" | "down"; target: number } | null, price: number): AutoDrawing | null {
   if (!path) return null;
   return { kind: "path", dir: path.dir, from_price: price, to_price: path.target };

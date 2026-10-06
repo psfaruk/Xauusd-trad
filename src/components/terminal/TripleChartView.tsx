@@ -36,7 +36,7 @@ import { X } from "lucide-react";
 /** every ink layer OFF — only candles + ghost volume remain */
 const BARE_LAYERS: Layers = {
   ema: false, killzones: false, zones: false, levels: false,
-  structure: false, volume: true, setup: false, signals: false, ai: false,
+  structure: false, momentum: false, volume: true, setup: false, signals: false, ai: false,
 };
 
 function fmtCompact(v: number) {

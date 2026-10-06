@@ -49,6 +49,7 @@ export function LayersPopover() {
     { key: "zones", label: t("layerZones") },
     { key: "levels", label: t("layerLevels") },
     { key: "structure", label: t("layerStructure") },
+    { key: "momentum", label: t("layerMomentum") },
     { key: "ema", label: t("layerEma") },
     { key: "killzones", label: t("layerKillzones") },
     { key: "volume", label: t("layerVolume") },

@@ -294,7 +294,17 @@ export type Tone = "bull" | "bear" | "gold" | "violet" | "neutral";
 /** Auto-drawing kinds — same visual grammar as the reference engine. */
 export type AutoDrawing =
   (
-  | { kind: "hline"; price: number; label: string; tone: Tone; style?: "solid" | "dash" }
+  | {
+      kind: "hline"; price: number; label: string; tone: Tone; style?: "solid" | "dash";
+      /** v17.1 — MTF S/R key level fields (absent on the plain EQ line):
+       *  the source timeframe that minted the level, which side it defends,
+       *  how many times it was tested, and the origin swing time the line
+       *  is drawn from. */
+      source_tf?: string;
+      side?: "support" | "resistance";
+      hits?: number;
+      t?: number;
+    }
   | {
       kind: "zone";
       side: "supply" | "demand" | "ob_bull" | "ob_bear" | "fvg_bull" | "fvg_bear";
@@ -380,6 +390,22 @@ export type AutoDrawing =
       price: number; distAtr: number; entryType: "market" | "limit";
     }
 
+  /** v17.1 — the momentum + structure read (user: "মার্কেট মোমেন্টাম ও
+   *  মার্কেট স্ট্রাকচার ভালো ভাবে ড্রয়িং হচ্ছে না"): a per-bar velocity
+   *  ribbon above the time axis + the two state pills (structure trend /
+   *  momentum state) so both reads are DRAWN, not just computed. */
+  | {
+      kind: "momentum";
+      /** per-bar momentum, last ~140 closed bars, m ∈ [-1, 1] */
+      bars: { t: number; m: number }[];
+      /** the live momentum value (-1..1) */
+      m: number;
+      state: "strong_bull" | "bull" | "flat" | "bear" | "strong_bear";
+      /** the active tf's structure trend (HH/HL vs LH/LL vote) */
+      trend: "bullish" | "bearish" | "neutral";
+      source_tf?: string;
+    }
+
   /** v17.0 (audit §dedup) — every auto-drawing carries cluster metadata:
    *  a deterministic stable ID (comparable across polls), a visibility
    *  RANK for level-type ink (1 = nearest to price; the renderer caps how
@@ -402,7 +428,7 @@ export interface UserDrawing {
   id: string;
   symbol: string;
   timeframe: string;
-  kind: "trendline" | "ray" | "hline" | "vline" | "rect" | "fib" | "text" | "measure";
+  kind: "trendline" | "ray" | "hline" | "vline" | "rect" | "fib" | "text" | "measure" | "triangle";
   points: { t: number; p: number }[];
   style: { color?: string; width?: number; text?: string };
   createdAt?: string;

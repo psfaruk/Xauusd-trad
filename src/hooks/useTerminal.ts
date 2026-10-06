@@ -16,6 +16,7 @@ export type ToolId =
   | "hline"
   | "vline"
   | "rect"
+  | "triangle"
   | "fib"
   | "text"
   | "measure";
@@ -29,6 +30,8 @@ export interface Layers {
   zones: boolean;
   levels: boolean;
   structure: boolean;
+  /** v17.1 — the momentum ribbon + structure/momentum state pills */
+  momentum: boolean;
   volume: boolean;
   setup: boolean;
   signals: boolean;
@@ -76,7 +79,7 @@ interface TerminalState {
 
 const DEFAULT_LAYERS: Layers = {
   ema: true, killzones: true, zones: true, levels: true,
-  structure: true, volume: true, setup: true, signals: true, ai: true,
+  structure: true, momentum: true, volume: true, setup: true, signals: true, ai: true,
 };
 
 const DEFAULT_INK: InkFilters = {

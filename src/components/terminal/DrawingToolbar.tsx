@@ -10,6 +10,7 @@ import {
   Minus,
   SeparatorVertical,
   Square,
+  Triangle,
   Percent,
   Type,
   Ruler,
@@ -29,6 +30,9 @@ const TOOLS: { id: ToolId; icon: any; key: string }[] = [
   { id: "hline", icon: Minus, key: "toolHline" },
   { id: "vline", icon: SeparatorVertical, key: "toolVline" },
   { id: "rect", icon: Square, key: "toolRect" },
+  // v17.1 (user report: "ট্রাই এঙ্গেল লাইন দিয়ে ড্রয়িং করা যায়, সেটা নাই") —
+  // the 3-anchor triangle tool: tap three vertices, get a closed triangle
+  { id: "triangle", icon: Triangle, key: "toolTriangle" },
   { id: "fib", icon: Percent, key: "toolFib" },
   { id: "text", icon: Type, key: "toolText" },
   { id: "measure", icon: Ruler, key: "toolMeasure" },

@@ -60,6 +60,10 @@ interface Candidate {
   label: string;          // human rationale: "H4 supply", "M15 bull OB"
   tier: 1 | 2 | 3;
   ageBars: number;        // smaller = fresher (0 = timeless)
+  /** v17.1: within-tier strength — the S/R hit count. A 9-touch support
+   *  beats a plain EQ midpoint sitting at the same price (same tier,
+   *  more evidence wins before freshness is consulted). */
+  strength: number;
 }
 
 const ZONE_EDGE_NAME: Record<string, string> = {
@@ -73,7 +77,12 @@ const ZONE_EDGE_NAME: Record<string, string> = {
 function assignId(d: AutoDrawing, tf: string): string {
   const p2 = (n: number) => n.toFixed(2);
   switch (d.kind) {
-    case "hline": return `hline|${d.label}|${p2(d.price)}`;
+    case "hline":
+      // v17.1: an MTF S/R level's identity includes its source tf + side —
+      // "H1 resistance at 4162" stays H1 resistance at 4162 across polls
+      return d.source_tf != null && d.side != null
+        ? `hline|${d.source_tf}|${d.side}|${p2(d.price)}`
+        : `hline|${d.label}|${p2(d.price)}`;
     case "zone": return `zone|${d.source_tf ?? tf}|${d.side}|${d.t}`;
     case "liq": return `liq|${d.side}|${d.t}`;
     case "magnet": return `magnet|${d.source}|${p2(d.price)}`;
@@ -93,6 +102,7 @@ function assignId(d: AutoDrawing, tf: string): string {
     case "path": return `path|${d.dir}|${p2(d.to_price)}`;
     case "pattern": return `pattern|${d.source_tf ?? tf}|${d.name}|${d.points[0]?.t ?? 0}`;
     case "tf_setup": return `tf_setup|${d.tf}|${p2(d.entry)}`;
+    case "momentum": return `momentum|${d.source_tf ?? tf}|${d.bars[d.bars.length - 1]?.t ?? 0}`;
     default: return `unk|${(d as { kind?: string }).kind ?? "?"}`;
   }
 }
@@ -113,17 +123,33 @@ export function clusterLevels(drawings: AutoDrawing[], opts: ClusterOptions): Au
   for (let i = 0; i < drawings.length; i++) {
     const d = drawings[i];
     if (d.kind === "hline") {
-      cands.push({ i, price: d.price, label: `${d.label} (equilibrium)`, tier: 3, ageBars: 0 });
+      // v17.1 — MTF S/R key levels: an H1/H4-sourced level is a TIER-1
+      // "HTF key level" (the audit's top of the hierarchy); an active-tf
+      // level is tier-3 local S/R. The plain EQ line stays tier-3 timeless.
+      const isSr = d.side != null;
+      if (isSr) {
+        const htf = d.source_tf != null && (TF_ORDER[d.source_tf] ?? 0) > (TF_ORDER[activeTf] ?? 0);
+        cands.push({
+          i,
+          price: d.price,
+          label: `${d.source_tf ?? activeTf} ${d.side === "resistance" ? "resistance" : "support"}${(d.hits ?? 1) > 1 ? ` ×${d.hits}` : ""}`,
+          tier: htf ? 1 : 3,
+          ageBars: barsAge(d.t ?? lastBarT),
+          strength: d.hits ?? 1,
+        });
+      } else {
+        cands.push({ i, price: d.price, label: `${d.label} (equilibrium)`, tier: 3, ageBars: 0, strength: 0 });
+      }
       continue;
     }
     if (d.kind === "liq") {
       // only LIVE pools cluster — swept/run pools are history (X marks)
       if (d.state !== "untouched") continue;
-      cands.push({ i, price: d.price, label: `${d.side} pool ${d.price.toFixed(2)}`, tier: 3, ageBars: barsAge(d.t) });
+      cands.push({ i, price: d.price, label: `${d.side} pool ${d.price.toFixed(2)}`, tier: 3, ageBars: barsAge(d.t), strength: 0 });
       continue;
     }
     if (d.kind === "magnet") {
-      cands.push({ i, price: d.price, label: `magnet ${d.source}`, tier: 3, ageBars: 0 });
+      cands.push({ i, price: d.price, label: `magnet ${d.source}`, tier: 3, ageBars: 0, strength: 0 });
       continue;
     }
     if (d.kind === "zone") {
@@ -141,6 +167,7 @@ export function clusterLevels(drawings: AutoDrawing[], opts: ClusterOptions): Au
         label: `${d.source_tf ?? activeTf} ${ZONE_EDGE_NAME[d.side] ?? d.side}${d.institutional ? " · INST" : ""}`,
         tier,
         ageBars: barsAge(d.t),
+        strength: 0,
       });
     }
   }
@@ -179,7 +206,7 @@ export function clusterLevels(drawings: AutoDrawing[], opts: ClusterOptions): Au
       continue;
     }
     const ranked = [...cl].sort(
-      (a, b) => a.tier - b.tier || a.ageBars - b.ageBars || Math.abs(a.price - price) - Math.abs(b.price - price),
+      (a, b) => a.tier - b.tier || b.strength - a.strength || a.ageBars - b.ageBars || Math.abs(a.price - price) - Math.abs(b.price - price),
     );
     const win = ranked[0];
     const winD = drawings[win.i];

@@ -139,6 +139,8 @@ interface Props {
 interface PendingCreate {
   kind: ToolId;
   a1?: { x: number; y: number; t: number; p: number };
+  /** v17.1 — the triangle tool's SECOND anchor (3-anchor creation) */
+  a2?: { x: number; y: number; t: number; p: number };
   move?: { x: number; y: number; t: number; p: number };
 }
 
@@ -765,6 +767,7 @@ export default function TradingChart(props: Props) {
         forecast: "structure",
         path: "structure",
         tf_setup: "setup",
+        momentum: "momentum",
       };
       // v17.0 — INK FILTERS (the audit's dedup/count/freshness controls):
       //  · merged duplicates stay hidden unless explicitly asked for
@@ -813,12 +816,30 @@ export default function TradingChart(props: Props) {
             const y = yOfPrice(d.price);
             if (y === null) return;
             const tone = TONES[d.tone] ?? TONES.neutral;
+            // v17.1 — MTF S/R key level: tagged R/S · TF · ×hits, drawn
+            // FROM the origin swing (TradingView-style) instead of full
+            // width; multi-hit levels are solid, single-test dashed
+            const isSr = d.side != null && d.source_tf != null;
+            const x0 = isSr && d.t != null ? (xOfTime(d.t) ?? 0) : 0;
             const faded = d.style === "dash";
             // v17.0: a clustered winner wears the ×N merge badge
             const mc = d.mergedFrom?.length ?? 0;
-            const hl = mc ? `${d.label} ×${mc + 1}` : d.label;
-            hardSeg(ctx, 0, y, rightEdge, y, tone.line(faded ? 0.45 : 0.9), tone.halo(0.08), 0.6, faded ? [4, 4] : []);
-            if (mc) tips.push({ x1: rightEdge - 240, y1: y - 9, x2: rightEdge, y2: y + 9, title: hl, price: d.price.toFixed(digits), mergedFrom: d.mergedFrom });
+            const srTag = isSr
+              ? `${d.side === "resistance" ? "R" : "S"}·${d.source_tf}${(d.hits ?? 1) > 1 ? ` ×${d.hits}` : ""}`
+              : null;
+            const hl = srTag ?? (mc ? `${d.label} ×${mc + 1}` : d.label);
+            hardSeg(
+              ctx, Math.max(0, x0), y, rightEdge, y,
+              tone.line(faded ? 0.45 : 0.9), tone.halo(0.08), 0.6,
+              faded ? [4, 4] : [],
+            );
+            if (mc) {
+              tips.push({
+                x1: 0, y1: y - 9, x2: rightEdge, y2: y + 9,
+                title: srTag != null ? `${d.side === "resistance" ? "RESISTANCE" : "SUPPORT"} · ${d.source_tf}${mc ? ` ×${mc + 1}` : ""}` : hl,
+                price: d.price.toFixed(digits), sourceTf: d.source_tf, mergedFrom: d.mergedFrom,
+              });
+            }
             if (tryLabel(rightEdge - 4, y - 8, hl, 8.5, "right")) {
               pillLabel(ctx, hl, rightEdge - 4, y - 8, tone.text, tone.line(0.5), "right", 8.5);
             }
@@ -1313,6 +1334,62 @@ export default function TradingChart(props: Props) {
             }
             break;
           }
+          case "momentum": {
+            // v17.1 — the momentum ribbon (user: "মার্কেট মোমেন্টাম ও মার্কেট
+            // স্ট্রাকচার ভালো ভাবে ড্রয়িং হচ্ছে না"): a per-bar velocity
+            // strip above the time axis + the two state pills — structure
+            // trend and momentum state, both DRAWN instead of buried in the
+            // engine. Ribbon: strong/mild bull green, strong/mild bear red,
+            // flat gray — reads like a heartbeat of the market.
+            let axisH = 26;
+            try {
+              // (chartRef re-read locally — the hoisted renderAuto can't
+              // inherit drawOverlay's non-null narrowing)
+              const ch = chartRef.current;
+              axisH = ch ? (ch.timeScale() as { height?: () => number }).height?.() ?? 26 : 26;
+            } catch { /* older builds — the 26px default stands */ }
+            const laneH = 7;
+            const y0 = h - axisH - laneH - 2;
+            if (y0 > 40) {
+              // backing lane — the strip reads as its own lane even over
+              // the volume histogram's baseline
+              ctx.fillStyle = isDark ? "rgba(8,12,10,0.62)" : "rgba(250,249,246,0.72)";
+              ctx.fillRect(0, y0, rightEdge, laneH);
+              hardSeg(ctx, 0, y0 + laneH + 0.5, rightEdge, y0 + laneH + 0.5, isDark ? "rgba(34,48,41,0.9)" : "rgba(220,216,205,0.9)", "transparent", 0.5);
+              const cellW = Math.max(1.5, Math.min(barSpacing, 10));
+              for (const b of d.bars) {
+                const x = xOfTime(b.t);
+                if (x === null || x < -cellW || x > rightEdge) continue;
+                const v = Math.abs(b.m);
+                const strong = v >= 0.55;
+                const mild = v >= 0.18;
+                ctx.fillStyle = b.m >= 0
+                  ? strong ? "rgba(52,211,153,0.95)" : mild ? "rgba(52,211,153,0.42)" : "rgba(148,163,158,0.22)"
+                  : strong ? "rgba(248,113,113,0.95)" : mild ? "rgba(248,113,113,0.42)" : "rgba(148,163,158,0.22)";
+                ctx.fillRect(Math.max(0, x - cellW / 2), y0 + 1, cellW, laneH - 2);
+              }
+            }
+            // the two state pills — top-left, under the OHLC legend
+            if (!bareRef.current) {
+              const py = 30;
+              const sTxt = `STRUCTURE ${d.trend === "bullish" ? "▲ BULLISH" : d.trend === "bearish" ? "▼ BEARISH" : "◆ RANGING"}`;
+              const sCol = d.trend === "bullish"
+                ? "rgba(110,231,183,0.95)"
+                : d.trend === "bearish" ? "rgba(252,165,165,0.95)" : "rgba(178,190,185,0.9)";
+              pillLabel(ctx, sTxt, 8, py, sCol, sCol.replace("0.95", "0.45").replace("0.9", "0.4"), "left", 8);
+              const mTxt = `MOMENTUM ${d.m >= 0 ? "▲" : "▼"} ${
+                d.state === "strong_bull" ? "STRONG +" : d.state === "bull" ? "+" :
+                d.state === "strong_bear" ? "STRONG −" : d.state === "bear" ? "−" : "·"
+              }${Math.abs(d.m).toFixed(2)}`;
+              const mCol = d.m >= 0.18
+                ? "rgba(110,231,183,0.95)"
+                : d.m <= -0.18 ? "rgba(252,165,165,0.95)" : "rgba(178,190,185,0.9)";
+              ctx.font = `700 8px ${FONT_FAMILY}`;
+              const sW = ctx.measureText(sTxt).width + 13;
+              pillLabel(ctx, mTxt, 8 + sW + 4, py, mCol, mCol.replace("0.95", "0.45").replace("0.9", "0.4"), "left", 8);
+            }
+            break;
+          }
           case "path": {
             const yA = yOfPrice(d.from_price);
             const yB = yOfPrice(d.to_price);
@@ -1347,6 +1424,32 @@ export default function TradingChart(props: Props) {
                   ctx.fillStyle = pt.fill(0.035);
                   ctx.fillRect(zx, Math.min(yA, yB), rightEdge - zx, Math.abs(yB - yA));
                 }
+              }
+            }
+            // 1b. v17.1 — converging boundary patterns (TRIANGLE / WEDGE /
+            //     PENNANT) get the area BETWEEN their two boundary lines
+            //     filled — the shape reads instantly as a coil instead of
+            //     two thin lines the eye loses against the candles
+            if (
+              (d.name.includes("TRIANGLE") || d.name.includes("WEDGE") || d.name.includes("PENNANT")) &&
+              (d.lines ?? []).length >= 2
+            ) {
+              const [gA, gB] = d.lines;
+              const ax1 = xOfTime(gA.t1), ax2 = xOfTime(gA.t2);
+              const ay1 = yOfPrice(gA.p1), ay2 = yOfPrice(gA.p2);
+              const bx1 = xOfTime(gB.t1), bx2 = xOfTime(gB.t2);
+              const by1 = yOfPrice(gB.p1), by2 = yOfPrice(gB.p2);
+              if ([ax1, ax2, ay1, ay2, bx1, bx2, by1, by2].every((v) => v !== null)) {
+                ctx.save();
+                ctx.beginPath();
+                ctx.moveTo(clamp(ax1!, -2, rightEdge), ay1!);
+                ctx.lineTo(clamp(ax2!, -2, rightEdge), ay2!);
+                ctx.lineTo(clamp(bx2!, -2, rightEdge), by2!);
+                ctx.lineTo(clamp(bx1!, -2, rightEdge), by1!);
+                ctx.closePath();
+                ctx.fillStyle = pt.fill(0.07);
+                ctx.fill();
+                ctx.restore();
               }
             }
             // 2. geometry lines — thin hard cores, dashed for necklines
@@ -1616,6 +1719,32 @@ export default function TradingChart(props: Props) {
             hit.rects.push({ x1: rx, y1: ry, x2: rx + rw, y2: ry + rh });
             break;
           }
+          case "triangle": {
+            // v17.1 — the 3-anchor triangle tool: closed polygon + whisper
+            // fill, three draggable vertices, bounding-box hit target
+            if (pts.length < 3 || pts.some((p) => p.x === null || p.y === null)) break;
+            const [t1, t2, t3] = pts;
+            ctx.save();
+            ctx.beginPath();
+            ctx.moveTo(t1.x!, t1.y!);
+            ctx.lineTo(t2.x!, t2.y!);
+            ctx.lineTo(t3.x!, t3.y!);
+            ctx.closePath();
+            ctx.fillStyle = "rgba(226,232,230,0.05)";
+            ctx.fill();
+            ctx.strokeStyle = color;
+            ctx.lineWidth = 0.7;
+            ctx.stroke();
+            ctx.restore();
+            hit.pts.push({ x: t1.x!, y: t1.y! }, { x: t2.x!, y: t2.y! }, { x: t3.x!, y: t3.y! });
+            hit.rects.push({
+              x1: Math.min(t1.x!, t2.x!, t3.x!),
+              y1: Math.min(t1.y!, t2.y!, t3.y!),
+              x2: Math.max(t1.x!, t2.x!, t3.x!),
+              y2: Math.max(t1.y!, t2.y!, t3.y!),
+            });
+            break;
+          }
           case "fib": {
             if (pts.length < 2 || pts[0].x === null || pts[0].y === null || pts[1].x === null || pts[1].y === null) break;
             const ratios = [0.236, 0.382, 0.5, 0.618, 0.786];
@@ -1668,7 +1797,17 @@ export default function TradingChart(props: Props) {
         ctx.setLineDash([3, 3]);
         ctx.strokeStyle = "rgba(245,158,11,0.8)";
         ctx.lineWidth = 0.9;
-        if (preview.kind === "trendline" || preview.kind === "ray" || preview.kind === "fib" || preview.kind === "measure") {
+        if (preview.kind === "triangle" && preview.a2) {
+          // two vertices placed → live closed-shape preview following the cursor
+          ctx.beginPath();
+          ctx.moveTo(a1.x, a1.y);
+          ctx.lineTo(preview.a2.x, preview.a2.y);
+          ctx.lineTo(move.x, move.y);
+          ctx.closePath();
+          ctx.fillStyle = "rgba(245,158,11,0.06)";
+          ctx.fill();
+          ctx.stroke();
+        } else if (preview.kind === "trendline" || preview.kind === "ray" || preview.kind === "fib" || preview.kind === "measure") {
           ctx.beginPath();
           ctx.moveTo(a1.x, a1.y);
           ctx.lineTo(move.x, move.y);
@@ -1928,6 +2067,26 @@ export default function TradingChart(props: Props) {
       }
 
       if (currentTool !== "cursor") {
+        // v17.1 — the triangle tool is THREE-anchor: first tap = vertex 1,
+        // second tap = vertex 2, third tap closes the shape and persists it
+        if (currentTool === "triangle") {
+          if (!pendingRef.current?.a1) {
+            pendingRef.current = { kind: "triangle", a1: tp };
+          } else if (!pendingRef.current.a2) {
+            pendingRef.current.a2 = tp;
+          } else {
+            const { a1, a2 } = pendingRef.current;
+            onCreateDrawing({
+              symbol, timeframe, kind: "triangle",
+              points: [{ t: a1!.t, p: a1!.p }, { t: a2!.t, p: a2!.p }, { t: tp.t, p: tp.p }],
+              style: {},
+            });
+            pendingRef.current = null;
+            onToolDone();
+          }
+          drawOverlayRef.current();
+          return;
+        }
         const twoAnchor = ["trendline", "ray", "rect", "fib", "measure"].includes(currentTool);
         if (currentTool === "measure") {
           if (!pendingRef.current?.a1) {
