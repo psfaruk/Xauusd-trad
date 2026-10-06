@@ -366,16 +366,30 @@ export type AutoDrawing =
       tone?: "bull" | "bear";
       source_tf?: string;
     }
-  /** v18.0 (reference-image port — "multiple setups"): a classic
-   *  CANDLESTICK pattern (hammer / engulfing / star) boxed on the chart the
-   *  way the user's reference screenshots highlight them — a thin outlined
-   *  rectangle around the exact pattern candles with a small name tag. */
+  /** v18.0 → v19.0 — a classic CANDLESTICK pattern setup boxed on the chart
+   *  the way the user's reference screenshots highlight them: a thin
+   *  outlined rectangle around the exact pattern candles with a small name
+   *  tag. v19.0 grows the grammar from 3 toy shapes to the full 34-setup
+   *  catalog (1–5 candles): the tag now carries the N-candle count, the
+   *  predicted direction arrow and the context confidence; the box border
+   *  tells the pattern's resolved status (confirmed / failed / fresh). */
   | {
       kind: "candle";
-      /** short display name — "HAMMER", "BULL ENGULF", "MORNING STAR"… */
+      /** short display code — "HAMMER", "ENGULF+", "MORNING*"… */
+      code: string;
       name: string;
       side: "bull" | "bear";
-      /** first → last pattern bar time (1–3 bars) */
+      /** candle count 1..5 */
+      n: number;
+      /** the market direction it predicts */
+      direction: "up" | "down";
+      /** resolved against the bars that followed the pattern */
+      status: "fresh" | "confirmed" | "failed" | "expired";
+      /** the trade outcome (confirmed setups only) */
+      outcome?: "won" | "lost" | "open";
+      /** context-weighted confidence 0..100 */
+      confidence: number;
+      /** first → last pattern bar time (1–5 bars) */
       t0: number; t1: number;
       /** price envelope of the pattern bars (box top/bottom) */
       lo: number; hi: number;
@@ -448,6 +462,87 @@ export interface UserDrawing {
   points: { t: number; p: number }[];
   style: { color?: string; width?: number; text?: string };
   createdAt?: string;
+}
+
+// ═══════════════ v19.0 — the candlestick pattern strategy layer ═══════════════
+//
+// User spec: "কোনো টাইম ফ্রেমে কোনো ক্যান্ডেল, মার্কেটের কোনো পজিশনে হলে
+// এটার লজিক কি? মার্কেট আপ যাবে নাকি ডাউন?" — every detection carries the
+// full answer: the shape, the market position it fired in, the WHY (bilingual
+// logic bullets), the predicted direction and the priced trade plan.
+
+export type CandleStatus = "fresh" | "confirmed" | "failed" | "expired";
+
+/** one detected candlestick setup with its complete logic read */
+export interface CandlePattern {
+  /** stable id: code:first-bar-time */
+  id: string;
+  code: string;
+  nameEn: string;
+  nameBn: string;
+  /** candle count 1..5 */
+  n: number;
+  side: "bull" | "bear";
+  /** what the pattern claims */
+  bias: "reversal" | "continuation" | "indecision";
+  /** the market's predicted direction from the trigger */
+  direction: "up" | "down";
+  t0: number; t1: number;   // first/last pattern bar time (UTC sec)
+  lo: number; hi: number;   // price envelope of the pattern bars
+  triggerClose: number;
+  confidence: number;       // 0..100 — context-weighted
+  /** the PATTERN lifecycle: fresh = WATCH (entry waits for the
+   *  confirmation close) · confirmed = the confirmation printed and the
+   *  plan is live · failed = broke before confirming · expired = the
+   *  window passed with no confirmation (never a trade) */
+  status: CandleStatus;
+  /** the TRADE outcome (status==="confirmed" only): won / lost / open —
+   *  computed with the backtest's exact resolution rule */
+  outcome: "won" | "lost" | "open" | null;
+  /** the trade plan (entry = confirmation close once confirmed, else the
+   *  pending confirmation level) */
+  entry: number; sl: number; tp: number; rr: number;
+  /** the LOGIC — why up / why down (bilingual; UI picks by locale) */
+  logicEn: string[];
+  logicBn: string[];
+  /** the market position it fired in */
+  context: {
+    trendInto: "up" | "down" | "flat";
+    atLevel: "support" | "resistance" | null;
+    levelPrice: number | null;
+    structure: "HH/HL" | "LH/LL" | "range";
+    rsi: number | null;
+    volZ: number;
+  };
+}
+
+/** one pattern family's walk-forward stats on this symbol+tf */
+export interface CandlePatternStat {
+  code: string;
+  nameEn: string;
+  nameBn: string;
+  n: number;
+  side: "bull" | "bear";
+  fired: number;
+  won: number;
+  lost: number;
+  expired: number;
+  winPct: number;
+  avgR: number;
+  totalR: number;
+}
+
+/** the candle engine's walk-forward backtest (fills at trigger close,
+ *  stop/target resolution over the following 24 bars — the numbers the
+ *  pattern panel's win-rate badges carry) */
+export interface CandleBacktest {
+  scanned: number;
+  horizonBars: number;
+  /** patterns excluded from stats (trigger too close to the last bar) */
+  open: number;
+  overall: { fired: number; won: number; lost: number; expired: number; winPct: number; avgR: number; totalR: number };
+  byCode: CandlePatternStat[];
+  byN: { n: number; fired: number; winPct: number; avgR: number }[];
 }
 
 export interface CheckItem {
@@ -592,6 +687,13 @@ export interface AnalysisResponse {
   tfSetups: TfSetup[];
   nearMiss: string[];
   drawings: AutoDrawing[];
+  /** v19.0 — the candlestick strategy read for this symbol+tf: every
+   *  detected 1–5 candle setup with its WHY logic, direction and priced
+   *  plan (newest first). The chart boxes are these same patterns. */
+  candles: CandlePattern[];
+  /** v19.0 — the candle engine's walk-forward backtest on this same bar
+   *  window (per-pattern win rates for the panel badges). */
+  candleBacktest: CandleBacktest | null;
   roadmap: RoadmapData;
   snapshot: IndicatorSnapshot;
   /** v16.4 (audit §4/§10): timeframe/data identity — candle open time of

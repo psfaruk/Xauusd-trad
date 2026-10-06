@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { seedSignals } from "@/lib/market/seed";
+import { backtestCandles } from "@/lib/market/candlesticks";
 import type { Candle } from "@/lib/market/types";
 import { MT5_URL, svcHeaders, getBrokerOffsetSec, spreadFor } from "@/lib/svc";
 
@@ -67,6 +68,13 @@ export async function GET(req: Request) {
 
   const { signals, scanned } = seedSignals({ symbol, tf, digits, spread, bars, brokerOffsetSec });
 
+  // v19.0 — the candlestick-pattern backtest on the SAME bars: every
+  // 1–5 candle setup the live engine would print, filled at its trigger
+  // close and resolved stop-first over the following 24 bars. Per-pattern
+  // win rates + per-candle-count stats — the verification the pattern
+  // panel's badges quote (nothing theoretical, all from this symbol+tf).
+  const candles = backtestCandles(bars);
+
   // audit §7.4 (Phase 4): adverse entry slippage on the simulated fills —
   // applied IN PLACE before the stats below so W/L classes stay identical
   // (SL/TP are price levels) while every filled trade's R shifts down by
@@ -117,6 +125,7 @@ export async function GET(req: Request) {
       avgRR: Math.round(avgRR * 100) / 100,
       byTrigger,
     },
+    candles,
     signals: signals.slice(-40).reverse(),
     generatedAt: Date.now(),
   };

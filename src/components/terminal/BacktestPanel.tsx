@@ -6,8 +6,7 @@
  * Auto-runs on mount and re-runs fresh whenever the symbol/timeframe changes.
  */
 
-import { useEffect, useRef, useState } from "react";
-import { useMutation } from "@tanstack/react-query";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { motion, type Variants } from "framer-motion";
 import type { AnalysisResponse, SignalPayload } from "@/lib/market/types";
 import { useI18n } from "@/lib/i18n";
@@ -25,6 +24,7 @@ import {
   ArrowUpRight,
   ArrowDownRight,
   AlertTriangle,
+  CandlestickChart,
 } from "lucide-react";
 
 /** GET /api/backtest payload (mirror of the API route shape). */
@@ -54,6 +54,8 @@ interface BacktestResponse {
   digits: number;
   scanned: number;
   stats: BacktestStats;
+  /** v19.0 — the candle-engine walk-forward stats on the same bars */
+  candles: import("@/lib/market/types").CandleBacktest;
   signals: SignalPayload[];
   generatedAt: number;
 }
@@ -86,15 +88,33 @@ export function BacktestPanel({ analysis }: { analysis?: AnalysisResponse | null
   const { symbol, timeframe } = useTerminal();
   const [openIdx, setOpenIdx] = useState<number | null>(null);
 
-  const { data, isPending, isError, error, mutate } = useMutation({
-    mutationFn: async (vars: { symbol: string; tf: string }): Promise<BacktestResponse> => {
+  // v19.0: plain fetch + state (the app's own convention — useFeed does the
+  // same). This panel was the app's ONLY React-Query consumer and its
+  // useMutation never settled under React 19 dev (the mutationFn resolved —
+  // fetch 200, JSON parsed — but isPending stayed true forever, leaving the
+  // panel on an eternal "BACKTESTING…" skeleton; verified in-browser).
+  const [data, setData] = useState<BacktestResponse | null>(null);
+  const [isPending, setIsPending] = useState(false);
+  const [isError, setIsError] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const run = useCallback(async () => {
+    setIsPending(true);
+    setIsError(false);
+    setError(null);
+    try {
       const res = await fetch(
-        `/api/backtest?symbol=${encodeURIComponent(vars.symbol)}&tf=${encodeURIComponent(vars.tf)}`,
+        `/api/backtest?symbol=${encodeURIComponent(symbol)}&tf=${encodeURIComponent(timeframe)}`,
       );
       if (!res.ok) throw new Error(`backtest ${res.status}`);
-      return res.json();
-    },
-  });
+      setData((await res.json()) as BacktestResponse);
+    } catch (e) {
+      setIsError(true);
+      setError(e instanceof Error ? e.message : "backtest failed");
+    } finally {
+      setIsPending(false);
+    }
+  }, [symbol, timeframe]);
 
   // auto-run once on mount + a fresh run whenever the market/timeframe
   // changes (the ref dedupes strict-mode double effects; retries on error
@@ -104,8 +124,8 @@ export function BacktestPanel({ analysis }: { analysis?: AnalysisResponse | null
     const key = `${symbol}|${timeframe}`;
     if (attemptedRef.current === key) return;
     attemptedRef.current = key;
-    mutate({ symbol, tf: timeframe });
-  }, [symbol, timeframe, mutate]);
+    void run();
+  }, [symbol, timeframe, run]);
 
   // only show results that belong to the CURRENT market + timeframe —
   // a stale result (symbol/tf just switched) is treated as a reset
@@ -115,7 +135,7 @@ export function BacktestPanel({ analysis }: { analysis?: AnalysisResponse | null
   const winTone =
     st == null ? "" : st.winPct >= 45 ? "text-up" : st.winPct >= 35 ? "text-gold" : "text-down";
 
-  const doRun = () => mutate({ symbol, tf: timeframe });
+  const doRun = () => void run();
 
   return (
     <div className="flex h-full flex-col">
@@ -180,7 +200,7 @@ export function BacktestPanel({ analysis }: { analysis?: AnalysisResponse | null
             <div className="rounded-lg border border-down/30 bg-down/5 p-3">
               <div className="mb-2 flex items-center gap-1.5 text-[11px] font-bold text-down">
                 <AlertTriangle className="h-3.5 w-3.5" />
-                {error instanceof Error ? error.message : "backtest failed"}
+                {error ?? "backtest failed"}
               </div>
               <Button
                 size="sm"
@@ -298,6 +318,65 @@ export function BacktestPanel({ analysis }: { analysis?: AnalysisResponse | null
                     ))}
                 </div>
               </motion.div>
+
+              {/* v19.0 — the candle-engine backtest (confirmation-entry fills) */}
+              {fresh.candles && fresh.candles.overall.fired > 0 && (
+                <motion.div variants={ITEM_V} className="rounded-lg border border-gold/25 bg-gold/[0.03] p-2.5">
+                  <div className="mb-1 flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-wider text-muted-foreground/70">
+                    <CandlestickChart className="h-3 w-3 text-gold" />
+                    {t("candleBtTitle")}
+                  </div>
+                  <p className="mb-1.5 text-[9px] leading-snug text-muted-foreground/80">{t("candleBtHint")}</p>
+                  <div className="mb-2 flex flex-wrap items-center gap-1 font-mono text-[10px]">
+                    <span className="rounded border border-border bg-muted/40 px-1.5 py-px text-muted-foreground">
+                      {fresh.candles.overall.fired}×
+                    </span>
+                    <span className="text-up">{fresh.candles.overall.won}W</span>
+                    <span className="text-muted-foreground/50">/</span>
+                    <span className="text-down">{fresh.candles.overall.lost}L</span>
+                    <span className={cn("tnum ml-1 font-bold", rTone(fresh.candles.overall.totalR))}>
+                      {fmtR(fresh.candles.overall.totalR)}
+                    </span>
+                    <span className="ml-auto text-muted-foreground/70">
+                      {fresh.candles.overall.winPct}% · avg {fmtR(fresh.candles.overall.avgR)}
+                    </span>
+                  </div>
+                  {/* by candle count — which N works on this tape */}
+                  <div className="mb-2 text-[9px] font-bold uppercase tracking-wider text-muted-foreground/60">
+                    {t("candleByCount")}
+                  </div>
+                  <div className="mb-2 grid grid-cols-5 gap-1">
+                    {fresh.candles.byN.map((n) => (
+                      <div key={n.n} className="rounded border border-border bg-muted/30 p-1 text-center">
+                        <div className="font-mono text-[9px] text-muted-foreground">{n.n}×</div>
+                        <div className={cn("tnum font-mono text-[10px] font-bold", n.winPct >= 45 ? "text-up" : "text-muted-foreground")}>
+                          {n.winPct}%
+                        </div>
+                        <div className={cn("tnum font-mono text-[8px]", rTone(n.avgR))}>{fmtR(n.avgR, 2)}</div>
+                      </div>
+                    ))}
+                  </div>
+                  {/* per-pattern table */}
+                  <div className="space-y-0.5">
+                    {fresh.candles.byCode.slice(0, 8).map((c) => (
+                      <div key={c.code} className="flex items-center gap-2 font-mono text-[10px]">
+                        <span className="w-3 shrink-0 text-center">{c.side === "bull" ? "▲" : "▼"}</span>
+                        <span className="w-20 shrink-0 truncate text-muted-foreground">{c.code}</span>
+                        <span className="tnum w-7 shrink-0 text-muted-foreground/70">{c.fired}×</span>
+                        <span className="tnum flex-1">
+                          <span className="text-up">{c.won}W</span>
+                          <span className="text-muted-foreground/50"> / </span>
+                          <span className="text-down">{c.lost}L</span>
+                        </span>
+                        <span className="tnum w-9 shrink-0 text-muted-foreground/80">{c.winPct}%</span>
+                        <span className={cn("tnum w-14 shrink-0 text-right font-bold", rTone(c.totalR))}>
+                          {fmtR(c.totalR)}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </motion.div>
+              )}
 
               {/* signal history */}
               <motion.div variants={ITEM_V}>

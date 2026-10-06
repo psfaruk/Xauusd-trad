@@ -1059,12 +1059,18 @@ export default function TradingChart(props: Props) {
             break;
           }
           case "candle": {
-            // v18.0 (user reference images — the boxed candlestick setups):
-            // a thin outlined rectangle around the EXACT pattern candles
-            // (hammer / engulfing / star) with a small name tag — the
-            // reference screenshots' highlight-box grammar. Bullish
-            // patterns tag below, bearish above, so the box never fights
-            // the swing tags for the same space.
+            // v19.0 — the candlestick STRATEGY box (34→32-setup catalog,
+            // confirmation-entry): the v18.0 highlight-box grammar stays
+            // (near-white rectangle around the exact pattern candles) but
+            // now tells the setup's whole story:
+            //   · fresh (WATCH)      — white box + gold "•" (entry waits
+            //     for the confirmation close — the plan is pending)
+            //   · confirmed          — side-tone border (validated setup)
+            //     + "✓" when the trade paid / "✗" when it stopped
+            //   · failed             — dashed muted box (broke before
+            //     confirming — history, not a live setup)
+            // The tag carries code + direction arrow + confidence, and a
+            // ×N badge for multi-candle patterns (2–5 bars).
             const cpt = d.side === "bull" ? TONES.bull : TONES.bear;
             const x0c = xOfTime(d.t0);
             const x1c = xOfTime(d.t1);
@@ -1079,23 +1085,51 @@ export default function TradingChart(props: Props) {
             const bh = Math.abs(y1c! - y0c!);
             if (bh < 2) return;
             const by0 = Math.min(y0c!, y1c!);
-            // whisper fill + NEAR-WHITE border (reference-image grammar: the
-            // highlight boxes are the highest-contrast ink on the chart — a
-            // green border over a green hammer candle is invisible, VLM/pixel
-            // audit confirmed; white reads over every candle color)
-            ctx.fillStyle = cpt.fill(0.06);
+            // fill: whisper tone for live setups, near-nothing for failed
+            const live = d.status === "fresh" || d.status === "confirmed";
+            ctx.fillStyle = d.status === "failed" ? cpt.fill(0.02) : cpt.fill(0.06);
             ctx.fillRect(bx0, by0, bw, bh);
-            const boxEdge = isDark ? "rgba(232,238,236,0.95)" : "rgba(34,40,37,0.9)";
-            hardSeg(ctx, bx0, by0, bx1, by0, boxEdge, "transparent", 1.1);
-            hardSeg(ctx, bx0, by0 + bh, bx1, by0 + bh, boxEdge, "transparent", 1.1);
-            hardSeg(ctx, bx0, by0, bx0, by0 + bh, boxEdge, "transparent", 1.1);
-            hardSeg(ctx, bx1, by0, bx1, by0 + bh, boxEdge, "transparent", 1.1);
-            // the name tag — below bull boxes, above bear boxes; tone-colored
-            // word with the white-box grammar (reference: boxed candle + tag)
+            // border: white (watch) · side-tone (confirmed) · dashed muted (failed)
+            if (d.status === "failed") {
+              const failEdge = isDark ? "rgba(148,163,158,0.35)" : "rgba(120,128,124,0.4)";
+              for (const [ex0, ey0, ex1, ey1] of [
+                [bx0, by0, bx1, by0], [bx0, by0 + bh, bx1, by0 + bh],
+                [bx0, by0, bx0, by0 + bh], [bx1, by0, bx1, by0 + bh],
+              ] as const) {
+                hardSeg(ctx, ex0, ey0, ex1, ey1, failEdge, "transparent", 0.8, [3, 3]);
+              }
+            } else {
+              const boxEdge =
+                d.status === "confirmed"
+                  ? cpt.line(0.9)
+                  : isDark ? "rgba(232,238,236,0.95)" : "rgba(34,40,37,0.9)";
+              const w = d.status === "confirmed" ? 1.35 : 1.1;
+              hardSeg(ctx, bx0, by0, bx1, by0, boxEdge, "transparent", w);
+              hardSeg(ctx, bx0, by0 + bh, bx1, by0 + bh, boxEdge, "transparent", w);
+              hardSeg(ctx, bx0, by0, bx0, by0 + bh, boxEdge, "transparent", w);
+              hardSeg(ctx, bx1, by0, bx1, by0 + bh, boxEdge, "transparent", w);
+            }
+            // the name tag — below bull boxes, above bear boxes
+            const glyph =
+              d.status === "fresh" ? " •" :
+              d.status === "confirmed" ? (d.outcome === "lost" ? " ✗" : " ✓") : "";
+            const arrow = d.direction === "up" ? "▲" : "▼";
+            const tag = `${d.name} ${arrow}${d.confidence}${glyph}`;
             const cx = (bx0 + bx1) / 2;
             const ly = d.side === "bull" ? by0 + bh + 11 : by0 - 11;
-            if (cx >= 0 && cx <= rightEdge && tryLabel(cx, ly, d.name, 8, "center")) {
-              pillLabel(ctx, d.name, cx, ly, cpt.text, cpt.line(0.5), "center", 8);
+            if (cx >= 0 && cx <= rightEdge && tryLabel(cx, ly, tag, 8, "center")) {
+              pillLabel(
+                ctx, tag, cx, ly,
+                d.status === "failed" ? "rgba(148,163,158,0.75)" : cpt.text,
+                d.status === "fresh" ? "rgba(245,158,11,0.55)" : cpt.line(0.5),
+                "center", 8,
+              );
+            }
+            // ×N badge for multi-candle patterns — tiny mono count at the
+            // box's top-left corner (the 1-bar shapes stay unbadged)
+            if (d.n >= 2 && bw >= 14) {
+              const nb = `×${d.n}`;
+              hardText(ctx, nb, bx0 + 2.5, by0 + 7.5, "rgba(148,163,158,0.85)", 7, "left");
             }
             break;
           }

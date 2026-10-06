@@ -6,7 +6,8 @@ import type { AnalysisResponse } from "@/lib/market/types";
 import { useI18n } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { Activity, Waves } from "lucide-react";
+import { Activity, Waves, CandlestickChart, ChevronDown } from "lucide-react";
+import type { CandlePattern, CandlePatternStat } from "@/lib/market/types";
 
 const listVariants: Variants = {
   hidden: {},
@@ -45,6 +46,133 @@ function UpdatedAgo({ at }: { at: number | undefined }) {
   );
 }
 
+// ═══════════════ v19.0 — the candlestick strategy section ═══════════════
+//
+// User spec: "কোনো টাইম ফ্রেমে কোনো ক্যান্ডেল, মার্কেটের কোনো পজিশনে হলে এটার
+// লজিক কি? মার্কেট আপ যাবে নাকি ডাউন?" — every detected 1–5 candle setup
+// with its WHY logic, the predicted direction, the priced plan and the
+// pattern's OWN verified win rate from the walk-forward backtest.
+
+const CANDLE_STATUS_STYLE: Record<string, { dot: string; label: string }> = {
+  fresh: { dot: "bg-gold", label: "candleWatch" },
+  confirmed: { dot: "bg-up", label: "candleConfirmed" },
+  failed: { dot: "bg-down", label: "candleFailed" },
+  expired: { dot: "bg-muted-foreground/50", label: "candleNoConfirm" },
+};
+
+function CandleCard({
+  p,
+  stat,
+  digits,
+}: {
+  p: CandlePattern;
+  stat?: CandlePatternStat;
+  digits: number;
+}) {
+  const { t, locale } = useI18n();
+  const [open, setOpen] = useState(false);
+  const bull = p.side === "bull";
+  const st = CANDLE_STATUS_STYLE[p.status] ?? CANDLE_STATUS_STYLE.expired;
+  const logic = locale === "bn" ? p.logicBn : p.logicEn;
+  const name = locale === "bn" ? p.nameBn : p.nameEn;
+  const outcome =
+    p.status === "confirmed"
+      ? p.outcome === "won"
+        ? t("candleWon")
+        : p.outcome === "lost"
+          ? t("candleLost")
+          : p.outcome === "open"
+            ? t("candleOpen")
+            : null
+      : null;
+  // the market-position context line — mono codes, language-neutral
+  const ctxBits: string[] = [];
+  ctxBits.push(p.context.trendInto === "up" ? "↑ leg" : p.context.trendInto === "down" ? "↓ leg" : "→ leg");
+  if (p.context.atLevel) ctxBits.push(`${p.context.atLevel === "support" ? "S" : "R"} ${p.context.levelPrice?.toFixed(digits)}`);
+  ctxBits.push(p.context.structure);
+  if (p.context.rsi != null) ctxBits.push(`RSI ${p.context.rsi.toFixed(0)}`);
+  if (p.context.volZ >= 1.5) ctxBits.push(`vol +${p.context.volZ.toFixed(1)}σ`);
+
+  return (
+    <div
+      className={cn(
+        "rounded-lg border p-2 transition-colors",
+        p.status === "expired" || p.status === "failed"
+          ? "border-border/60 bg-card/30 opacity-75"
+          : bull
+            ? "border-up/25 bg-up/[0.04]"
+            : "border-down/25 bg-down/[0.04]",
+      )}
+    >
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="flex w-full items-center gap-1.5 text-left"
+        aria-expanded={open}
+      >
+        <span className={cn("h-1.5 w-1.5 shrink-0 rounded-full", st.dot)} aria-hidden="true" />
+        <span className="truncate text-[11px] font-bold">{name}</span>
+        <span className="shrink-0 rounded border border-border bg-muted/40 px-1 font-mono text-[8px] text-muted-foreground">
+          {p.n}×
+        </span>
+        <span className={cn("shrink-0 font-mono text-[10px] font-bold", bull ? "text-up" : "text-down")}>
+          {bull ? "▲" : "▼"}
+        </span>
+        <span className="tnum shrink-0 font-mono text-[9px] text-muted-foreground">{p.confidence}%</span>
+        <span className="ml-auto flex shrink-0 items-center gap-1">
+          {outcome && (
+            <span
+              className={cn(
+                "rounded px-1 font-mono text-[8px] font-bold uppercase",
+                p.outcome === "won" ? "bg-up/15 text-up" : p.outcome === "lost" ? "bg-down/15 text-down" : "bg-gold/15 text-gold",
+              )}
+            >
+              {outcome}
+            </span>
+          )}
+          <span className="font-mono text-[8px] uppercase text-muted-foreground/70">{t(st.label)}</span>
+          <ChevronDown className={cn("h-3 w-3 text-muted-foreground/60 transition-transform", open && "rotate-180")} />
+        </span>
+      </button>
+      <div className="mt-1 flex items-center gap-2 font-mono text-[9px]">
+        <span className="text-muted-foreground/70">
+          {t("entry")} <span className="tnum font-bold text-foreground">{p.entry.toFixed(digits)}</span>
+          {p.status === "fresh" && <span className="text-gold"> ({t("candlePendingEntry")})</span>}
+        </span>
+        <span className="text-muted-foreground/70">
+          {t("stopLoss")} <span className="tnum text-down">{p.sl.toFixed(digits)}</span>
+        </span>
+        <span className="text-muted-foreground/70">
+          {t("takeProfit")} <span className="tnum text-up">{p.tp.toFixed(digits)}</span>
+        </span>
+        <span className="ml-auto tnum text-muted-foreground">{p.rr.toFixed(2)}R</span>
+      </div>
+      {open && (
+        <div className="mt-1.5 space-y-1 border-t border-border/60 pt-1.5">
+          <div className="font-mono text-[8.5px] text-muted-foreground/80">{ctxBits.join("  ·  ")}</div>
+          <div className="text-[9px] font-bold uppercase tracking-wider text-muted-foreground/60">{t("candleWhy")}</div>
+          <ul className="space-y-0.5">
+            {logic.map((l, i) => (
+              <li key={i} className="flex gap-1 text-[10px] leading-snug text-foreground/85">
+                <span className={cn("shrink-0 font-bold", bull ? "text-up" : "text-down")} aria-hidden="true">›</span>
+                {l}
+              </li>
+            ))}
+          </ul>
+          {stat && stat.fired >= 3 && (
+            <div className="font-mono text-[8.5px] text-muted-foreground/80">
+              {t("candleVerified")}: {stat.fired}× · {stat.winPct}% {t("candleWin")} ·{" "}
+              <span className={stat.totalR >= 0 ? "text-up" : "text-down"}>
+                {stat.totalR >= 0 ? "+" : ""}{stat.totalR}R
+              </span>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function AnalysisPanel({ analysis }: { analysis: AnalysisResponse | null }) {
   const { t } = useI18n();
   const s = analysis?.snapshot;
@@ -76,6 +204,41 @@ export function AnalysisPanel({ analysis }: { analysis: AnalysisResponse | null 
             className="space-y-3 p-3"
           >
           {/* trend per TF */}
+          {/* v19.0 — the candlestick strategy read (the headline section) */}
+          <motion.div variants={itemVariants} className="rounded-lg border border-border bg-card/50 p-2.5">
+            <div className="mb-2 flex items-center gap-1.5">
+              <CandlestickChart className="h-3 w-3 text-gold" />
+              <span className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground/70">
+                {t("candleStrategy")}
+              </span>
+              {analysis!.candleBacktest && analysis!.candleBacktest.overall.fired > 0 && (
+                <span className="ml-auto flex items-center gap-1.5 font-mono text-[8.5px]">
+                  <span className="text-muted-foreground/70">{analysis!.candleBacktest.overall.fired}×</span>
+                  <span className={analysis!.candleBacktest.overall.winPct >= 45 ? "text-up" : "text-muted-foreground"}>
+                    {analysis!.candleBacktest.overall.winPct}% {t("candleWin")}
+                  </span>
+                  <span className={analysis!.candleBacktest.overall.totalR >= 0 ? "text-up" : "text-down"}>
+                    {analysis!.candleBacktest.overall.totalR >= 0 ? "+" : ""}{analysis!.candleBacktest.overall.totalR}R
+                  </span>
+                </span>
+              )}
+            </div>
+            {analysis!.candles.length ? (
+              <div className="space-y-1.5">
+                {analysis!.candles.map((p) => (
+                  <CandleCard
+                    key={p.id}
+                    p={p}
+                    stat={analysis!.candleBacktest?.byCode.find((c) => c.code === p.code)}
+                    digits={digits}
+                  />
+                ))}
+              </div>
+            ) : (
+              <p className="text-[10px] text-muted-foreground">{t("candleNoSetups")}</p>
+            )}
+          </motion.div>
+
           <motion.div variants={itemVariants} className="rounded-lg border border-border bg-card/50 p-2.5">
             <div className="mb-2 text-[10px] font-bold uppercase tracking-wider text-muted-foreground/70">
               {t("trend")}

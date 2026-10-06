@@ -10,14 +10,15 @@ import { detectKeyLevels } from "@/lib/market/levels";
 import { buildRoadmap } from "@/lib/market/roadmap";
 import { detectStructure, detectSupplyDemand, detectOrderBlocks, detectFvg, detectLiquidity } from "@/lib/market/smc";
 import { detectConsolidations, detectAmdPhases, detectInstitutionalActivity } from "@/lib/market/phases";
-import { detectPatterns, detectCandles } from "@/lib/market/patterns";
+import { detectPatterns } from "@/lib/market/patterns";
+import { detectCandlePatterns, backtestCandles } from "@/lib/market/candlesticks";
 import type { AnalysisResponse, Candle, SignalPayload, TfSetup } from "@/lib/market/types";
 import { svcHeaders, getBrokerOffsetSec, spreadFor, MT5_URL } from "@/lib/svc";
 
 const CACHE_TTL = 8_000;
 /** v16.4 (audit §10): the strategy build identity carried in every
  *  response so consumers/caches can compare across deploys. */
-const STRATEGY_VERSION = "v18.0";
+const STRATEGY_VERSION = "v19.0";
 /** v16.4 (audit §10): a candle older than 3× its timeframe (plus a
  *  market-closed weekend allowance) means the FEED is stale — surfaced
  *  via dataFreshness.fresh=false instead of passing silently. */
@@ -673,13 +674,19 @@ export async function GET(req: Request) {
       drawings.push({ ...p, source_tf: "H1" });
     }
   }
-  // v18.0 (user reference images — the boxed candlestick setups): the
-  // textbook 1–3 bar reversals at real extremes (hammer / engulfing /
-  // star) boxed on the chart like the reference screenshots — thin
-  // outlined rectangle around the exact pattern candles + name tag.
-  for (const c of detectCandles(closedBars)) {
-    drawings.push({ ...c, source_tf: tf });
+  // v19.0 — the CANDLESTICK STRATEGY layer (user spec: any timeframe, any
+  //    candle count 1–5, any market position — what's the logic, which way
+  //    does the market go): the full 34-setup engine runs on the active
+  //    tf's closed bars. Every detection carries its market context
+  //    (approach leg, S/R, structure, RSI, volume), bilingual WHY logic,
+  //    a priced entry/SL/TP plan and a status resolved against the bars
+  //    that followed — and the same window runs the walk-forward backtest
+  //    so the panel badges quote the symbol's OWN history, not theory.
+  const candleRead = detectCandlePatterns(closedBars, tf);
+  for (const c of candleRead.drawings) {
+    drawings.push(c);
   }
+  const candleStats = backtestCandles(closedBars);
   // v16.5: the forward map — projected legs to the roadmap's real targets
   // (supersedes the old single-arrow path drawing)
   const forecast = buildForecastDrawing(roadmap, price, digits);
@@ -748,6 +755,31 @@ export async function GET(req: Request) {
     ageSec,
     fresh: ageSec <= FRESHNESS_TF_MULT * (tfSecMap[tf] ?? 900),
   };
+  // v19.0 — CANDLE CONFLUENCE on the live signal: a fresh/confirmed
+  //    candlestick setup from the last 3 bars that AGREES with the signal
+  //    direction is quoted as an extra factor line (and nudges confidence
+  //    +3, capped) — the candle layer and the signal engine tell one
+  //    story instead of two unrelated ones.
+  let signalOut = liveSignal;
+  if (liveSignal) {
+    const agreeing = candleRead.patterns.find(
+      (p) =>
+        (p.status === "fresh" || p.status === "confirmed") &&
+        bars[tf].filter((b) => !b.f).slice(-3).some((b) => b.t >= p.t1) &&
+        ((liveSignal.direction === "BUY" && p.side === "bull") ||
+         (liveSignal.direction === "SELL" && p.side === "bear")),
+    );
+    if (agreeing) {
+      signalOut = {
+        ...liveSignal,
+        confidence: Math.min(99, liveSignal.confidence + 3),
+        factors: [
+          ...liveSignal.factors,
+          `Candle ${agreeing.code} agrees (${agreeing.nameEn}, ${agreeing.confidence}% conf)`,
+        ],
+      };
+    }
+  }
   const payload: AnalysisResponse = {
     symbol,
     timeframe: tf,
@@ -760,12 +792,14 @@ export async function GET(req: Request) {
     price,
     digits,
     status: liveSignal ? "OK" : "NO_SETUP",
-    signal: liveSignal,
+    signal: signalOut,
     signals,
     nextSetup: projection,
     tfSetups,
     nearMiss: result.nearMiss,
     drawings,
+    candles: candleRead.patterns,
+    candleBacktest: candleStats,
     roadmap,
     snapshot: result.snapshot,
     lastCandleTime,
