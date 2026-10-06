@@ -778,7 +778,33 @@ export default function TradingChart(props: Props) {
       const chartTfRank = TF_ORDER[timeframe] ?? 3;
       const ink = inkRef.current;
       const tips: LevelTip[] = [];
+      // v17.2 — SWINGS FIRST (reference port): the HH/HL/LL/LH tags are the
+      // spine every other drawing hangs from (user: "লাস্ট কয়েকটি LL HL HH HL
+      // এই গুলো কে মাথা রেখে ড্রয়িং হচ্ছে"), so they render BEFORE all other
+      // ink and win every label collision — no CHoCH/zone/level pill may
+      // ever push a structure tag off the canvas.
+      if (layersRef.current.structure) {
+        for (const d of autoRef.current) {
+          if (d.kind !== "swing") continue;
+          try { drawSwingTag(d); } catch { /* one bad tag must not blank the chart */ }
+        }
+      }
+      // v17.2 — ONE budget for ALL horizontal ink: key levels, liquidity
+      // pools and magnets fight for the same maxLevels slots, nearest to
+      // price first. The ×N clustering already ranks S/R winners, but pools
+      // and magnets had NO cap — the right edge stacked pill on pill (VLM
+      // audit of the live chart: "the right third is a spaghetti chart").
+      const levelKinds = new Set(["hline", "liq", "magnet"]);
+      const lastPrice = bs[bs.length - 1].c;
+      const levelKeep = new Set<AutoDrawing>();
+      autoRef.current
+        .filter((d) => levelKinds.has(d.kind) && !(d.mergedInto && !ink.merged))
+        .map((d) => ({ d, dist: Math.abs((d as { price: number }).price - lastPrice) }))
+        .sort((a, b) => a.dist - b.dist)
+        .slice(0, Math.max(1, ink.maxLevels))
+        .forEach((r) => levelKeep.add(r.d));
       for (const d of autoRef.current) {
+        if (d.kind === "swing") continue; // v17.2: the pre-pass drew the spine first
         const layer = LAYER_OF[d.kind] ?? "zones";
         if (!layersRef.current[layer]) continue;
         if (d.mergedInto && !ink.merged) continue;
@@ -795,6 +821,9 @@ export default function TradingChart(props: Props) {
           if (srcTf && (TF_ORDER[srcTf] ?? 0) > chartTfRank) continue;
         }
         if (d.rank != null && d.rank > ink.maxLevels) continue;
+        // v17.2: the unified proximity budget — only the nearest N
+        // horizontal lines (of ANY kind) get ink
+        if (levelKinds.has(d.kind) && !levelKeep.has(d)) continue;
         try { renderAuto(ctx, d); } catch (e) { console.warn("[chart] renderAuto failed:", d.kind, e); }
       }
       tipRef.current = tips;
@@ -810,6 +839,38 @@ export default function TradingChart(props: Props) {
       // hoisted function declaration, so TypeScript's `if (!ctx) return`
       // narrowing above does NOT cross into it — the non-null context must
       // be threaded through explicitly (v16.9: fixes ~130 null-guard errors).
+      /** v17.2 — the swing tag (reference app's D-058 grammar): a 7px tick
+       *  away from the swing, an anchor dot on the exact price and the tiny
+       *  fixed-size shadowed word ABOVE highs / BELOW lows — the structure
+       *  read a price-action trader keeps in their head. Color is positional
+       *  (reference port): words above candles read bear/resistance red,
+       *  words below read bull/support green — same coding as the zones. */
+      function drawSwingTag(d: Extract<AutoDrawing, { kind: "swing" }>) {
+        const x = xOfTime(d.t);
+        const y = yOfPrice(d.price);
+        if (x === null || y === null || x < -6 || x > rightEdge + 6) return;
+        const high = d.side === "high";
+        const dir = high ? -1 : 1; // the word sits away from the candles
+        const color = high ? "rgba(252,165,165,0.95)" : "rgba(110,231,183,0.95)";
+        // the tick at the swing point
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 0.6;
+        ctx.setLineDash([]);
+        ctx.beginPath();
+        ctx.moveTo(x, y);
+        ctx.lineTo(x, y + dir * 7);
+        ctx.stroke();
+        // the anchor dot on the swing price
+        ctx.fillStyle = color;
+        ctx.beginPath();
+        ctx.arc(x, y, 1.6, 0, Math.PI * 2);
+        ctx.fill();
+        // the word — fixed 8px, shadowed, never scaled by zoom
+        const ty = y + dir * 16;
+        if (tryLabel(x, ty, d.tag, 8, "center")) {
+          hardText(ctx, d.tag, x, ty, color, 8, "center");
+        }
+      }
       function renderAuto(ctx: CanvasRenderingContext2D, d: AutoDrawing) {
         switch (d.kind) {
           case "hline": {
@@ -905,14 +966,17 @@ export default function TradingChart(props: Props) {
               // broken line: THIN ghost, never projected (ref D-053)
               hardSeg(ctx, x1!, y1!, x2!, y2!, tone.line(0.30), tone.halo(0.04), 0.4, [3, 4]);
             } else {
-              // solid thin core t1→t2 (v16.8: 0.7 → 0.55 — thinner & clearer, user spec) …
-              hardSeg(ctx, x1!, y1!, x2!, y2!, tone.line(0.88), tone.halo(0.07), 0.55);
+              // solid core t1→t2 — v17.2 (user: "ট্রেন্ড লাইন গুলো সুন্দর করে
+              // দেখায়"): the reference app draws trendlines as the LOUDEST
+              // structural ink — 0.85px core + soft halo, clearly ahead of
+              // the 0.55px zone borders, so the diagonals read at a glance
+              hardSeg(ctx, x1!, y1!, x2!, y2!, tone.line(0.92), tone.halo(0.10), 0.85);
               // … then the dashed projection to the right edge — the path
               // ahead the market has been respecting ("মার্কেট ট্রেন্ড লাইন
               // ফলো করেই চলে")
               const slope = (y2! - y1!) / Math.max(1, x2! - x1!);
               const ye = y2! + slope * (rightEdge - x2!);
-              hardSeg(ctx, x2!, y2!, rightEdge, ye, tone.line(0.55), "transparent", 0.45, [5, 4]);
+              hardSeg(ctx, x2!, y2!, rightEdge, ye, tone.line(0.65), "transparent", 0.6, [5, 4]);
             }
             break;
           }
@@ -1057,13 +1121,9 @@ export default function TradingChart(props: Props) {
             break;
           }
           case "swing": {
-            const x = xOfTime(d.t);
-            const y = yOfPrice(d.price);
-            if (x === null || y === null) return;
-            const bull = d.tag === "HH" || d.tag === "HL";
-            if (tryLabel(x, y + (d.side === "high" ? -9 : 9), d.tag, 7.5, "center")) {
-              hardText(ctx, d.tag, x, y + (d.side === "high" ? -9 : 9), bull ? "rgba(110,231,183,0.9)" : "rgba(252,165,165,0.9)", 7.5, "center");
-            }
+            // v17.2: the AI layer's swings use the same tag grammar as the
+            // pre-pass spine (tick + dot + shadowed word)
+            drawSwingTag(d);
             break;
           }
           case "setup": {

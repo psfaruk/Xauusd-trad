@@ -234,31 +234,36 @@ export function buildDrawings(
     out.push({ kind: "structure", t: ev.t, price: ev.price, dir: ev.dir, label: ev.label, fromT: ev.fromT, source_tf: tf });
   }
 
-  // 6b. market-structure zigzag — the swing map, connected.
-  //    v16.8: HIGH/LOW ALTERNATION enforced — consecutive same-kind swings
-  //    collapse to the more extreme one (the raw fractal stream can emit
-  //    two highs in a row; connecting them drew a kinked non-structure path).
-  const swPathRaw = sw.slice(-14);
-  const swAlt: typeof swPathRaw = [];
-  for (const s of swPathRaw) {
-    const prev = swAlt[swAlt.length - 1];
-    if (prev && prev.kind === s.kind) {
-      const moreExtreme = s.kind === "high" ? s.price >= prev.price : s.price <= prev.price;
-      if (moreExtreme) swAlt[swAlt.length - 1] = s;
+  // 6b. market-structure zigzag — THE SPINE. v17.2 (reference port — user:
+  //    "লাস্ট কয়েকটি LL HL HH HL এই গুলো কে মাথা রেখে ড্রয়িং হচ্ছে"): built
+  //    from the SAME structure-label swings the chart tags HH/HL/LL/LH, so
+  //    one swing set drives labels, zigzag and trendline anchors — the
+  //    path connects exactly the tagged swings. The old 5/5-major zigzag
+  //    ran through points that carried no tag: two structure stories on
+  //    one chart. HIGH/LOW ALTERNATION still enforced — consecutive
+  //    same-kind swings collapse to the more extreme one.
+  const lblAlt: typeof ctx.structure.labels = [];
+  for (const l of ctx.structure.labels) {
+    const prev = lblAlt[lblAlt.length - 1];
+    if (prev && prev.side === l.side) {
+      const moreExtreme = l.side === "high" ? l.price >= prev.price : l.price <= prev.price;
+      if (moreExtreme) lblAlt[lblAlt.length - 1] = l;
       continue;
     }
-    swAlt.push(s);
+    lblAlt.push(l);
   }
-  const swPath = swAlt.slice(-9);
+  const swPath = lblAlt.slice(-10);
   if (swPath.length >= 2) {
     out.push({
       kind: "zigzag",
-      points: swPath.map((s) => ({ t: s.t, p: s.price, side: s.kind })),
+      points: swPath.map((s) => ({ t: s.t, p: s.price, side: s.side })),
     });
   }
 
-  // 7. swing labels (last 6)
-  for (const l of ctx.structure.labels.slice(-6)) {
+  // 7. swing labels — v17.2: last 8 (was 6). The tagged swings ARE the
+  //    structure the whole ink layer hangs from; the renderer draws them
+  //    FIRST so no other label can take their space.
+  for (const l of ctx.structure.labels.slice(-8)) {
     out.push({ kind: "swing", t: l.t, price: l.price, tag: l.tag, side: l.side });
   }
 
