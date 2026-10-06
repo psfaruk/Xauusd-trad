@@ -366,6 +366,22 @@ export type AutoDrawing =
       tone?: "bull" | "bear";
       source_tf?: string;
     }
+  /** v18.0 (reference-image port — "multiple setups"): a classic
+   *  CANDLESTICK pattern (hammer / engulfing / star) boxed on the chart the
+   *  way the user's reference screenshots highlight them — a thin outlined
+   *  rectangle around the exact pattern candles with a small name tag. */
+  | {
+      kind: "candle";
+      /** short display name — "HAMMER", "BULL ENGULF", "MORNING STAR"… */
+      name: string;
+      side: "bull" | "bear";
+      /** first → last pattern bar time (1–3 bars) */
+      t0: number; t1: number;
+      /** price envelope of the pattern bars (box top/bottom) */
+      lo: number; hi: number;
+      source_tf?: string;
+    }
+
   // ── v16.5 — the market-structure narrative layer (user spec) ──
   /** a consolidation range: where price coiled before its next decision */
   | { kind: "range"; t0: number; t1: number; hi: number; lo: number; state: "forming" | "broken_up" | "broken_down"; source_tf?: string }

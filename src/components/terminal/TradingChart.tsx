@@ -612,6 +612,11 @@ export default function TradingChart(props: Props) {
     const tf = tfSec;
     const axisW = chart.priceScale("right").width() ?? 56;
     const rightEdge = Math.max(60, w - axisW - 2);
+    // v18.0: narrow-chart ink discipline — the user reads this terminal on a
+    // phone (their reference screenshots are Android Chrome); below ~520px
+    // of plot width the secondary labels (fib ratios, pattern family
+    // words) yield so the primary contracts stay readable
+    const narrow = rightEdge < 520;
     const lastTime = bs[bs.length - 1].t;
     const barSpacing = ts.options().barSpacing ?? 6.5;
 
@@ -758,6 +763,7 @@ export default function TradingChart(props: Props) {
         swing: "structure",
         trendline: "structure",
         channel: "structure",
+        candle: "structure",
         fib: "structure",
         sweep: "structure",
         pattern: "structure",
@@ -778,6 +784,14 @@ export default function TradingChart(props: Props) {
       const chartTfRank = TF_ORDER[timeframe] ?? 3;
       const ink = inkRef.current;
       const tips: LevelTip[] = [];
+      // v18.0 (reference images — "multiple setups"): a per-frame budget of
+      // how many pattern TRADE PLANS (entry/stop/target + measured move)
+      // may draw. The reference cheat-sheet labels entry/stop/target on
+      // EVERY pattern — but it is a schematic with no hero setup box. We
+      // keep TWO pattern plans max (confirmed first — they render first in
+      // the array), so the chart reads as multiple setups without the
+      // v16.10 four-competing-entries clutter.
+      let patternPlanN = 0;
       // v17.2 — SWINGS FIRST (reference port): the HH/HL/LL/LH tags are the
       // spine every other drawing hangs from (user: "লাস্ট কয়েকটি LL HL HH HL
       // এই গুলো কে মাথা রেখে ড্রয়িং হচ্ছে"), so they render BEFORE all other
@@ -982,8 +996,43 @@ export default function TradingChart(props: Props) {
           }
           case "channel": {
             // v16.6 (ref _channel): upper/lower parallels + dashed median,
-            // each projected forward — the corridor the market walks in
+            // each projected forward — the corridor the market walks in.
+            // v18.0 (user reference image — the green corridor): the area
+            // between the parallels FILLS with a whisper tone so the
+            // channel reads as a ZONE (like the reference's pale-green
+            // ascending channel), not two naked lines.
             const ctone = TONES[d.tone ?? (d.dir === "up" ? "bull" : "bear")] ?? TONES.neutral;
+            const chPoly = (l1: { t1: number; p1: number; t2: number; p2: number }, l2: { t1: number; p1: number; t2: number; p2: number }) => {
+              const a1 = xOfTime(l1.t1), a2 = xOfTime(l1.t2), ay1 = yOfPrice(l1.p1), ay2 = yOfPrice(l1.p2);
+              const b1 = xOfTime(l2.t1), b2 = xOfTime(l2.t2), by1 = yOfPrice(l2.p1), by2 = yOfPrice(l2.p2);
+              if ([a1, a2, ay1, ay2, b1, b2, by1, by2].some((v) => v === null)) return;
+              const ca2 = clamp(a2!, -2, rightEdge), cb2 = clamp(b2!, -2, rightEdge);
+              const maxT = Math.max(ca2, cb2);
+              if (maxT >= rightEdge - 1) {
+                // both anchors already at the edge — plain quad
+                ctx.beginPath();
+                ctx.moveTo(clamp(a1!, -2, rightEdge), ay1!);
+                ctx.lineTo(ca2, ay2!);
+                ctx.lineTo(cb2, by2!);
+                ctx.lineTo(clamp(b1!, -2, rightEdge), by1!);
+                ctx.closePath();
+              } else {
+                // extend the corridor along both projected lines
+                const sA = (ay2! - ay1!) / Math.max(1e-6, a2! - a1!);
+                const sB = (by2! - by1!) / Math.max(1e-6, b2! - b1!);
+                ctx.beginPath();
+                ctx.moveTo(clamp(a1!, -2, rightEdge), ay1!);
+                ctx.lineTo(ca2, ay2!);
+                ctx.lineTo(rightEdge, ay2! + sA * (rightEdge - ca2));
+                ctx.lineTo(rightEdge, by2! + sB * (rightEdge - cb2));
+                ctx.lineTo(cb2, by2!);
+                ctx.lineTo(clamp(b1!, -2, rightEdge), by1!);
+                ctx.closePath();
+              }
+              ctx.fillStyle = ctone.fill(0.05);
+              ctx.fill();
+            };
+            chPoly(d.upper, d.lower);
             const drawSide = (l: { t1: number; p1: number; t2: number; p2: number }, isMedian = false) => {
               const cx1 = xOfTime(l.t1), cx2 = xOfTime(l.t2), cy1 = yOfPrice(l.p1), cy2 = yOfPrice(l.p2);
               if ([cx1, cx2, cy1, cy2].some((v) => v === null)) return;
@@ -1009,6 +1058,47 @@ export default function TradingChart(props: Props) {
             }
             break;
           }
+          case "candle": {
+            // v18.0 (user reference images — the boxed candlestick setups):
+            // a thin outlined rectangle around the EXACT pattern candles
+            // (hammer / engulfing / star) with a small name tag — the
+            // reference screenshots' highlight-box grammar. Bullish
+            // patterns tag below, bearish above, so the box never fights
+            // the swing tags for the same space.
+            const cpt = d.side === "bull" ? TONES.bull : TONES.bear;
+            const x0c = xOfTime(d.t0);
+            const x1c = xOfTime(d.t1);
+            const y0c = yOfPrice(d.hi);
+            const y1c = yOfPrice(d.lo);
+            if ([x0c, x1c, y0c, y1c].some((v) => v === null)) return;
+            const padX = Math.max(2, barSpacing * 0.4);
+            const bx0 = clamp(x0c! - padX, -2, rightEdge);
+            const bx1 = clamp(x1c! + padX, -2, rightEdge);
+            if (bx1 - bx0 < 2.5 || bx0 > rightEdge) return;
+            const bw = bx1 - bx0;
+            const bh = Math.abs(y1c! - y0c!);
+            if (bh < 2) return;
+            const by0 = Math.min(y0c!, y1c!);
+            // whisper fill + NEAR-WHITE border (reference-image grammar: the
+            // highlight boxes are the highest-contrast ink on the chart — a
+            // green border over a green hammer candle is invisible, VLM/pixel
+            // audit confirmed; white reads over every candle color)
+            ctx.fillStyle = cpt.fill(0.06);
+            ctx.fillRect(bx0, by0, bw, bh);
+            const boxEdge = isDark ? "rgba(232,238,236,0.95)" : "rgba(34,40,37,0.9)";
+            hardSeg(ctx, bx0, by0, bx1, by0, boxEdge, "transparent", 1.1);
+            hardSeg(ctx, bx0, by0 + bh, bx1, by0 + bh, boxEdge, "transparent", 1.1);
+            hardSeg(ctx, bx0, by0, bx0, by0 + bh, boxEdge, "transparent", 1.1);
+            hardSeg(ctx, bx1, by0, bx1, by0 + bh, boxEdge, "transparent", 1.1);
+            // the name tag — below bull boxes, above bear boxes; tone-colored
+            // word with the white-box grammar (reference: boxed candle + tag)
+            const cx = (bx0 + bx1) / 2;
+            const ly = d.side === "bull" ? by0 + bh + 11 : by0 - 11;
+            if (cx >= 0 && cx <= rightEdge && tryLabel(cx, ly, d.name, 8, "center")) {
+              pillLabel(ctx, d.name, cx, ly, cpt.text, cpt.line(0.5), "center", 8);
+            }
+            break;
+          }
           case "fib": {
             const x0 = xOfTime(d.t0);
             const xA = xOfTime(d.t1);
@@ -1027,7 +1117,21 @@ export default function TradingChart(props: Props) {
                 TONES.gold.line(isGolden ? 0.75 : 0.42),
                 TONES.gold.halo(isGolden ? 0.07 : 0.04), isGolden ? 0.55 : 0.45,
               );
-              hardText(ctx, `${lv.ratio.toFixed(3)}  ${lv.price.toFixed(digits)}`, rightEdge - 4, y - 7, isGolden ? TONES.gold.text : "rgba(148,163,158,0.7)", 8, "right");
+              // v18.0: fib labels join the collision system — the seven
+              // right-edge ratio texts used to draw unguarded and stacked
+              // with every level pill (VLM audit: right-strip clutter).
+              // Check-only for the non-golden ratios (the box is popped
+              // right back): fib renders BEFORE the MTF S/R pills, and a
+              // registered fib box would evict them — the S/R key levels
+              // keep their priority (user spec: S/R must always show).
+              const fl = `${lv.ratio.toFixed(3)}  ${lv.price.toFixed(digits)}`;
+              if (isGolden) {
+                tryLabel(rightEdge - 4, y - 7, fl, 8, "right", true);
+                hardText(ctx, fl, rightEdge - 4, y - 7, TONES.gold.text, 8, "right");
+              } else if (!narrow && tryLabel(rightEdge - 4, y - 7, fl, 8, "right")) {
+                labelBoxes.pop();
+                hardText(ctx, fl, rightEdge - 4, y - 7, "rgba(148,163,158,0.7)", 8, "right");
+              }
               if (isGolden) gp.push(y);
             }
             if (gp.length === 2 && d.ote) {
@@ -1486,12 +1590,14 @@ export default function TradingChart(props: Props) {
                 }
               }
             }
-            // 1b. v17.1 — converging boundary patterns (TRIANGLE / WEDGE /
-            //     PENNANT) get the area BETWEEN their two boundary lines
-            //     filled — the shape reads instantly as a coil instead of
-            //     two thin lines the eye loses against the candles
+            // 1b. v17.1 → v18.0 — converging boundary patterns (TRIANGLE /
+            //     WEDGE / PENNANT) fill the area BETWEEN their two boundary
+            //     lines ALL THE WAY to the convergence point (the apex),
+            //     exactly like the user's reference screenshots: the coil
+            //     reads as a triangle SHAPE, not two sticks. Parallel sides
+            //     (RECTANGLE) extend the fill a third of the remaining chart.
             if (
-              (d.name.includes("TRIANGLE") || d.name.includes("WEDGE") || d.name.includes("PENNANT")) &&
+              (d.name.includes("TRIANGLE") || d.name.includes("WEDGE") || d.name.includes("PENNANT") || d.name.includes("RECTANGLE")) &&
               (d.lines ?? []).length >= 2
             ) {
               const [gA, gB] = d.lines;
@@ -1500,19 +1606,53 @@ export default function TradingChart(props: Props) {
               const bx1 = xOfTime(gB.t1), bx2 = xOfTime(gB.t2);
               const by1 = yOfPrice(gB.p1), by2 = yOfPrice(gB.p2);
               if ([ax1, ax2, ay1, ay2, bx1, bx2, by1, by2].every((v) => v !== null)) {
-                ctx.save();
-                ctx.beginPath();
-                ctx.moveTo(clamp(ax1!, -2, rightEdge), ay1!);
-                ctx.lineTo(clamp(ax2!, -2, rightEdge), ay2!);
-                ctx.lineTo(clamp(bx2!, -2, rightEdge), by2!);
-                ctx.lineTo(clamp(bx1!, -2, rightEdge), by1!);
-                ctx.closePath();
-                ctx.fillStyle = pt.fill(0.07);
-                ctx.fill();
-                ctx.restore();
+                const cax2 = clamp(ax2!, -2, rightEdge);
+                const cbx2 = clamp(bx2!, -2, rightEdge);
+                const maxX2 = Math.max(cax2, cbx2);
+                // project both lines forward in pixels and find the apex
+                const sA = (ay2! - ay1!) / Math.max(1e-6, ax2! - ax1!);
+                const sB = (by2! - by1!) / Math.max(1e-6, bx2! - bx1!);
+                let endX = clamp(maxX2 + 0.3 * Math.max(30, rightEdge - maxX2), maxX2, rightEdge);
+                if (Math.abs(sA - sB) > 1e-6) {
+                  const apexX = (by2! - ay2! + sA * cax2 - sB * cbx2) / (sA - sB);
+                  if (apexX > maxX2) endX = clamp(apexX, maxX2, rightEdge);
+                }
+                if (endX > maxX2 + 1) {
+                  const yAe = ay2! + sA * (endX - cax2);
+                  const yBe = by2! + sB * (endX - cbx2);
+                  ctx.save();
+                  ctx.beginPath();
+                  ctx.moveTo(clamp(ax1!, -2, rightEdge), ay1!);
+                  ctx.lineTo(cax2, ay2!);
+                  ctx.lineTo(endX, yAe);
+                  ctx.lineTo(endX, yBe);
+                  ctx.lineTo(cbx2, by2!);
+                  ctx.lineTo(clamp(bx1!, -2, rightEdge), by1!);
+                  ctx.closePath();
+                  ctx.fillStyle = pt.fill(0.07);
+                  ctx.fill();
+                  ctx.restore();
+                } else {
+                  ctx.save();
+                  ctx.beginPath();
+                  ctx.moveTo(clamp(ax1!, -2, rightEdge), ay1!);
+                  ctx.lineTo(cax2, ay2!);
+                  ctx.lineTo(cbx2, by2!);
+                  ctx.lineTo(clamp(bx1!, -2, rightEdge), by1!);
+                  ctx.closePath();
+                  ctx.fillStyle = pt.fill(0.07);
+                  ctx.fill();
+                  ctx.restore();
+                }
               }
             }
-            // 2. geometry lines — thin hard cores, dashed for necklines
+            // 2. geometry lines — thin hard cores, dashed for necklines.
+            //    v18.0 (reference images): the BOUNDARY-family sides (the
+            //    two trendlines of a triangle / wedge / rectangle) PROJECT
+            //    FORWARD as solid faded rays — the reference screenshots
+            //    draw the pattern's lines well past the last candle so the
+            //    apex sits ahead of price where the decision happens.
+            const boundaryFam = d.family === "boundary";
             for (const g of d.lines ?? []) {
               const gx1 = xOfTime(g.t1), gx2 = xOfTime(g.t2), gy1 = yOfPrice(g.p1), gy2 = yOfPrice(g.p2);
               if ([gx1, gx2, gy1, gy2].some((v) => v === null)) continue;
@@ -1525,6 +1665,13 @@ export default function TradingChart(props: Props) {
                 const gslope = (gy2! - gy1!) / Math.max(1, gx2! - gx1!);
                 const gye = gy2! + gslope * (rightEdge - gx2!);
                 hardSeg(ctx, gx2!, gy2!, rightEdge, gye, pt.line(0.4), "transparent", 0.5, [4, 3]);
+              }
+              // v18.0: solid boundary sides project as rays to the right
+              // edge — the visible corridor/apex ahead of price
+              if (boundaryFam && !g.dash && gx2! <= rightEdge && gx2! > 0) {
+                const gslope = (gy2! - gy1!) / Math.max(1, gx2! - gx1!);
+                const gye = gy2! + gslope * (rightEdge - gx2!);
+                hardSeg(ctx, gx2!, gy2!, rightEdge, gye, pt.line(0.5), "transparent", 0.6);
               }
             }
             // 3. numbered swing circles 1..N (the structure walk)
@@ -1548,24 +1695,30 @@ export default function TradingChart(props: Props) {
             const headP = d.points[d.points.length - 1];
             const xH = headP ? xOfTime(headP.t) : null;
             const xAnchor = Math.min(xH ?? rightEdge - 84, rightEdge - 84) + 8;
-            // v16.10 (user report — ENTRY confusion): the trade-plan ink
-            // (ENTRY ring/line, SL, TARGET) is the CONFIRMED pattern's
-            // contract ONLY. A FORMING pattern drew its own full-width
-            // ENTRY/SL/TARGET set — up to 3 patterns + the hero setup = 4
-            // competing "entries" on one chart. Forming now shows geometry
-            // (name pill, numbered pivots, shading) — its plan arrives when
-            // the market confirms the trigger.
+            // v16.10 → v18.0 (user reference images — "মাল্টিপল সেটাপ"):
+            // the trade-plan ink (ENTRY / STOP / TARGET + the measured-move
+            // vertical) now renders for FORMING patterns too — the
+            // reference cheat-sheet labels entry/stop/target on every
+            // pattern BEFORE the breakout; that is what makes it a SETUP.
+            // The clutter lesson stays: a per-frame budget (patternPlanN)
+            // caps plans at TWO patterns (confirmed render first in the
+            // array and get the loud gold contract; forming get the same
+            // levels in thin dotted ink), so the hero setup box keeps the
+            // loudest voice on the chart.
             const confirmed = d.state === "confirmed";
+            const drawPlan = patternPlanN < 2;
+            if (drawPlan) patternPlanN++;
             // plan lines START at the pattern's birth, never x=0 full width
             const firstPx = d.points[0] ? xOfTime(d.points[0].t) : null;
             const planX0 = clamp(firstPx ?? xAnchor, 2, rightEdge - 10);
             // 4. ENTRY — gold ring at the trigger + dashed level line + tag
-            const yE = confirmed ? yOfPrice(d.entry.price) : null;
+            //    (forming: thin dotted, dimmer — the setup being prepared)
+            const yE = drawPlan ? yOfPrice(d.entry.price) : null;
             if (yE !== null && yE > -5 && yE < h + 5) {
               const xE0 = d.entry.t != null ? xOfTime(d.entry.t) : xH;
               hardSeg(ctx, Math.max(0, xE0 ?? 0), Math.round(yE) + 0.5, rightEdge, Math.round(yE) + 0.5,
-                gold.line(0.75), gold.halo(0.06), 0.65, [4, 3]);
-              if (xE0 != null && xE0 >= -4 && xE0 <= rightEdge) {
+                gold.line(confirmed ? 0.75 : 0.5), gold.halo(0.06), confirmed ? 0.65 : 0.5, confirmed ? [4, 3] : [2, 3]);
+              if (confirmed && xE0 != null && xE0 >= -4 && xE0 <= rightEdge) {
                 ctx.save();
                 ctx.beginPath();
                 ctx.arc(xE0 + 2, yE, 5, 0, Math.PI * 2);
@@ -1575,33 +1728,70 @@ export default function TradingChart(props: Props) {
                 ctx.restore();
               }
               if (tryLabel(xAnchor, d.dir === "up" ? yE + 11 : yE - 4, `ENTRY ${d.entry.price.toFixed(digits)}`, 8, "left")) {
-                pillLabel(ctx, `ENTRY ${d.entry.price.toFixed(digits)}`, xAnchor, d.dir === "up" ? yE + 11 : yE - 4, gold.text, gold.line(0.5), "left", 8);
+                pillLabel(ctx, `ENTRY ${d.entry.price.toFixed(digits)}`, xAnchor, d.dir === "up" ? yE + 11 : yE - 4,
+                  confirmed ? gold.text : "rgba(230,190,70,0.75)", gold.line(confirmed ? 0.5 : 0.3), "left", 8);
               }
             }
-            // 5. STOP-LOSS — thin red dashed line + tag (confirmed only)
-            const yS = confirmed ? yOfPrice(d.sl) : null;
+            // 5. STOP-LOSS — thin red dashed line + tag. v18.0: the tag sits
+            //    on the side AWAY from the entry line (down patterns: above
+            //    the SL; up patterns: below it) — the old yS+12 always put
+            //    the down-pattern SL tag into the entry↔SL gap where it
+            //    fought the ENTRY pill (VLM audit: obscured SL label).
+            const yS = drawPlan ? yOfPrice(d.sl) : null;
             if (yS !== null && yS > -5 && yS < h + 5) {
               hardSeg(ctx, planX0, Math.round(yS) + 0.5, rightEdge, Math.round(yS) + 0.5,
-                "rgba(248,113,113,0.72)", "rgba(248,113,113,0.05)", 0.55, [2.5, 3.5]);
-              if (tryLabel(xAnchor, yS + 12, `SL ${d.sl.toFixed(digits)}`, 8, "left")) {
-                pillLabel(ctx, `SL ${d.sl.toFixed(digits)}`, xAnchor, yS + 12, "rgba(252,165,165,0.95)", "rgba(248,113,113,0.5)", "left", 8);
+                confirmed ? "rgba(248,113,113,0.72)" : "rgba(248,113,113,0.45)", "rgba(248,113,113,0.05)", confirmed ? 0.55 : 0.45, [2.5, 3.5]);
+              const slLy = d.dir === "down" ? yS - 4 : yS + 12;
+              if (tryLabel(xAnchor, slLy, `SL ${d.sl.toFixed(digits)}`, 8, "left")) {
+                pillLabel(ctx, `SL ${d.sl.toFixed(digits)}`, xAnchor, slLy,
+                  confirmed ? "rgba(252,165,165,0.95)" : "rgba(252,165,165,0.7)", "rgba(248,113,113,0.5)", "left", 8);
               }
             }
-            // 6. TARGET — whisper gold band + dashed line + tag (confirmed only)
-            const yT1 = confirmed ? yOfPrice(d.target_zone.lo) : null;
-            const yT2 = confirmed ? yOfPrice(d.target_zone.hi) : null;
+            // 6. TARGET — whisper green band + dashed line + tag.
+            //    v18.0: TARGET reads GREEN (profit direction — the same
+            //    coding as the hero setup's TP), so the three plan levels
+            //    answer at a glance: gold = pay, red = pain, green = gain.
+            const yT1 = drawPlan ? yOfPrice(d.target_zone.lo) : null;
+            const yT2 = drawPlan ? yOfPrice(d.target_zone.hi) : null;
             if (yT1 !== null && yT2 !== null && Math.abs(yT2 - yT1) > 0.5) {
-              ctx.fillStyle = "rgba(212,175,55,0.05)";
+              ctx.fillStyle = confirmed ? "rgba(52,211,153,0.05)" : "rgba(52,211,153,0.03)";
               ctx.fillRect(rightEdge - 64, Math.min(yT1, yT2), 64, Math.abs(yT2 - yT1));
             }
-            const yT = confirmed ? yOfPrice(d.target) : null;
+            const yT = drawPlan ? yOfPrice(d.target) : null;
             if (yT !== null && yT > -5 && yT < h + 5) {
               hardSeg(ctx, planX0, Math.round(yT) + 0.5, rightEdge, Math.round(yT) + 0.5,
-                gold.line(0.6), "transparent", 0.55, [2, 3]);
+                confirmed ? "rgba(52,211,153,0.8)" : "rgba(52,211,153,0.45)", "transparent", confirmed ? 0.6 : 0.45, [2, 3]);
               const rrTxt = d.rr != null ? ` · RR ${d.rr.toFixed(1)}` : "";
               if (tryLabel(rightEdge - 4, yT - 8, `TARGET ${d.target.toFixed(digits)}${rrTxt}`, 8, "right")) {
-                pillLabel(ctx, `TARGET ${d.target.toFixed(digits)}${rrTxt}`, rightEdge - 4, yT - 8, gold.text, gold.line(0.5), "right", 8);
+                pillLabel(ctx, `TARGET ${d.target.toFixed(digits)}${rrTxt}`, rightEdge - 4, yT - 8,
+                  confirmed ? "rgba(167,243,208,0.95)" : "rgba(167,243,208,0.7)", "rgba(52,211,153,0.5)", "right", 8);
               }
+            }
+            // 6b. v18.0 — the MEASURED-MOVE VERTICAL (the reference
+            //     cheat-sheet's signature element): a dashed vertical from
+            //     the ENTRY level to the TARGET level with bracket caps and
+            //     an arrowhead at the target — the projected distance drawn
+            //     to scale, so "reversal হলে কত দূর যাবে" is answered by
+            //     geometry. SKY-CYAN like the reference's blue connectors:
+            //     green ink over green candles camouflages (VLM audit), the
+            //     measurement color must contrast with the candles.
+            if (drawPlan && yE !== null && yT !== null && Math.abs(yT - yE) > 6) {
+              // anchor: the breakout candle when it is ON SCREEN; else the
+              // pattern's last pivot +2 bars (a confirmed breakout that
+              // scrolled off-screen must not strand the bracket at x=4)
+              const xV0 = d.entry.t != null ? xOfTime(d.entry.t) : null;
+              const onScreen = xV0 != null && xV0 >= 8 && xV0 <= rightEdge - 8;
+              const xV = clamp(
+                onScreen ? xV0! : ((xH ?? rightEdge - 40) + barSpacing * 2),
+                4, rightEdge - 4,
+              );
+              const mvA = confirmed ? 0.85 : 0.5;
+              const mvCol = `rgba(56,189,248,${mvA})`;
+              hardSeg(ctx, xV, yE, xV, yT, mvCol, "transparent", 0.7, [4, 3]);
+              // bracket caps at both levels — the |—| measurement grammar
+              hardSeg(ctx, xV - 4, yE, xV + 4, yE, mvCol, "transparent", 0.7);
+              hardSeg(ctx, xV - 4, yT, xV + 4, yT, mvCol, "transparent", 0.7);
+              arrow(ctx, xV, yT, d.dir, mvCol, "rgba(56,189,248,0.15)", 5);
             }
             // 7. breakout arrow once price CLOSED through the trigger
             if (d.state === "confirmed" && d.breakout_t != null) {
@@ -1615,16 +1805,21 @@ export default function TradingChart(props: Props) {
                 }
               }
             }
-            // 8. name pill at the pattern's first point — family + state
+            // 8. name pill at the pattern's first point — family + state.
+            //    v18.0: compact form on narrow charts (mobile) and no
+            //    forced collision win — a phone screen cannot afford the
+            //    full "NAME · FAMILY · STATE · TF" sentence
             const firstP = d.points[0];
             if (firstP) {
               const x0 = xOfTime(firstP.t);
               const y0 = yOfPrice(firstP.price);
               if (x0 !== null && y0 !== null && x0 >= -4 && x0 <= rightEdge) {
                 const fam = d.family === "reversal" ? "REVERSAL" : d.family === "continuation" ? "CONTINUATION" : "BOUNDARY";
-                const nm = `${d.name} · ${fam} · ${d.state === "confirmed" ? "✓ CONFIRMED" : "FORMING"}${d.source_tf ? " · " + d.source_tf : ""}`;
+                const nm = narrow
+                  ? `${d.name} · ${d.state === "confirmed" ? "✓" : "FORMING"}`
+                  : `${d.name} · ${fam} · ${d.state === "confirmed" ? "✓ CONFIRMED" : "FORMING"}${d.source_tf ? " · " + d.source_tf : ""}`;
                 const ty = firstP.kind === "high" ? y0 - 22 : y0 + 22;
-                if (tryLabel(x0, ty, nm, 8.5, "left", true)) {
+                if (tryLabel(x0, ty, nm, 8.5, "left", !narrow)) {
                   pillLabel(ctx, nm, x0, ty,
                     d.state === "confirmed" ? pt.text : "rgba(226,232,230,0.9)",
                     d.state === "confirmed" ? pt.line(0.55) : "rgba(148,163,158,0.4)", "left", 8.5);

@@ -10,14 +10,14 @@ import { detectKeyLevels } from "@/lib/market/levels";
 import { buildRoadmap } from "@/lib/market/roadmap";
 import { detectStructure, detectSupplyDemand, detectOrderBlocks, detectFvg, detectLiquidity } from "@/lib/market/smc";
 import { detectConsolidations, detectAmdPhases, detectInstitutionalActivity } from "@/lib/market/phases";
-import { detectPatterns } from "@/lib/market/patterns";
+import { detectPatterns, detectCandles } from "@/lib/market/patterns";
 import type { AnalysisResponse, Candle, SignalPayload, TfSetup } from "@/lib/market/types";
 import { svcHeaders, getBrokerOffsetSec, spreadFor, MT5_URL } from "@/lib/svc";
 
 const CACHE_TTL = 8_000;
 /** v16.4 (audit §10): the strategy build identity carried in every
  *  response so consumers/caches can compare across deploys. */
-const STRATEGY_VERSION = "v17.1";
+const STRATEGY_VERSION = "v18.0";
 /** v16.4 (audit §10): a candle older than 3× its timeframe (plus a
  *  market-closed weekend allowance) means the FEED is stale — surfaced
  *  via dataFreshness.fresh=false instead of passing silently. */
@@ -672,6 +672,13 @@ export async function GET(req: Request) {
     for (const p of detectPatterns(h1Closed).slice(0, 1)) {
       drawings.push({ ...p, source_tf: "H1" });
     }
+  }
+  // v18.0 (user reference images — the boxed candlestick setups): the
+  // textbook 1–3 bar reversals at real extremes (hammer / engulfing /
+  // star) boxed on the chart like the reference screenshots — thin
+  // outlined rectangle around the exact pattern candles + name tag.
+  for (const c of detectCandles(closedBars)) {
+    drawings.push({ ...c, source_tf: tf });
   }
   // v16.5: the forward map — projected legs to the roadmap's real targets
   // (supersedes the old single-arrow path drawing)
