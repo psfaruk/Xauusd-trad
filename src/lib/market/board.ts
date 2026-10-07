@@ -392,8 +392,10 @@ async function llmJson(
 }
 
 /** parse one agent vote object — used by the committee's regex-salvage path
- *  when the model answers with loose objects instead of a JSON array */
-function parseAgentJson(raw: string): { vote: "BUY" | "SELL" | "HOLD"; confidence: number; note: string } | null {
+ *  when the model answers with loose objects instead of a JSON array.
+ *  v26 — also surfaces a valid agent `id` when the model included one, so the
+ *  salvage tier can attribute votes by their own id instead of array order. */
+function parseAgentJson(raw: string): { id: string | null; vote: "BUY" | "SELL" | "HOLD"; confidence: number; note: string } | null {
   const m = raw.match(/\{[\s\S]*\}/);
   if (!m) return null;
   try {
@@ -402,7 +404,8 @@ function parseAgentJson(raw: string): { vote: "BUY" | "SELL" | "HOLD"; confidenc
     if (!vote) return null;
     const confidence = Math.max(0, Math.min(100, Math.round(Number(j.confidence) || 0)));
     const note = typeof j.note === "string" ? j.note.trim().slice(0, 220) : "";
-    return { vote, confidence, note };
+    const id = typeof j.id === "string" && j.id ? j.id : null;
+    return { id, vote, confidence, note };
   } catch {
     return null;
   }
@@ -464,7 +467,11 @@ function localAgents(ctx: BoardContext): BoardAgentOut[] {
       smc === "HOLD" ? "HOLD" : smc,
       "জোন-ভিত্তিক জ্যামিতি হিসাব করা হয়েছে — RR শর্ত পূরণ হলে এন্ট্রি।"),
     localAgent(AGENT_PERSONAS[3], ctx,
-      t === "HOLD" && smc === "HOLD" ? "HOLD" : (t !== "HOLD" && smc !== "HOLD" && t !== smc ? "HOLD" : "HOLD"),
+      // v26 — was a dead ternary that always returned HOLD. Deliberate rule
+      // now: the local skeptic supports a direction ONLY when the indicator
+      // read AND the SMC read agree on it; anything mixed or one-sided stays
+      // HOLD (the devil's advocate never invents an edge).
+      t !== "HOLD" && t === smc ? t : "HOLD",
       "সংশয়: ফেকআউট বা লিকুইডিটি ট্র্যাপ ঝুঁকি যাচাই করুন।"),
     localAgent(AGENT_PERSONAS[4], ctx,
       highVol || wideSpread ? "HOLD" : smc !== "HOLD" ? smc : t,
@@ -699,13 +706,20 @@ export function lotFor(
  * v24 — the ONE-CALL committee prompt: all 5 analyst personas, each with its
  * own specialty + voting rule + assigned brain, voting independently inside
  * a single request. Replaces 5 separate engine calls (rate-limit relief).
+ * v26 — each agent section now carries its ASSIGNED brain's persona, so every
+ * vote is cast in that model's own voice, and the batch call itself rides the
+ * TREND agent's assigned model (the committee chair): with the v25 flagship
+ * defaults the flagship committee actually runs, and the per-agent badges
+ * stay honest.
  */
-function buildCommitteeSystem(personas: AgentPersona[]): string {
+function buildCommitteeSystem(personas: AgentPersona[], models?: Record<string, string>): string {
   const members = personas
     .map((p, i) => {
       // strip the trailing per-agent JSON rule — the committee has its own
       const body = p.system.replace(JSON_RULE, "").trim();
-      return `AGENT ${i + 1} — id "${p.id}" · ${p.roleEn}\n${body}`;
+      const m = models?.[p.id] ? modelById(models[p.id]) : null;
+      const brain = m ? `\nASSIGNED BRAIN: ${m.label} — ${m.persona}` : "";
+      return `AGENT ${i + 1} — id "${p.id}" · ${p.roleEn}${brain}\n${body}`;
     })
     .join("\n\n");
 
@@ -725,6 +739,7 @@ function buildCommitteeSystem(personas: AgentPersona[]): string {
 function parseCommitteeVotes(
   raw: string,
 ): { id: string; vote: "BUY" | "SELL" | "HOLD"; confidence: number; note: string }[] | null {
+  const validIds = new Set(AGENT_PERSONAS.map((p) => p.id as string));
   const cleaned = raw.replace(/```(?:json)?/gi, "").trim();
   const candidates: unknown[] = [];
   // 1) a top-level array
@@ -747,17 +762,21 @@ function parseCommitteeVotes(
       } catch { /* fall through */ }
     }
   }
-  // 3) regex salvage: individual vote objects, ids assigned by committee order
+  // 3) regex salvage: individual vote objects. v26 — a loose object that
+  // carries its own valid `id` is attributed to THAT agent (the model said
+  // who voted); positional order is only the fallback.
   if (!candidates.length) {
     const objs = (cleaned.match(/\{[^{}]*\}/g) ?? [])
       .map((m) => parseAgentJson(m))
       .filter((o): o is NonNullable<ReturnType<typeof parseAgentJson>> => o != null);
     objs.forEach((o, i) => {
-      const persona = AGENT_PERSONAS[i];
-      if (persona) candidates.push({ id: persona.id, ...o });
+      const persona =
+        o.id && validIds.has(o.id)
+          ? AGENT_PERSONAS.find((p) => p.id === o.id)
+          : AGENT_PERSONAS[i];
+      if (persona) candidates.push({ id: persona.id, vote: o.vote, confidence: o.confidence, note: o.note });
     });
   }
-  const validIds = new Set(AGENT_PERSONAS.map((p) => p.id as string));
   const out: { id: string; vote: "BUY" | "SELL" | "HOLD"; confidence: number; note: string }[] = [];
   for (const c of candidates) {
     if (!c || typeof c !== "object") continue;
@@ -804,11 +823,17 @@ export async function runBoardMeeting(
   //    The committee keeps every agent's own specialty, rule, assigned brain
   //    and Bengali voice — they just share one request now (6 → 2 calls per
   //    meeting, −66% engine pressure). A short/failed batch degrades ONLY
-  //    the missing agents to their deterministic local reads. ──
+  //    the missing agents to their deterministic local reads.
+  //    v26 — the batch now rides the TREND agent's assigned model (the chair)
+  //    and every section carries its own brain's persona, so the flagship
+  //    committee actually runs and votes in each model's voice. Budgets
+  //    tightened 34s→28s / 30s→22s so committee+CTO+spacing fit the route's
+  //    maxDuration with room to spare. ──
   let degraded = false;
   const localFb = localAgents(ctx);
-  const committeeSystem = buildCommitteeSystem(AGENT_PERSONAS);
-  const batchRes = await llmJson(committeeSystem, userMsg, 34_000, "glm-4.6");
+  const committeeSystem = buildCommitteeSystem(AGENT_PERSONAS, models);
+  const batchModelId = models?.trend && modelById(models.trend) ? models.trend : undefined;
+  const batchRes = await llmJson(committeeSystem, userMsg, 28_000, batchModelId);
   const batchVotes = batchRes.ok ? parseCommitteeVotes(batchRes.raw) : null;
   if (!batchVotes) degraded = true;
 
@@ -827,7 +852,7 @@ export async function runBoardMeeting(
 
   // ── the CTO — the final word (gate retries inside its budget) ──
   const ctoModelId = models?.cto;
-  const ctoRes = await llmJson(CTO_PERSONA.system, ctoUser(analysts), 30_000, ctoModelId);
+  const ctoRes = await llmJson(CTO_PERSONA.system, ctoUser(analysts), 22_000, ctoModelId);
   const ctoUsedModelId = ctoRes.usedModelId;
   const ctoParsed = ctoRes.ok ? parseCto(ctoRes.raw) : null;
   let action: "BUY" | "SELL" | "HOLD" = "HOLD";

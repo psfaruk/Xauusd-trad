@@ -52,3 +52,13 @@ Caddyfile
 /coverage
 .vercel
 .claude
+
+# v26 repo hygiene — one-off probe/test artifacts & verification screenshots
+# (never source; keep them locally, out of the repo)
+scripts/*.png
+scripts/recovery-result.json
+scripts/watch-recovery.ts
+scripts/test-sdk-models*.ts
+scripts/test-routing-mock.test.ts
+scripts/probe-special-models.ts
+cleanup.mjs

@@ -153,6 +153,10 @@ export const AI_MODELS: AiModel[] = [
   },
   {
     id: "deepseek-v4",
+    // NOTE (v26): DeepSeek's API currently serves ONE apiModel id ("deepseek-chat")
+    // for both V3 and the V4 flagship — until DeepSeek ships a distinct id, a
+    // key installs make byte-identical direct calls for deepseek-chat and
+    // deepseek-v4; keyless they ride the engine like every other model.
     apiModel: "deepseek-chat",
     provider: "deepseek",
     label: "DeepSeek V4",

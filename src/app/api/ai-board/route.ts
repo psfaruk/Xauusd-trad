@@ -21,7 +21,7 @@ import type { BoardResponse, BoardSessionPayload, Candle } from "@/lib/market/ty
  */
 
 export const runtime = "nodejs";
-export const maxDuration = 60;
+export const maxDuration = 75; // v26 — committee 28s + CTO 22s + gate spacing fit with margin (was 60, too tight)
 
 const BOARD_TFS = ["M1", "M5", "M15", "M30", "H1", "H4"];
 const COOLDOWN_MS = 45_000;

@@ -120,11 +120,25 @@ function captureChartImage(): string | null {
     ctx.fillStyle = "#0a0f0d";
     ctx.fillRect(0, 0, out.width, out.height);
 
-    // composite all canvases in DOM (stacking) order — candles first, then
-    // the crosshair, then the overlay with drawings + AI ink
+    // composite all canvases in DOM (stacking) order — v26: each canvas is
+    // drawn at its own CSS rect relative to the host, scaled to the output.
+    // lightweight-charts stacks MANY canvases of different sizes (candle pane,
+    // 56px price axis, 26px time axis, crosshair, the app's drawing overlay) —
+    // stretching each one to the full output (the v24 bug) smeared the axis
+    // canvases over the candles, so the VLM received garbage while the UI
+    // claimed it "saw the chart". Positioning each at its true rect keeps the
+    // pane sharp and the axes where they belong.
     host.querySelectorAll("canvas").forEach((c) => {
       try {
-        ctx.drawImage(c, 0, 0, c.width, c.height, 0, 0, out.width, out.height);
+        const r = c.getBoundingClientRect();
+        if (r.width < 1 || r.height < 1) return;
+        ctx.drawImage(
+          c,
+          (r.left - rect.left) * scale,
+          (r.top - rect.top) * scale,
+          r.width * scale,
+          r.height * scale,
+        );
       } catch {
         /* a tainted/odd canvas never blocks the rest */
       }

@@ -29,6 +29,9 @@ import {
 import { sdkChatComplete, sdkPing, gateHealth, type SdkChatResult } from "./gate";
 import type { ChatMsg } from "./llm-types";
 
+/** v26 — one-shot marker for the v25 settings migration (see getAiSettings) */
+const SETTING_MIGRATED_V25 = "ai.migrated.v25";
+
 // ── settings (cached 30s; invalidated on PUT /api/ai/models) ────────────────
 
 export interface AiSettings {
@@ -59,6 +62,16 @@ export async function getAiSettings(force = false): Promise<AiSettings> {
     if (row?.value) keys[p.id] = row.value;
   }
 
+  // v26 — ONE-SHOT, PERSISTED migration. The v25 code re-transformed the
+  // saved values on EVERY read and never wrote them back, so (a) a
+  // deliberate glm-4.6 chat choice (or a deliberately re-selected v23
+  // committee) was silently clobbered on every GET and could never be saved,
+  // and (b) the transform ran forever. Now: the first read without the flag
+  // row transforms once, PERSISTS the result, and plants the flag — from
+  // then on raw saved values are returned untouched, so every later
+  // deliberate choice survives.
+  const migrated = rows.some((r) => r.key === SETTING_MIGRATED_V25 && r.value === "1");
+
   let boardModels: Record<string, string> = { ...DEFAULT_BOARD_MODELS };
   try {
     const raw = rows.find((r) => r.key === SETTING_BOARD_MODELS)?.value;
@@ -68,18 +81,17 @@ export async function getAiSettings(force = false): Promise<AiSettings> {
       for (const [k, v] of Object.entries(parsed)) {
         if (typeof v === "string" && modelById(v)) saved[k] = v;
       }
-      // v25 migration — if the saved committee is exactly the untouched v23
-      // default set, upgrade it to the new FLAGSHIP committee (the user never
-      // customized it). Anything else is a deliberate choice → keep it.
-      const V23_DEFAULTS: Record<string, string> = {
-        trend: "qwen-flash", smc: "kimi-k2", risk: "glm-4.6",
-        skeptic: "deepseek-reasoner", volatility: "qwen-turbo", cto: "glm-4.6",
-      };
-      const isUntouchedV23 =
-        Object.keys(saved).length === Object.keys(V23_DEFAULTS).length &&
-        Object.entries(V23_DEFAULTS).every(([k, v]) => saved[k] === v);
-      if (isUntouchedV23) {
-        boardModels = { ...DEFAULT_BOARD_MODELS };
+      if (!migrated) {
+        // last transform: an exactly-untouched v23 default committee upgrades
+        // to the flagship committee; anything else is deliberate → kept as-is
+        const V23_DEFAULTS: Record<string, string> = {
+          trend: "qwen-flash", smc: "kimi-k2", risk: "glm-4.6",
+          skeptic: "deepseek-reasoner", volatility: "qwen-turbo", cto: "glm-4.6",
+        };
+        const isUntouchedV23 =
+          Object.keys(saved).length === Object.keys(V23_DEFAULTS).length &&
+          Object.entries(V23_DEFAULTS).every(([k, v]) => saved[k] === v);
+        boardModels = isUntouchedV23 ? { ...DEFAULT_BOARD_MODELS } : { ...boardModels, ...saved };
       } else {
         boardModels = { ...boardModels, ...saved };
       }
@@ -87,10 +99,35 @@ export async function getAiSettings(force = false): Promise<AiSettings> {
   } catch { /* defaults survive */ }
 
   const chatRaw = rows.find((r) => r.key === SETTING_CHAT_MODEL)?.value;
-  // v25 migration — a saved chat model survives UNLESS it is the untouched
-  // old default (glm-4.6), which upgrades to the new flagship default.
-  const chatModel =
-    chatRaw && modelById(chatRaw) && chatRaw !== "glm-4.6" ? chatRaw : DEFAULT_CHAT_MODEL;
+  let chatModel: string;
+  if (!migrated) {
+    // last transform: a saved chat model survives UNLESS it is the untouched
+    // old default (glm-4.6), which upgrades to the new flagship default
+    chatModel = chatRaw && modelById(chatRaw) && chatRaw !== "glm-4.6" ? chatRaw : DEFAULT_CHAT_MODEL;
+  } else {
+    // raw saved value rules — the user's deliberate choice is final
+    chatModel = chatRaw && modelById(chatRaw) ? chatRaw : DEFAULT_CHAT_MODEL;
+  }
+
+  // persist the one-shot migration (best-effort — a failed write retries on
+  // the next read because the flag row is only planted after both writes)
+  if (!migrated) {
+    await db.appSetting.upsert({
+      where: { key: SETTING_BOARD_MODELS },
+      create: { key: SETTING_BOARD_MODELS, value: JSON.stringify(boardModels) },
+      update: { value: JSON.stringify(boardModels) },
+    }).catch(() => {});
+    await db.appSetting.upsert({
+      where: { key: SETTING_CHAT_MODEL },
+      create: { key: SETTING_CHAT_MODEL, value: chatModel },
+      update: { value: chatModel },
+    }).catch(() => {});
+    await db.appSetting.upsert({
+      where: { key: SETTING_MIGRATED_V25 },
+      create: { key: SETTING_MIGRATED_V25, value: "1" },
+      update: { value: "1" },
+    }).catch(() => {});
+  }
 
   const value: AiSettings = { keys, boardModels, chatModel };
   settingsCache = { at: Date.now(), value };
@@ -191,9 +228,12 @@ async function keylessCall(
 
   // builtin GLM: glm-4.6 rides the engine default; the flagship GLM 5.3 sends
   // its own id as a pass-through (verified served), falling back to the
-  // engine default + persona if the id is ever rejected
+  // engine default + persona if the id is ever rejected.
+  // v26 — the builtin branch now also consults the known-bad cache: a
+  // pass-through id that was already rejected (cache = false) goes straight
+  // to the persona route instead of burning a doomed call every time.
   if (isBuiltin) {
-    if (model.apiModel) {
+    if (model.apiModel && cache.get(model.id) !== false) {
       const r = await sdkChatComplete({
         messages, model: model.apiModel, temperature, maxTokens, timeoutMs, kind,
       });

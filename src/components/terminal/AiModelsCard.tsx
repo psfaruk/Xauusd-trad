@@ -19,6 +19,7 @@ import { useCallback, useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useI18n } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
+import { DEFAULT_BOARD_MODELS } from "@/lib/ai/registry";
 import { toast } from "@/hooks/use-toast";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -78,7 +79,7 @@ async function fetchModels(): Promise<ModelsPayload> {
 }
 
 export function AiModelsCard() {
-  const { t } = useI18n();
+  const { t, locale } = useI18n();
   const modelsQ = useQuery({
     queryKey: ["ai-models"],
     queryFn: fetchModels,
@@ -341,7 +342,7 @@ export function AiModelsCard() {
                       ? "border-up/40 bg-up/10 text-up"
                       : m.tier === "special"
                         ? "border-gold/40 bg-gold/10 text-gold"
-                        : "border-gold/40 bg-gold/10 text-gold",
+                        : "border-border bg-muted/60 text-muted-foreground",
                   )}
                 >
                   {m.direct ? "direct" : m.tier === "special" ? "flagship" : "live"}
@@ -360,17 +361,20 @@ export function AiModelsCard() {
           <p className="mb-2 text-[9px] leading-snug text-muted-foreground/80">{t("aiAssignNote")}</p>
           <div className="flex flex-col gap-1.5">
             {data.boardAgents.map((agent) => {
+              // v26 — labels follow the active locale (was Bengali-first always)
               const label = AGENT_LABELS[agent] ?? { bn: agent, en: agent };
+              const primary = locale === "bn" ? label.bn : label.en;
+              const secondary = locale === "bn" ? label.en : label.bn;
               return (
                 <div key={agent} className="flex items-center gap-2">
                   <Label htmlFor={`agent-${agent}`} className="w-full max-w-[180px] shrink-0 truncate text-[10px] font-semibold text-muted-foreground">
-                    {label.bn}
+                    {primary}
                     <span className="ml-1 text-[8px] uppercase tracking-wider text-muted-foreground/60">
-                      {label.en}
+                      {secondary}
                     </span>
                   </Label>
                   <Select
-                    value={boardModels[agent] ?? "glm-4.6"}
+                    value={boardModels[agent] ?? data.boardModels[agent] ?? DEFAULT_BOARD_MODELS[agent as keyof typeof DEFAULT_BOARD_MODELS] ?? "glm-5.3"}
                     onValueChange={(v) => {
                       const next = { ...boardModels, [agent]: v };
                       setBoardModels(next);

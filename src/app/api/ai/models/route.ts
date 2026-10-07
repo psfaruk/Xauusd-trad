@@ -80,7 +80,12 @@ export async function PUT(req: Request) {
     chatModel?: string;
   };
 
-  // ── set / clear a provider key ──
+  // v26 — VALIDATE EVERYTHING FIRST, WRITE LAST. The old order persisted a
+  // key (or a chat model) before a later invalid section 400'd, leaving a
+  // half-applied save. A rejected body now performs zero writes.
+
+  // ── validate: set / clear a provider key ──
+  let setKeyOp: { keySetting: string; value: string } | null = null;
   if (b.setKey) {
     const providerId = b.setKey.provider as AiProviderId;
     const key = (b.setKey.key ?? "").trim();
@@ -90,21 +95,19 @@ export async function PUT(req: Request) {
     if (key.length < 16 || key.length > 256 || /\s/.test(key)) {
       return NextResponse.json({ error: "that does not look like an API key" }, { status: 400 });
     }
-    await db.appSetting.upsert({
-      where: { key: providerById(providerId).keySetting },
-      create: { key: providerById(providerId).keySetting, value: key },
-      update: { value: key },
-    });
+    setKeyOp = { keySetting: providerById(providerId).keySetting, value: key };
   }
+  let clearKeyOp: { keySetting: string } | null = null;
   if (b.clearKey) {
     const providerId = b.clearKey as AiProviderId;
     if (!PROVIDER_IDS.includes(providerId) || providerId === "builtin") {
       return NextResponse.json({ error: "unknown provider" }, { status: 400 });
     }
-    await db.appSetting.deleteMany({ where: { key: providerById(providerId).keySetting } }).catch(() => {});
+    clearKeyOp = { keySetting: providerById(providerId).keySetting };
   }
 
-  // ── board per-agent model assignment ──
+  // ── validate: board per-agent model assignment ──
+  let boardOp: Record<string, string> | null = null;
   if (b.boardModels && typeof b.boardModels === "object") {
     const clean: Record<string, string> = {};
     for (const agent of BOARD_AGENT_IDS) {
@@ -114,20 +117,38 @@ export async function PUT(req: Request) {
     if (!Object.keys(clean).length) {
       return NextResponse.json({ error: "no valid agent assignments" }, { status: 400 });
     }
-    await db.appSetting.upsert({
-      where: { key: SETTING_BOARD_MODELS },
-      create: { key: SETTING_BOARD_MODELS, value: JSON.stringify(clean) },
-      update: { value: JSON.stringify(clean) },
-    });
+    boardOp = clean;
   }
 
-  // ── default chat model ──
-  if (b.chatModel && AI_MODELS.some((m) => m.id === b.chatModel)) {
+  // ── validate: default chat model ──
+  if (b.chatModel != null && !AI_MODELS.some((m) => m.id === b.chatModel)) {
+    return NextResponse.json({ error: "unknown chat model" }, { status: 400 });
+  }
+
+  // ── write (only past full validation) ──
+  if (setKeyOp) {
+    await db.appSetting.upsert({
+      where: { key: setKeyOp.keySetting },
+      create: { key: setKeyOp.keySetting, value: setKeyOp.value },
+      update: { value: setKeyOp.value },
+    }).catch(() => {});
+  }
+  if (clearKeyOp) {
+    await db.appSetting.deleteMany({ where: { key: clearKeyOp.keySetting } }).catch(() => {});
+  }
+  if (boardOp) {
+    await db.appSetting.upsert({
+      where: { key: SETTING_BOARD_MODELS },
+      create: { key: SETTING_BOARD_MODELS, value: JSON.stringify(boardOp) },
+      update: { value: JSON.stringify(boardOp) },
+    }).catch(() => {});
+  }
+  if (b.chatModel) {
     await db.appSetting.upsert({
       where: { key: SETTING_CHAT_MODEL },
       create: { key: SETTING_CHAT_MODEL, value: b.chatModel },
       update: { value: b.chatModel },
-    });
+    }).catch(() => {});
   }
 
   invalidateAiSettings();

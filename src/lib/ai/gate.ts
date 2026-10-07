@@ -42,9 +42,18 @@ const PRIO = { probe: 0, vision: 1, chat: 1, board: 3 } as const;
 
 // ── state (per process, HMR-safe) ───────────────────────────────────────────
 
+interface PendingJob {
+  prio: number;
+  /** earliest start (v26) — a requeued job parks here until this instant */
+  notBefore: number;
+  thunk: () => Promise<void>;
+  /** v26 — settles the caller's promise if an HMR replace drops the job */
+  fail: (e: Error) => void;
+}
+
 interface GateState {
   /** sorted pending jobs — pumped one at a time, highest priority first */
-  pending: { prio: number; thunk: () => Promise<void> }[];
+  pending: PendingJob[];
   pumping: boolean;
   lastCallStart: number;
   spacingMs: number;
@@ -67,8 +76,14 @@ const g: GateState = (() => {
   const existing = glob[key] as Partial<GateState> | undefined;
   // HMR guard: an older module version's singleton (e.g. v23's promise-chain
   // queue) may live here without `pending` — replace it wholesale. A fresh
-  // process always takes the defaults path.
+  // process always takes the defaults path. v26: jobs dropped by a replace
+  // are now REJECTED (their callers surface "retry" instead of hanging).
   if (!existing || !Array.isArray(existing.pending) || typeof existing.pumping !== "boolean") {
+    if (existing && Array.isArray(existing.pending)) {
+      for (const j of existing.pending as PendingJob[]) {
+        try { j.fail?.(new Error("gate replaced (HMR) — please retry")); } catch { /* settled already */ }
+      }
+    }
     glob[key] = {
       pending: [],
       pumping: false,
@@ -91,20 +106,41 @@ const g: GateState = (() => {
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
-// ── the priority pump ───────────────────────────────────────────────────────
+// ── v26 — requeue signal ────────────────────────────────────────────────────
+// A patient job that must wait out a breaker/backoff for MORE than this
+// releases the pump for other traffic (it re-enters the queue at its own
+// priority with notBefore = now + delay). Waits ≤ this sleep inline.
+const REQUEUE_AFTER_MS = 1_500;
 
-function submit<T>(prio: number, job: () => Promise<T>): Promise<T> {
+class RequeueSignal {
+  constructor(public delayMs: number) {}
+}
+
+// ── the priority pump (v26 — preemption) ────────────────────────────────────
+
+function submit<T>(prio: number, job: (entry: PendingJob) => Promise<T>): Promise<T> {
   return new Promise<T>((resolve, reject) => {
-    g.pending.push({
+    const entry: PendingJob = {
       prio,
+      notBefore: 0,
+      fail: reject,
       thunk: async () => {
         try {
-          resolve(await job());
+          resolve(await job(entry));
         } catch (e) {
-          reject(e);
+          if (e instanceof RequeueSignal) {
+            // v26 — put MYSELF back at my priority instead of holding the
+            // pump through a long cooldown; other traffic runs meanwhile.
+            entry.notBefore = Date.now() + e.delayMs;
+            g.pending.push(entry);
+            g.pending.sort((a, b) => a.prio - b.prio);
+            return;
+          }
+          reject(e instanceof Error ? e : new Error(String(e)));
         }
       },
-    });
+    };
+    g.pending.push(entry);
     // stable priority order — earlier submissions win ties (FIFO within class)
     g.pending.sort((a, b) => a.prio - b.prio);
     void pump();
@@ -115,13 +151,30 @@ async function pump(): Promise<void> {
   if (g.pumping) return;
   g.pumping = true;
   try {
-    while (g.pending.length) {
-      // spacing: adaptive gap between two call starts
+    for (;;) {
+      if (!g.pending.length) break;
+      const now = Date.now();
+      // earliest eligible job in priority order — jobs parked for later
+      // (notBefore in the future, v26) are skipped so they never block anyone.
+      // `?? 0`: a pre-v26 HMR leftover entry lacks notBefore and must stay
+      // eligible, not park the pump forever (undefined <= now is false!).
+      let idx = -1;
+      for (let i = 0; i < g.pending.length; i++) {
+        if ((g.pending[i].notBefore ?? 0) <= now) { idx = i; break; }
+      }
+      if (idx === -1) {
+        // everything is parked — sleep toward the earliest wake-up, but never
+        // longer than 2s so a brand-new high-priority job is picked up fast
+        const nextAt = Math.min(...g.pending.map((j) => j.notBefore ?? 0));
+        await sleep(Math.max(30, Math.min(nextAt - Date.now(), 2_000)));
+        continue;
+      }
+      // spacing: adaptive gap between two call starts. v26 measures it from
+      // when a call actually STARTS (a requeued/parked job never counted), so
+      // a released pump never injects phantom gaps.
       const wait = g.lastCallStart + g.spacingMs - Date.now();
       if (wait > 0) await sleep(wait);
-      const next = g.pending.shift();
-      if (!next) continue;
-      g.lastCallStart = Date.now();
+      const next = g.pending.splice(idx, 1)[0];
       await next.thunk();
     }
   } finally {
@@ -231,14 +284,40 @@ function noteOk(): void {
   g.lastError = null;
 }
 
-/** wait out an open breaker if the caller is patient (user-facing classes) */
+/** wait out an open breaker if the caller is patient (user-facing classes).
+ *  v26 — a wait longer than REQUEUE_AFTER_MS throws RequeueSignal so the job
+ *  releases the pump (other traffic proceeds meanwhile); the job re-enters at
+ *  its own priority and its closure state (attempts, deadline) survives. */
 async function waitOutBreaker(kind: string, deadline: number): Promise<boolean> {
   while (Date.now() < g.breakerUntil) {
     const waitMs = g.breakerUntil - Date.now() + 400;
     if (kind === "board") return false; // fail fast → local mode
     if (Date.now() + waitMs + 2_500 >= deadline) return false;
+    if (waitMs > REQUEUE_AFTER_MS) throw new RequeueSignal(waitMs);
     await sleep(waitMs);
   }
+  return true;
+}
+
+/** v26 — race a promise against a timeout and CLEAR the timer on settle (the
+ *  old Promise.race sites leaked up-to-70s timers after a fast completion and
+ *  left the losing SDK call consuming engine budget invisibly). */
+function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, rej) => {
+    timer = setTimeout(() => rej(new Error(label)), ms);
+  });
+  return Promise.race([
+    Promise.resolve(p).finally(() => clearTimeout(timer)),
+    timeout,
+  ]) as Promise<T>;
+}
+
+/** v26 — the 429 backoff sleep: short ones wait inline, long ones requeue */
+async function backoffSleep(backoff: number, deadline: number): Promise<boolean> {
+  if (Date.now() + backoff + 3_000 >= deadline) return false;
+  if (backoff > REQUEUE_AFTER_MS) throw new RequeueSignal(backoff);
+  await sleep(backoff);
   return true;
 }
 
@@ -247,8 +326,12 @@ async function waitOutBreaker(kind: string, deadline: number): Promise<boolean> 
 export function sdkChatComplete(opts: SdkChatOptions): Promise<SdkChatResult> {
   const kind = opts.kind ?? "chat";
   const prio = PRIO[(kind === "probe" ? "probe" : kind === "vision" ? "vision" : kind) as keyof typeof PRIO] ?? PRIO.chat;
+  // v26 — the deadline lives OUTSIDE the job closure: a requeued job re-enters
+  // the queue (releasing the pump for other traffic) but its budget never
+  // resets — recomputing it inside the job would silently extend the caller's
+  // patience by every requeue.
+  const deadline = Date.now() + opts.timeoutMs;
   return submit(prio, async () => {
-    const deadline = Date.now() + opts.timeoutMs;
     let attempt = 0;
 
     while (true) {
@@ -267,6 +350,9 @@ export function sdkChatComplete(opts: SdkChatOptions): Promise<SdkChatResult> {
 
       attempt += 1;
       g.totalCalls += 1;
+      // v26 — a call START is measured here (not when the job was picked), so
+      // adaptive spacing stays honest across requeues
+      g.lastCallStart = Date.now();
 
       try {
         const zai = await importZai();
@@ -279,12 +365,11 @@ export function sdkChatComplete(opts: SdkChatOptions): Promise<SdkChatResult> {
         if (typeof opts.maxTokens === "number") body.max_tokens = opts.maxTokens;
 
         const remaining = Math.max(3_000, deadline - Date.now());
-        const completion = (await Promise.race([
+        const completion = await withTimeout(
           zai.chat.completions.create(body as never),
-          new Promise<never>((_, rej) =>
-            setTimeout(() => rej(new Error("llm timeout")), remaining),
-          ),
-        ])) as {
+          remaining,
+          "llm timeout",
+        ) as {
           choices?: { message?: { content?: string } }[];
           model?: string;
         };
@@ -310,10 +395,8 @@ export function sdkChatComplete(opts: SdkChatOptions): Promise<SdkChatResult> {
         if (is429) {
           note429();
           const backoff = BACKOFF_STEPS[Math.min(attempt - 1, BACKOFF_STEPS.length - 1)];
-          if (Date.now() + backoff + 3_000 < deadline) {
-            await sleep(backoff);
-            continue;
-          }
+          const survived = await backoffSleep(backoff, deadline);
+          if (survived) continue;
           return {
             ok: false, content: "", servedModel: null, attempts: attempt,
             code: "RATE_LIMITED",
@@ -361,8 +444,9 @@ export interface SdkVisionResult {
  * priority alongside chat). Retries 429s inside the budget like chat does.
  */
 export function sdkVisionComplete(opts: SdkVisionOptions): Promise<SdkVisionResult> {
+  // v26 — deadline outside the job closure (survives requeues; see chat)
+  const deadline = Date.now() + opts.timeoutMs;
   return submit(PRIO.vision, async () => {
-    const deadline = Date.now() + opts.timeoutMs;
     let attempt = 0;
 
     if (!/^data:image\/(png|jpe?g|webp);base64,/i.test(opts.imageDataUrl)) {
@@ -383,10 +467,11 @@ export function sdkVisionComplete(opts: SdkVisionOptions): Promise<SdkVisionResu
 
       attempt += 1;
       g.totalCalls += 1;
+      g.lastCallStart = Date.now(); // v26 — call-start measured here (see chat)
       try {
         const zai = await importZai();
         const remaining = Math.max(4_000, deadline - Date.now());
-        const completion = (await Promise.race([
+        const completion = await withTimeout(
           zai.chat.completions.createVision({
             model: "glm-4.6v",
             messages: [
@@ -400,10 +485,9 @@ export function sdkVisionComplete(opts: SdkVisionOptions): Promise<SdkVisionResu
             ],
             thinking: { type: "disabled" },
           }),
-          new Promise<never>((_, rej) =>
-            setTimeout(() => rej(new Error("vision timeout")), remaining),
-          ),
-        ])) as {
+          remaining,
+          "vision timeout",
+        ) as {
           choices?: { message?: { content?: string } }[];
           model?: string;
         };
@@ -425,10 +509,8 @@ export function sdkVisionComplete(opts: SdkVisionOptions): Promise<SdkVisionResu
         if (is429) {
           note429();
           const backoff = BACKOFF_STEPS[Math.min(attempt - 1, BACKOFF_STEPS.length - 1)];
-          if (Date.now() + backoff + 3_000 < deadline) {
-            await sleep(backoff);
-            continue;
-          }
+          const survived = await backoffSleep(backoff, deadline);
+          if (survived) continue;
           return { ok: false, content: "", attempts: attempt, code: "RATE_LIMITED", error: "vision rate limit" };
         }
         if (isTimeout) {

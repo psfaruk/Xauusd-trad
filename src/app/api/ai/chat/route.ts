@@ -125,6 +125,12 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "message required" }, { status: 400 });
   }
 
+  // v26 — ONE request-level deadline (maxDuration 90s, self-host or not).
+  // The old fixed budgets (vision 40s + chat 70s + market 10s) summed to
+  // ~120s worst case and exceeded it; every phase now gets its slice of the
+  // SAME clock, so the reply always lands inside the route's budget.
+  const deadline = Date.now() + 86_000;
+
   const settings = await getAiSettings();
   const modelId = typeof body?.model === "string" && modelById(body.model) ? body.model : settings.chatModel;
 
@@ -132,23 +138,36 @@ export async function POST(req: Request) {
   const image = typeof body?.image === "string" && body.image.startsWith("data:image/") ? body.image : null;
   const appStateRaw = body?.appState && typeof body?.appState === "object" ? body.appState : null;
 
+  // v26 — ground the reply in the timeframe the user is ACTUALLY looking at
+  // (was hardcoded M15, so an H1 chart got an M15 vision read blended with
+  // M15 numbers). Falls back to M15 when the state is missing/garbled.
+  const tf =
+    typeof appStateRaw?.timeframe === "string" && /^[MHD]\d+$/i.test(appStateRaw.timeframe)
+      ? appStateRaw.timeframe.toUpperCase()
+      : "M15";
+
   // ── live market context (the same read the board gets) ──
-  const [bars, digits, spread, newsRadar, latestBoard] = await Promise.all([
-    fetchCandles(thread, "M15", 300),
+  const [bars, digits, spread, newsRadar, boardSameTf, boardAnyTf] = await Promise.all([
+    fetchCandles(thread, tf, 300),
     fetchDigits(thread),
     spreadFor(thread),
     getNewsRadar(thread).catch(() => null),
+    db.boardSession.findFirst({
+      where: { symbol: thread, timeframe: tf },
+      orderBy: { createdAt: "desc" },
+    }).catch(() => null),
     db.boardSession.findFirst({
       where: { symbol: thread },
       orderBy: { createdAt: "desc" },
     }).catch(() => null),
   ]);
+  const latestBoard = boardSameTf ?? boardAnyTf;
 
   let marketBlock = "Market data unavailable right now.";
   try {
     const closed = bars.filter((b) => !b.f);
     if (closed.length >= 60) {
-      const ctx = buildBoardContext(thread, "M15", { M15: closed }, spread, digits, {
+      const ctx = buildBoardContext(thread, tf, { [tf]: closed }, spread, digits, {
         balance: null, engineSignal: null, recentBoard: [],
         newsHeadlines: newsRadar?.headlines ?? [],
       });
@@ -168,13 +187,15 @@ export async function POST(req: Request) {
   }
 
   // ── VISION: let the AI actually SEE the chart (priority call, 429-safe) ──
+  // v26 — vision gets its slice of the request deadline (≤35s and never the
+  // last 25s the chat reply still needs)
   let visionBlock = "";
   let sawChart = false;
   if (image && image.length <= MAX_IMAGE_BYTES) {
     const v = await sdkVisionComplete({
       imageDataUrl: image,
-      prompt: visionPrompt(thread, typeof appStateRaw?.timeframe === "string" ? appStateRaw.timeframe : "M15"),
-      timeoutMs: 40_000,
+      prompt: visionPrompt(thread, tf),
+      timeoutMs: Math.max(10_000, Math.min(35_000, deadline - Date.now() - 25_000)),
     });
     if (v.ok && v.content.trim()) {
       sawChart = true;
@@ -242,10 +263,9 @@ export async function POST(req: Request) {
       content: m.content,
     }));
 
-  const userRow = await db.chatMessage.create({
-    data: { threadId: thread, role: "user", content: message, model: modelId },
-  }).catch(() => null);
-
+  // v26 — persist the user row ONLY after a successful reply. The old flow
+  // wrote it up front, so a failed send left an orphaned unanswered message
+  // in the thread (and a retry duplicated it in the context).
   const reply = await chatComplete({
     modelId,
     messages: [
@@ -255,25 +275,36 @@ export async function POST(req: Request) {
     ],
     // v24 — generous budget + TOP priority: the gate serializes, spaces and
     // 429-retries inside this budget, and chat jumps ahead of board meetings.
-    timeoutMs: 70_000,
+    // v26 — the budget is the request deadline's remaining slice (≤70s).
+    timeoutMs: Math.max(15_000, Math.min(70_000, deadline - Date.now())),
     temperature: 0.5,
     maxTokens: 1100,
     kind: "chat",
   });
 
   if (!reply.ok) {
+    // v26 — raw provider errors (which include a slice of the upstream body)
+    // are logged server-side only; the client gets a friendly bilingual line.
+    console.error("[ai/chat] model error:", {
+      thread, model: modelId, code: reply.code, raw: reply.error,
+    });
     const friendly =
       reply.code === "RATE_LIMITED"
         ? "ইঞ্জিন একটু ব্যস্ত — মেসেজটি সারিতে আছে, ২০-৩০ সেকেন্ড পর আবার পাঠালেই উত্তর পাবেন।"
         : reply.code === "TIMEOUT"
           ? "মডেলটি উত্তর দিতে বেশি সময় নিচ্ছে — একটু পর আবার চেষ্টা করুন।"
-          : reply.error;
+          : reply.code === "PROVIDER_ERROR" || reply.code === "EMPTY"
+            ? "মডেলটি এই মুহূর্তে উত্তর দিতে পারছে না — একটু পর আবার চেষ্টা করুন।"
+            : "উত্তর পাওয়া যায়নি — আবার চেষ্টা করুন।";
     return NextResponse.json(
-      { error: friendly ?? reply.error ?? "the model did not answer", code: reply.code ?? "PROVIDER_ERROR", modelLabel: reply.modelLabel, rawError: reply.error },
+      { error: friendly, code: reply.code ?? "PROVIDER_ERROR", modelLabel: reply.modelLabel },
       { status: reply.code === "RATE_LIMITED" ? 429 : 502 },
     );
   }
 
+  const userRow = await db.chatMessage.create({
+    data: { threadId: thread, role: "user", content: message, model: modelId },
+  }).catch(() => null);
   const assistantRow = await db.chatMessage.create({
     data: { threadId: thread, role: "assistant", content: reply.content, model: modelId },
   }).catch(() => null);
