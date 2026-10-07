@@ -11,6 +11,7 @@ import {
 } from "@/lib/ai/registry";
 import {
   getAiSettings,
+  gateHealth,
   invalidateAiSettings,
   maskKey,
   modelAvailable,
@@ -53,11 +54,14 @@ export async function GET() {
         provider: m.provider,
         label: m.label,
         note: m.note,
+        /** v23 — every model runs keyless; `direct` marks the optional key upgrade */
         available: modelAvailable(m.id, s),
+        direct: m.provider !== "builtin" && Boolean(s.keys[m.provider]),
       })),
       boardAgents: BOARD_AGENT_IDS,
       boardModels: s.boardModels,
       chatModel: s.chatModel,
+      engine: gateHealth(),
     },
     { headers: { "Cache-Control": "no-store" } },
   );

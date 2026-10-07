@@ -24,7 +24,7 @@ import type { Candle } from "@/lib/market/types";
  */
 
 export const runtime = "nodejs";
-export const maxDuration = 45;
+export const maxDuration = 60;
 
 const HISTORY_LIMIT = 60;
 const CONTEXT_MESSAGES = 14;
@@ -173,15 +173,24 @@ export async function POST(req: Request) {
       ...history,
       { role: "user", content: message },
     ],
-    timeoutMs: 35_000,
+    // v23 — generous budget: the gate serializes + retries 429s inside it,
+    // so a rate-limited moment becomes a slightly longer "thinking…" instead
+    // of an instant "API problem".
+    timeoutMs: 42_000,
     temperature: 0.5,
     maxTokens: 1100,
   });
 
   if (!reply.ok) {
+    const friendly =
+      reply.code === "RATE_LIMITED"
+        ? "ইঞ্জিন একটু ব্যস্ত (rate limit) — ২০-৩০ সেকেন্ড পর আবার পাঠান, ততক্ষণে ঠিক হয়ে যাবে।"
+        : reply.code === "TIMEOUT"
+          ? "মডেলটি উত্তর দিতে বেশি সময় নিচ্ছে — একটু পর আবার চেষ্টা করুন।"
+          : reply.error;
     return NextResponse.json(
-      { error: reply.error ?? "the model did not answer", code: reply.code ?? "PROVIDER_ERROR", modelLabel: reply.modelLabel },
-      { status: reply.code === "NO_KEY" ? 400 : 502 },
+      { error: friendly ?? reply.error ?? "the model did not answer", code: reply.code ?? "PROVIDER_ERROR", modelLabel: reply.modelLabel, rawError: reply.error },
+      { status: reply.code === "RATE_LIMITED" ? 429 : 502 },
     );
   }
 
@@ -193,6 +202,8 @@ export async function POST(req: Request) {
     reply: reply.content,
     model: modelId,
     modelLabel: reply.modelLabel,
+    engine: reply.engine ?? "glm-engine",
+    engineLabel: reply.engineLabel ?? reply.modelLabel,
     userMessage: userRow
       ? { id: userRow.id, role: "user", content: userRow.content, model: modelId, createdAt: userRow.createdAt.toISOString() }
       : null,

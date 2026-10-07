@@ -35,7 +35,7 @@ import {
 } from "./smc";
 import { detectPatterns } from "./patterns";
 import { modelById } from "@/lib/ai/registry";
-import { chatComplete, getAiSettings } from "@/lib/ai/llm";
+import { chatComplete } from "@/lib/ai/llm";
 
 // ── helpers ────────────────────────────────────────────────────────────────
 
@@ -371,17 +371,12 @@ async function llmJson(
   timeoutMs: number,
   modelId?: string,
 ): Promise<LlmResult & { usedModelId: string }> {
-  // v22 — routed through the multi-provider gateway (GLM / DeepSeek /
-  // Qwen / Kimi). When the assigned model's provider key is missing, the
-  // call silently falls back to the ALWAYS-ON built-in GLM — an agent
-  // never goes LOCAL just because a key was removed; only a real provider
-  // failure does that.
-  let useId = modelId ?? "glm-4.6";
-  const assigned = modelById(useId);
-  if (assigned && assigned.provider !== "builtin") {
-    const s = await getAiSettings();
-    if (!s.keys[assigned.provider]) useId = "glm-4.6";
-  }
+  // v23 — KEYLESS multi-model board: every company's model runs without any
+  // API key (built-in engine + persona), so the assigned model is always
+  // honored. Board calls are kind:"board" — when the engine is rate-limited
+  // they fail fast and the agent degrades to its local read, never stalling
+  // the meeting.
+  const useId = modelId ?? "glm-4.6";
   const res = await chatComplete({
     modelId: useId,
     messages: [
@@ -391,6 +386,7 @@ async function llmJson(
     timeoutMs,
     temperature: 0.3,
     maxTokens: 700,
+    kind: "board",
   });
   return { ok: res.ok, raw: res.ok ? res.content : "", usedModelId: useId };
 }
@@ -719,48 +715,36 @@ export async function runBoardMeeting(
       .map((a) => `- ${a.roleEn} [${a.model}]: ${a.vote} (${a.confidence}%) — ${a.note}`)
       .join("\n")}\n\nIssue the final decision now.`;
 
-  // ── agents 1–5 — SEQUENTIAL with one retry each. The provider rate-limits
-  //    concurrent calls (measured: 4 of 5 parallel calls rejected), so the
-  //    board takes its turns like a real roundtable: each analyst speaks,
-  //    the next one listens. A failed call retries once after 600ms, then
-  //    falls back to the deterministic local read for that agent. ──
+  // ── agents 1–5 — SEQUENTIAL through the gate (v23). The gate serializes
+  //    every engine call, spaces them and retries 429s internally with real
+  //    backoff — so the meeting just takes its turns like a roundtable. A
+  //    call that still fails (breaker open / hard error) degrades THAT agent
+  //    to its deterministic local read — the board never stalls. ──
   let degraded = false;
   const localFb = localAgents(ctx);
   const analysts: BoardAgentOut[] = [];
   for (let i = 0; i < AGENT_PERSONAS.length; i++) {
     const persona = AGENT_PERSONAS[i];
     const modelId = models?.[persona.id];
-    let usedModelId = modelId;
-    let parsed: ReturnType<typeof parseAgentJson> = null;
-    for (let attempt = 0; attempt < 2 && !parsed; attempt++) {
-      // 429 backoff — the provider's quota needs a real pause, not a blink
-      if (attempt > 0) await new Promise((r) => setTimeout(r, 1_800));
-      const res = await llmJson(persona.system, userMsg, 25_000, modelId);
-      usedModelId = res.usedModelId;
-      parsed = res.ok ? parseAgentJson(res.raw) : null;
-    }
+    const res = await llmJson(persona.system, userMsg, 26_000, modelId);
+    const parsed = res.ok ? parseAgentJson(res.raw) : null;
     if (parsed) {
       analysts.push({
         id: persona.id, roleEn: persona.roleEn, roleBn: persona.roleBn,
-        model: agentBadge(persona, usedModelId),
+        model: agentBadge(persona, res.usedModelId),
         vote: parsed.vote, confidence: parsed.confidence, note: parsed.note,
       });
     } else {
       degraded = true;
-      analysts.push({ ...localFb[i], model: agentBadge(persona, usedModelId) });
+      analysts.push({ ...localFb[i], model: agentBadge(persona, res.usedModelId) });
     }
   }
 
-  // ── the CTO (one retry — the final word deserves it) ──
+  // ── the CTO — the final word (gate retries inside its budget) ──
   const ctoModelId = models?.cto;
-  let ctoUsedModelId = ctoModelId;
-  let ctoParsed: ReturnType<typeof parseCto> = null;
-  for (let attempt = 0; attempt < 2 && !ctoParsed; attempt++) {
-    if (attempt > 0) await new Promise((r) => setTimeout(r, 1_800));
-    const ctoRes = await llmJson(CTO_PERSONA.system, ctoUser(analysts), 30_000, ctoModelId);
-    ctoUsedModelId = ctoRes.usedModelId;
-    ctoParsed = ctoRes.ok ? parseCto(ctoRes.raw) : null;
-  }
+  const ctoRes = await llmJson(CTO_PERSONA.system, ctoUser(analysts), 30_000, ctoModelId);
+  const ctoUsedModelId = ctoRes.usedModelId;
+  const ctoParsed = ctoRes.ok ? parseCto(ctoRes.raw) : null;
   let action: "BUY" | "SELL" | "HOLD" = "HOLD";
   let geom: ReturnType<typeof sanitizeDecision> = null;
   let consensus = 0;

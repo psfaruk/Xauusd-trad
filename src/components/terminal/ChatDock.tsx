@@ -1,19 +1,20 @@
 "use client";
 
 /**
- * ChatDock — THE AI CHAT BOX (v22.0).
+ * ChatDock — THE AI CHAT BOX (v23.0 · KEYLESS).
  *
  * অ্যাপের ভেতরে একটি AI চ্যাট বক্স, নির্দিষ্ট মডেল সিলেক্ট করে চ্যাট করার
  * সুবিধা সহ — a floating chat available on EVERY tab (bottom-right FAB):
  *
- *   · model picker — the free models from the registry, grouped by company
- *     (GLM built-in · DeepSeek · Alibaba Qwen · Moonshot Kimi); models whose
- *     provider key is missing show a "key" hint instead of a dot
+ *   · model picker — ALL models work WITHOUT any API key (v23): GLM native
+ *     + DeepSeek / Alibaba Qwen / Moonshot Kimi through the built-in engine,
+ *     each with its own persona; the badge on every reply shows which engine
+ *     actually answered (native / GLM-engine / direct)
  *   · market-aware answers — every reply is grounded in the same live
  *     snapshot the AI Board reads (price, zones, patterns, board decision,
  *     news headlines); ask "এখন entry নেবো?" and get real levels
  *   · history persisted per symbol (survives reloads), markdown rendering,
- *     typing indicator, clear-thread
+ *     typing indicator, clear-thread, rate-limit-aware errors
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -29,7 +30,7 @@ import {
 } from "@/components/ui/select";
 import ReactMarkdown from "react-markdown";
 import {
-  MessageCircle, X, Send, Loader2, Trash2, Sparkles, KeyRound, Bot,
+  MessageCircle, X, Send, Loader2, Trash2, Sparkles, Bot, Unlock,
 } from "lucide-react";
 
 interface ChatMsgRow {
@@ -38,12 +39,19 @@ interface ChatMsgRow {
   content: string;
   model: string;
   createdAt: string;
+  /** v23 — "DeepSeek V3 · GLM-engine" style badge (fresh replies only) */
+  engineLabel?: string;
 }
 
 interface ModelsPayload {
   providers: { id: string; name: string; keyUrl: string; keyHint: string; hasKey: boolean; keyMasked: string | null }[];
-  models: { id: string; provider: string; label: string; note: string; available: boolean }[];
+  models: { id: string; provider: string; label: string; note: string; available: boolean; direct: boolean }[];
   chatModel: string;
+  engine?: {
+    coolingDown: boolean;
+    cooldownRemainingMs: number;
+    stats: { totalCalls: number; total429: number; lastError: string | null; lastOkAt: number | null };
+  };
 }
 
 async function fetchModels(): Promise<ModelsPayload> {
@@ -154,7 +162,7 @@ export function ChatDock() {
         setMessages((prev) => prev.map((m) => (m.id === optimistic.id ? data.userMessage : m)));
       }
       if (data.assistantMessage) {
-        setMessages((prev) => [...prev, data.assistantMessage]);
+        setMessages((prev) => [...prev, { ...data.assistantMessage, engineLabel: data.engineLabel }]);
       }
     } catch (e) {
       setMessages((prev) => prev.filter((m) => m.id !== optimistic.id));
@@ -187,7 +195,6 @@ export function ChatDock() {
     },
     {},
   );
-  const activeModel = (modelsQ.data?.models ?? []).find((m) => m.id === modelId);
 
   return (
     <>
@@ -234,7 +241,7 @@ export function ChatDock() {
               </div>
             </div>
 
-            {/* model picker */}
+            {/* model picker — every model keyless (v23) */}
             <Select value={modelId} onValueChange={pickModel}>
               <SelectTrigger
                 className="h-7 w-[150px] shrink-0 gap-1 border-border bg-background px-2 text-[10px] font-bold"
@@ -252,20 +259,21 @@ export function ChatDock() {
                       <SelectItem
                         key={m.id}
                         value={m.id}
-                        disabled={!m.available}
                         className="text-[11px]"
-                        title={m.available ? m.note : t("chatNeedsKey")}
+                        title={m.note}
                       >
                         <span className="flex w-full items-center gap-1.5">
                           <span
                             className={cn(
                               "h-1.5 w-1.5 shrink-0 rounded-full",
-                              m.available ? "bg-up" : "bg-muted-foreground/40",
+                              m.provider === "builtin" || m.direct ? "bg-up" : "bg-gold",
                             )}
                             aria-hidden
                           />
                           <span className="font-semibold">{m.label}</span>
-                          {!m.available && <KeyRound className="ml-auto h-3 w-3 text-amber-400" aria-hidden />}
+                          {m.provider !== "builtin" && !m.direct && (
+                            <Unlock className="ml-auto h-3 w-3 text-gold/80" aria-hidden />
+                          )}
                         </span>
                       </SelectItem>
                     ))}
@@ -314,7 +322,7 @@ export function ChatDock() {
                   <div className="max-w-[92%] rounded-lg rounded-bl-sm border border-border bg-card px-3 py-2">
                     <div className="mb-1 flex items-center gap-1.5">
                       <span className="rounded border border-gold/40 bg-gold/10 px-1 py-px font-mono text-[7px] font-black uppercase tracking-wider text-gold">
-                        {activeModelLabel(messages, m, modelsQ.data)}
+                        {m.engineLabel ?? activeModelLabel(messages, m, modelsQ.data)}
                       </span>
                     </div>
                     <div className="prose-chat text-[12px] leading-relaxed text-foreground/95 [&_p]:mb-1.5 [&_p:last-child]:mb-0 [&_ul]:mb-1.5 [&_ul]:list-disc [&_ul]:pl-4 [&_ol]:mb-1.5 [&_ol]:list-decimal [&_ol]:pl-4 [&_li]:mb-0.5 [&_strong]:font-bold [&_code]:rounded [&_code]:bg-muted [&_code]:px-1 [&_code]:font-mono [&_code]:text-[10px]">
@@ -342,12 +350,10 @@ export function ChatDock() {
 
           {/* composer */}
           <div className="shrink-0 border-t border-border bg-card/60 p-2">
-            {activeModel && !activeModel.available && (
-              <div className="mb-1.5 flex items-center gap-1.5 rounded-md border border-amber-500/40 bg-amber-500/10 px-2 py-1 text-[10px] font-semibold text-amber-400">
-                <KeyRound className="h-3 w-3 shrink-0" aria-hidden />
-                {t("chatModelNeedsKey")}
-              </div>
-            )}
+            <div className="mb-1.5 flex items-center gap-1.5 rounded-md border border-up/30 bg-up/5 px-2 py-1 text-[10px] font-semibold text-up">
+              <Unlock className="h-3 w-3 shrink-0" aria-hidden />
+              {t("chatKeylessNote")}
+            </div>
             <div className="flex items-end gap-2">
               <Textarea
                 ref={taRef}

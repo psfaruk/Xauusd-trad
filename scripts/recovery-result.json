@@ -1,0 +1,12 @@
+{
+  "recoveredAt": "2026-10-07T16:02:28.095Z",
+  "waitedMs": 4263612,
+  "glmTest": {
+    "ok": true,
+    "body": "{\"reply\":\"Bullish — symmetric triangle forming with entry 4108.845, SL 4096.601, target 4166.944 (RR 4.75).\",\"model\":\"glm-4.6\",\"modelLabel\":\"GLM-4.6\",\"engine\":\"native\",\"engineLabel\":\"GLM-4.6\",\"userMessage\":{\"id\":\"ed87606b-789e-4285-95de-93dc97140e37\",\"role\":\"user\",\"content\":\"Recovery check — one short line: is gold bullish or bearish?\",\"model\":\"glm-4.6\",\"createdAt\":\"2026-10-07T16:02:22.479Z\"},\"assistantMessage\":{\"id\":\"8fc2bf36-d352-452e-b9a8-4bb9f794b275\",\"role\":\"assistant\",\"content\":\"Bullish — symmetric triangle forming with entry 4108.845, SL 4096.601, target 4166.944 (RR 4.75).\",\"model\":\"gl"
+  },
+  "dsTest": {
+    "ok": true,
+    "body": "{\"reply\":\"\\nBullish — symmetric triangle forming with entry 4108.845, SL 4096.601, target 4166.944 (RR 4.75).\",\"model\":\"deepseek-chat\",\"modelLabel\":\"DeepSeek V3\",\"engine\":\"native\",\"engineLabel\":\"DeepSeek V3\",\"userMessage\":{\"id\":\"51454d27-542d-4f52-b4bc-b30635369823\",\"role\":\"user\",\"content\":\"Recovery check — one short line: is gold bullish or bearish?\",\"model\":\"deepseek-chat\",\"createdAt\":\"2026-10-07T16:02:27.333Z\"},\"assistantMessage\":{\"id\":\"bd68b800-c373-4e41-a462-91d934fb0d80\",\"role\":\"assistant\",\"content\":\"\\nBullish — symmetric triangle forming with entry 4108.845, SL 4096.601, target 4166.944"
+  }
+}

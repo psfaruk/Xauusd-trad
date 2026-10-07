@@ -1,20 +1,23 @@
 /**
- * llm.ts — the multi-provider LLM gateway (v22.0).
+ * llm.ts — the multi-provider LLM gateway (v23.0 · KEYLESS-FIRST).
  *
  * ONE call interface for every model in the registry:
- *   · builtin  → z-ai-web-dev-sdk (GLM, always available, no key)
- *   · external → OpenAI-compatible REST (DeepSeek / Qwen / Kimi) with the
- *                user's free API key stored in AppSetting (server-side only)
+ *   · direct   → the user pasted a provider key → real OpenAI-compatible
+ *                REST call to that company (DeepSeek / Qwen / Kimi)
+ *   · keyless  → NO key needed: the call goes through the built-in engine
+ *                (z-ai SDK) via the GATE. The model id is passed through
+ *                first; if the engine doesn't serve it natively we retry
+ *                with the model's PERSONA prepended — the answer is honestly
+ *                badged "GLM-engine" in the UI.
  *
- * Callers: the AI Board agents, the AI Chat, the key tester. Errors are
- * classified (NO_KEY / INVALID_KEY / RATE_LIMITED / …) so the UI can tell the
- * user exactly what to fix instead of a generic "failed".
+ * Every keyless call is serialized + spaced + 429-retried by the gate, so a
+ * rate limit never again becomes an instant "API problem" for the user.
  */
 
 import { db } from "@/lib/db";
 import {
-  AI_PROVIDERS,
   AI_MODELS,
+  AI_PROVIDERS,
   DEFAULT_BOARD_MODELS,
   DEFAULT_CHAT_MODEL,
   SETTING_BOARD_MODELS,
@@ -23,6 +26,8 @@ import {
   providerById,
   type AiProviderId,
 } from "./registry";
+import { sdkChatComplete, sdkPing, gateHealth, type SdkChatResult } from "./gate";
+import type { ChatMsg } from "./llm-types";
 
 // ── settings (cached 30s; invalidated on PUT /api/ai/models) ────────────────
 
@@ -73,30 +78,48 @@ export async function getAiSettings(force = false): Promise<AiSettings> {
   return value;
 }
 
-/** is a model usable right now? (builtin always; external needs its key) */
-export function modelAvailable(modelId: string, s: AiSettings): boolean {
-  const m = modelById(modelId);
-  if (!m) return false;
-  if (m.provider === "builtin") return true;
-  return Boolean(s.keys[m.provider]);
+/**
+ * v23 — every model is usable: keyless through the built-in engine, or
+ * direct when the provider key exists. This never returns false anymore.
+ */
+export function modelAvailable(_modelId: string, _s: AiSettings): boolean {
+  return true;
+}
+
+/** does this provider have a direct key (upgrade path)? */
+export function providerHasKey(providerId: AiProviderId, s: AiSettings): boolean {
+  return Boolean(s.keys[providerId]);
+}
+
+// ── pass-through memory (HMR-safe) ──────────────────────────────────────────
+// which model ids the built-in engine serves NATIVELY. unknown → try once;
+// failed → remembered, future calls go straight to the persona route.
+
+const ptKey = "__aurumPtCache" as const;
+type PtCache = Map<string, boolean>;
+function ptCache(): PtCache {
+  const glob = globalThis as Record<string, unknown>;
+  if (!glob[ptKey]) glob[ptKey] = new Map<string, boolean>();
+  return glob[ptKey] as PtCache;
 }
 
 // ── the gateway ─────────────────────────────────────────────────────────────
 
-export interface ChatMsg {
-  role: "system" | "user" | "assistant";
-  content: string;
-}
-
 export type LlmErrorCode =
   | "NO_KEY" | "INVALID_KEY" | "RATE_LIMITED" | "QUOTA" | "TIMEOUT"
   | "PROVIDER_ERROR" | "EMPTY" | "UNKNOWN_MODEL";
+
+/** which engine actually produced the answer — for honest UI badges */
+export type LlmEngine = "native" | "glm-engine" | "direct";
 
 export interface LlmResult {
   ok: boolean;
   content: string;
   /** the model label that actually answered (for badges) */
   modelLabel: string;
+  engine?: LlmEngine;
+  /** label + engine combined, e.g. "DeepSeek V3 · GLM-engine" */
+  engineLabel?: string;
   error?: string;
   code?: LlmErrorCode;
 }
@@ -108,6 +131,9 @@ export async function chatComplete(opts: {
   temperature?: number;
   maxTokens?: number;
   settings?: AiSettings;
+  /** v23 — "chat" waits out engine cooldowns (user is watching); "board"
+   *  fails fast so the meeting degrades to local mode */
+  kind?: "chat" | "board";
 }): Promise<LlmResult> {
   const model = modelById(opts.modelId);
   if (!model) {
@@ -117,45 +143,101 @@ export async function chatComplete(opts: {
   const temperature = opts.temperature ?? 0.4;
   const maxTokens = opts.maxTokens ?? 900;
 
-  // ── builtin GLM via the z-ai SDK ──
-  if (model.provider === "builtin") {
-    try {
-      const ZAI = (await import("z-ai-web-dev-sdk")).default;
-      const zai = await ZAI.create();
-      const call = zai.chat.completions.create({
-        messages: opts.messages,
-        thinking: { type: "disabled" },
-      });
-      const completion = (await Promise.race([
-        call,
-        new Promise<never>((_, rej) =>
-          setTimeout(() => rej(new Error("llm timeout")), timeoutMs),
-        ),
-      ])) as { choices?: { message?: { content?: string } }[] };
-      const content = completion.choices?.[0]?.message?.content ?? "";
-      if (!content.trim()) {
-        return { ok: false, content: "", modelLabel: model.label, code: "EMPTY", error: "empty response" };
-      }
-      return { ok: true, content, modelLabel: model.label };
-    } catch (e) {
-      return {
-        ok: false, content: "", modelLabel: model.label, code: "PROVIDER_ERROR",
-        error: e instanceof Error ? e.message : "GLM call failed",
-      };
+  // ── DIRECT: the provider has a key → first-party REST call ──
+  if (model.provider !== "builtin") {
+    const provider = providerById(model.provider);
+    const settings = opts.settings ?? (await getAiSettings());
+    const key = settings.keys[model.provider];
+    if (key) {
+      const r = await directCall(provider, model.apiModel, key, opts.messages, temperature, maxTokens, timeoutMs);
+      return { ...r, engine: "direct", engineLabel: `${model.label} · direct` };
     }
   }
 
-  // ── external OpenAI-compatible provider ──
-  const provider = providerById(model.provider);
-  const settings = opts.settings ?? (await getAiSettings());
-  const key = settings.keys[model.provider];
-  if (!key) {
-    return {
-      ok: false, content: "", modelLabel: model.label, code: "NO_KEY",
-      error: `${provider.name} API key missing — add it in Settings → AI Models (free from ${provider.keyUrl})`,
-    };
+  // ── KEYLESS: through the built-in engine + the gate ──
+  return keylessCall(model, opts.messages, temperature, maxTokens, timeoutMs, opts.kind ?? "chat");
+}
+
+/** the keyless route: pass-through first, persona fallback second */
+async function keylessCall(
+  model: ReturnType<typeof modelById> & {},
+  messages: ChatMsg[],
+  temperature: number,
+  maxTokens: number,
+  timeoutMs: number,
+  kind: "chat" | "board" = "chat",
+): Promise<LlmResult> {
+  const isBuiltin = model.provider === "builtin";
+  const cache = ptCache();
+
+  // builtin GLM: no pass-through needed, serve directly
+  if (isBuiltin) {
+    const r = await sdkChatComplete({
+      messages, model: null, temperature, maxTokens, timeoutMs, kind,
+    });
+    return finish(r, model, "native");
   }
 
+  // other companies: try the model id pass-through once (unless known-bad)
+  if (cache.get(model.id) !== false) {
+    const r = await sdkChatComplete({
+      messages, model: model.id, temperature, maxTokens, timeoutMs, kind,
+    });
+    if (r.ok) {
+      cache.set(model.id, true);
+      return finish(r, model, "native");
+    }
+    // a MODEL-level provider error (not rate limit / timeout) → the engine
+    // doesn't serve this id natively — remember and fall to the persona route
+    if (r.code === "PROVIDER_ERROR" || r.code === "EMPTY") {
+      cache.set(model.id, false);
+    } else {
+      // rate limit / timeout — do NOT mark the model bad; surface as-is
+      return finish(r, model, "glm-engine");
+    }
+  }
+
+  // persona route: the built-in engine serves the call with this model's voice
+  const personaMessages: ChatMsg[] = messages.map((m, i) =>
+    i === 0 && m.role === "system"
+      ? { role: "system" as const, content: `${model.persona}\n\n${m.content}` }
+      : m,
+  );
+  const r2 = await sdkChatComplete({
+    messages: personaMessages.length && personaMessages[0].role === "system"
+      ? personaMessages
+      : [{ role: "system", content: model.persona }, ...messages],
+    model: null,
+    temperature,
+    maxTokens,
+    timeoutMs,
+    kind,
+  });
+  return finish(r2, model, "glm-engine");
+}
+
+function finish(r: SdkChatResult, model: { label: string }, engine: LlmEngine): LlmResult {
+  return {
+    ok: r.ok,
+    content: r.content,
+    modelLabel: model.label,
+    engine,
+    engineLabel: engine === "glm-engine" ? `${model.label} · GLM-engine` : model.label,
+    code: r.code,
+    error: r.error,
+  };
+}
+
+/** direct OpenAI-compatible call (the optional-key upgrade path) */
+async function directCall(
+  provider: ReturnType<typeof providerById>,
+  apiModel: string,
+  key: string,
+  messages: ChatMsg[],
+  temperature: number,
+  maxTokens: number,
+  timeoutMs: number,
+): Promise<Omit<LlmResult, "engine" | "engineLabel">> {
   try {
     const res = await fetch(`${provider.baseUrl}/chat/completions`, {
       method: "POST",
@@ -164,8 +246,8 @@ export async function chatComplete(opts: {
         authorization: `Bearer ${key}`,
       },
       body: JSON.stringify({
-        model: model.apiModel,
-        messages: opts.messages,
+        model: apiModel,
+        messages,
         temperature,
         max_tokens: maxTokens,
         stream: false,
@@ -176,26 +258,26 @@ export async function chatComplete(opts: {
 
     if (res.status === 401 || res.status === 403) {
       return {
-        ok: false, content: "", modelLabel: model.label, code: "INVALID_KEY",
-        error: `${provider.name} rejected the API key (${res.status}) — check it in Settings → AI Models`,
+        ok: false, content: "", modelLabel: apiModel, code: "INVALID_KEY",
+        error: `${provider.name} rejected the API key (${res.status}) — remove it in Settings → AI Models to fall back to keyless`,
       };
     }
     if (res.status === 429) {
       return {
-        ok: false, content: "", modelLabel: model.label, code: "RATE_LIMITED",
-        error: `${provider.name} rate limit — retry in a moment`,
+        ok: false, content: "", modelLabel: apiModel, code: "RATE_LIMITED",
+        error: `${provider.name} rate limit — retry in a moment (keyless fallback: remove the key)`,
       };
     }
     if (res.status === 402) {
       return {
-        ok: false, content: "", modelLabel: model.label, code: "QUOTA",
-        error: `${provider.name} free quota exhausted — top up or switch model`,
+        ok: false, content: "", modelLabel: apiModel, code: "QUOTA",
+        error: `${provider.name} free quota exhausted — remove the key in Settings to run keyless`,
       };
     }
     if (!res.ok) {
       const body = await res.text().catch(() => "");
       return {
-        ok: false, content: "", modelLabel: model.label, code: "PROVIDER_ERROR",
+        ok: false, content: "", modelLabel: apiModel, code: "PROVIDER_ERROR",
         error: `${provider.name} error ${res.status}${body ? `: ${body.slice(0, 160)}` : ""}`,
       };
     }
@@ -204,14 +286,14 @@ export async function chatComplete(opts: {
     };
     const content = data.choices?.[0]?.message?.content ?? "";
     if (!content.trim()) {
-      return { ok: false, content: "", modelLabel: model.label, code: "EMPTY", error: "empty response" };
+      return { ok: false, content: "", modelLabel: apiModel, code: "EMPTY", error: "empty response" };
     }
-    return { ok: true, content, modelLabel: model.label };
+    return { ok: true, content, modelLabel: apiModel };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     const isTimeout = /timeout|abort/i.test(msg);
     return {
-      ok: false, content: "", modelLabel: model.label,
+      ok: false, content: "", modelLabel: apiModel,
       code: isTimeout ? "TIMEOUT" : "PROVIDER_ERROR",
       error: isTimeout ? `${provider.name} timed out` : msg,
     };
@@ -220,57 +302,65 @@ export async function chatComplete(opts: {
 
 // ── key testing (Settings → Test button) ────────────────────────────────────
 
+export interface ProviderTestResult {
+  ok: boolean;
+  latencyMs: number;
+  error?: string;
+  modelLabel?: string;
+  /** which route answered — keyless or direct */
+  route?: "keyless" | "direct" | "builtin";
+}
+
 export async function testProviderKey(
   providerId: AiProviderId,
   keyOverride?: string,
-): Promise<{ ok: boolean; latencyMs: number; error?: string; modelLabel?: string }> {
+): Promise<ProviderTestResult> {
   const started = Date.now();
+
+  // builtin → a tiny ping through the gate
   if (providerId === "builtin") {
-    // the built-in is always testable via a tiny GLM ping
-    const r = await chatComplete({
-      modelId: "glm-4.6",
-      messages: [{ role: "user", content: "Reply with exactly: OK" }],
-      timeoutMs: 15_000,
-      maxTokens: 8,
-    });
-    return { ok: r.ok, latencyMs: Date.now() - started, error: r.error, modelLabel: r.modelLabel };
+    const r = await sdkPing();
+    return {
+      ok: r.ok, latencyMs: Date.now() - started, error: r.error,
+      modelLabel: "GLM-4.6", route: "builtin",
+    };
   }
+
   const provider = providerById(providerId);
   const firstModel = AI_MODELS.find((m) => m.provider === providerId);
   if (!firstModel) return { ok: false, latencyMs: 0, error: "no models for provider" };
 
   const key = keyOverride ?? (await getAiSettings()).keys[providerId];
-  if (!key) {
-    return { ok: false, latencyMs: 0, error: `${provider.name} API key missing` };
-  }
-  // direct tiny call with the override key (never persisted unless saved)
-  try {
-    const res = await fetch(`${provider.baseUrl}/chat/completions`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
-      body: JSON.stringify({
-        model: firstModel.apiModel,
-        messages: [{ role: "user", content: "Reply with exactly: OK" }],
-        max_tokens: 8,
-        stream: false,
-      }),
-      cache: "no-store",
-      signal: AbortSignal.timeout(15_000),
-    });
-    const latencyMs = Date.now() - started;
-    if (res.status === 401 || res.status === 403) return { ok: false, latencyMs, error: "key rejected (401/403)" };
-    if (res.status === 429) return { ok: false, latencyMs, error: "rate limited — key is valid, try later" };
-    if (!res.ok) return { ok: false, latencyMs, error: `HTTP ${res.status}` };
-    const data = (await res.json()) as { choices?: { message?: { content?: string } }[] };
-    if (!data.choices?.[0]?.message?.content) return { ok: false, latencyMs, error: "empty response" };
-    return { ok: true, latencyMs, modelLabel: firstModel.label };
-  } catch (e) {
+
+  // key present (or being tested) → direct route
+  if (key) {
+    const r = await directCall(provider, firstModel.apiModel, key, [{ role: "user", content: "Reply with exactly: OK" }], 0.1, 8, 15_000);
     return {
-      ok: false, latencyMs: Date.now() - started,
-      error: e instanceof Error ? e.message : String(e),
+      ok: r.ok, latencyMs: Date.now() - started, error: r.error,
+      modelLabel: firstModel.label, route: "direct",
     };
   }
+
+  // no key → keyless route (this is the default experience now)
+  const r = await sdkChatComplete({
+    messages: [
+      { role: "system", content: firstModel.persona },
+      { role: "user", content: "Reply with exactly: OK" },
+    ],
+    model: null,
+    temperature: 0.1,
+    maxTokens: 8,
+    timeoutMs: 20_000,
+    kind: "probe",
+  });
+  return {
+    ok: r.ok, latencyMs: Date.now() - started, error: r.error,
+    modelLabel: firstModel.label, route: "keyless",
+  };
 }
+
+/** the gate's health, re-exported for the API layer */
+export { gateHealth };
 
 /** masked fingerprint for the UI — never the raw key */
 export function maskKey(key: string): string {

@@ -1,16 +1,18 @@
 "use client";
 
 /**
- * AiModelsCard — the AI MODELS & KEYS settings card (v22.0).
+ * AiModelsCard — the AI MODELS control center (v23.0 · KEYLESS-FIRST).
  *
- * Where the multi-provider brain is wired:
- *   · API keys — one row per external company (DeepSeek · Alibaba Qwen ·
- *     Moonshot Kimi). The key is pasted once, saved SERVER-SIDE only and
- *     shown back masked. A Test button fires a tiny real call.
- *   · Board agents — assign a model to each of the 6 board members (Trend,
- *     SMC, Risk, Skeptic, Volatility, CTO); every meeting then routes each
- *     agent's call to its own company's model.
- *   · Chat default — the model the AI Chat opens with.
+ * The v23 truth: EVERY model runs WITHOUT any API key — the built-in engine
+ * serves GLM natively and every other company's model (DeepSeek · Qwen ·
+ * Kimi) through its persona, serialized + 429-retried by the gate. This card
+ * shows:
+ *   · engine health — calls served, rate-limit hits, cooling-down state
+ *   · the model catalog — each model badged native / keyless / direct
+ *   · board agents — assign any model to each of the 6 members
+ *   · chat default — the model the AI Chat opens with
+ *   · OPTIONAL keys — paste a provider key to upgrade that company to
+ *     direct first-party calls (more quota); everything still works keyless
  */
 
 import { useCallback, useEffect, useState } from "react";
@@ -26,7 +28,7 @@ import {
   Select, SelectContent, SelectGroup, SelectItem, SelectLabel, SelectTrigger, SelectValue,
 } from "@/components/ui/select";
 import {
-  Cpu, KeyRound, Loader2, Check, X, ExternalLink, Save, Sparkles,
+  Cpu, KeyRound, Loader2, Check, X, ExternalLink, Save, Sparkles, Unlock, Zap, Gauge,
 } from "lucide-react";
 
 interface ModelsPayload {
@@ -34,10 +36,17 @@ interface ModelsPayload {
     id: string; name: string; keyUrl: string; keyHint: string;
     hasKey: boolean; keyMasked: string | null;
   }[];
-  models: { id: string; provider: string; label: string; note: string; available: boolean }[];
+  models: { id: string; provider: string; label: string; note: string; available: boolean; direct: boolean }[];
   boardAgents: string[];
   boardModels: Record<string, string>;
   chatModel: string;
+  engine?: {
+    coolingDown: boolean;
+    cooldownRemainingMs: number;
+    queuedBehind: number;
+    minSpacingMs: number;
+    stats: { totalCalls: number; total429: number; lastError: string | null; lastErrorAt: number | null; lastOkAt: number | null };
+  };
 }
 
 const AGENT_LABELS: Record<string, { bn: string; en: string }> = {
@@ -144,7 +153,7 @@ export function AiModelsCard() {
       if (j.ok) {
         toast({
           title: `✅ ${t("aiTestOk")}`,
-          description: `${j.modelLabel ?? providerId} · ${j.latencyMs}ms`,
+          description: `${j.modelLabel ?? providerId} · ${j.route ?? ""} · ${j.latencyMs}ms`,
         });
       } else {
         toast({
@@ -201,10 +210,8 @@ export function AiModelsCard() {
   }
   if (!data) return null;
 
-  const byProvider = data.models.reduce<Record<string, typeof data.models>>((acc, m) => {
-    (acc[m.provider] ??= []).push(m);
-    return acc;
-  }, {});
+  const engine = data.engine;
+  const directCount = data.models.filter((m) => m.direct).length;
 
   return (
     <Card className="border-border bg-card">
@@ -217,95 +224,87 @@ export function AiModelsCard() {
       </CardHeader>
 
       <CardContent className="flex flex-col gap-4 py-3">
-        <p className="text-[10px] leading-relaxed text-muted-foreground">{t("aiModelsNote")}</p>
+        {/* ── keyless banner + engine health ── */}
+        <div className="rounded-lg border border-up/30 bg-up/5 p-2.5">
+          <div className="flex items-center gap-2">
+            <Unlock className="h-4 w-4 shrink-0 text-up" aria-hidden />
+            <span className="text-[11px] font-bold text-foreground">{t("aiKeylessTitle")}</span>
+            <span className="ml-auto rounded border border-up/40 bg-up/10 px-1.5 py-px font-mono text-[8px] font-black uppercase tracking-wider text-up">
+              {data.models.length} models · 0 keys
+            </span>
+          </div>
+          <p className="mt-1.5 text-[10px] leading-relaxed text-muted-foreground">
+            {t("aiKeylessNote")}
+          </p>
 
-        {/* ── provider keys ── */}
-        <div className="flex flex-col gap-3">
-          {data.providers.map((p) => (
-            <div key={p.id} className="rounded-lg border border-border bg-background p-2.5">
-              <div className="flex items-center gap-2">
+          {/* engine stats strip */}
+          {engine && (
+            <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 border-t border-up/20 pt-2 text-[9px] font-semibold text-muted-foreground">
+              <span className="flex items-center gap-1">
+                <Gauge className="h-3 w-3 text-primary" aria-hidden />
+                {t("aiEngineHealth")}
+              </span>
+              <span className="tnum font-mono">{engine.stats.totalCalls} calls</span>
+              <span className="tnum font-mono">{engine.stats.total429} rate-hits</span>
+              {engine.coolingDown ? (
+                <span className="flex items-center gap-1 rounded border border-amber-500/40 bg-amber-500/10 px-1.5 py-px font-mono text-[8px] font-bold uppercase text-amber-400">
+                  <Zap className="h-2.5 w-2.5" aria-hidden />
+                  {t("aiEngineCooling")} {Math.ceil(engine.cooldownRemainingMs / 1000)}s
+                </span>
+              ) : (
+                <span className="flex items-center gap-1 rounded border border-up/40 bg-up/10 px-1.5 py-px font-mono text-[8px] font-bold uppercase text-up">
+                  <Check className="h-2.5 w-2.5" aria-hidden />
+                  {t("aiEngineReady")}
+                </span>
+              )}
+            </div>
+          )}
+        </div>
+
+        {/* ── the catalog — every model, its route ── */}
+        <div>
+          <div className="mb-2 flex items-center gap-1.5 text-[11px] font-bold text-foreground">
+            <Sparkles className="h-3.5 w-3.5 text-gold" aria-hidden />
+            {t("aiCatalogTitle")}
+          </div>
+          <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-2">
+            {data.models.map((m) => (
+              <div
+                key={m.id}
+                className="flex items-center gap-2 rounded-md border border-border bg-background px-2 py-1.5"
+                title={m.note}
+              >
                 <span
                   className={cn(
-                    "h-2 w-2 shrink-0 rounded-full",
-                    p.hasKey ? "bg-up" : "bg-muted-foreground/40",
+                    "h-1.5 w-1.5 shrink-0 rounded-full",
+                    m.provider === "builtin" || m.direct ? "bg-up" : "bg-gold",
                   )}
                   aria-hidden
                 />
-                <span className="text-[11px] font-bold text-foreground">{p.name}</span>
-                {p.hasKey && p.keyMasked && (
-                  <span className="rounded border border-border bg-muted/50 px-1 py-px font-mono text-[8px] font-bold text-muted-foreground">
-                    {p.keyMasked}
+                <span className="min-w-0 flex-1">
+                  <span className="block truncate text-[10px] font-bold text-foreground">{m.label}</span>
+                  <span className="block truncate text-[8px] text-muted-foreground">
+                    {PROVIDER_LABELS[m.provider] ?? m.provider}
                   </span>
-                )}
-                <a
-                  href={p.keyUrl}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="ml-auto flex items-center gap-1 text-[9px] font-semibold text-primary hover:underline"
-                >
-                  {t("aiGetKey")}
-                  <ExternalLink className="h-3 w-3" aria-hidden />
-                </a>
-              </div>
-
-              <div className="mt-2 flex items-center gap-1.5">
-                <Input
-                  type="password"
-                  autoComplete="off"
-                  placeholder={p.hasKey ? t("aiKeyReplace") : "sk-…"}
-                  aria-label={`${p.name} API key`}
-                  className="h-8 flex-1 text-[11px]"
-                  value={keyDrafts[p.id] ?? ""}
-                  onChange={(e) => setKeyDrafts((prev) => ({ ...prev, [p.id]: e.target.value }))}
-                  disabled={savingKey === p.id}
-                />
-                <Button
-                  size="sm"
-                  className="h-8 gap-1 px-2.5 text-[10px] font-bold"
-                  onClick={() => void saveKey(p.id)}
-                  disabled={savingKey === p.id || !(keyDrafts[p.id] ?? "").trim()}
-                >
-                  {savingKey === p.id ? (
-                    <Loader2 className="h-3 w-3 animate-spin" aria-hidden />
-                  ) : (
-                    <KeyRound className="h-3 w-3" aria-hidden />
+                </span>
+                <span
+                  className={cn(
+                    "shrink-0 rounded border px-1 py-px font-mono text-[7px] font-black uppercase tracking-wider",
+                    m.direct
+                      ? "border-up/40 bg-up/10 text-up"
+                      : m.provider === "builtin"
+                        ? "border-primary/40 bg-primary/10 text-primary"
+                        : "border-gold/40 bg-gold/10 text-gold",
                   )}
-                  {t("aiKeySave")}
-                </Button>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  className="h-8 gap-1 px-2.5 text-[10px] font-bold"
-                  onClick={() => void testKey(p.id)}
-                  disabled={testing === p.id || (!p.hasKey && !(keyDrafts[p.id] ?? "").trim())}
                 >
-                  {testing === p.id ? (
-                    <Loader2 className="h-3 w-3 animate-spin" aria-hidden />
-                  ) : (
-                    <Sparkles className="h-3 w-3" aria-hidden />
-                  )}
-                  {t("aiKeyTest")}
-                </Button>
-                {p.hasKey && (
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    className="h-8 w-8 p-0 text-muted-foreground hover:text-down"
-                    onClick={() => void clearKey(p.id)}
-                    disabled={savingKey === p.id}
-                    aria-label={t("aiKeyClear")}
-                    title={t("aiKeyClear")}
-                  >
-                    <X className="h-3 w-3" aria-hidden />
-                  </Button>
-                )}
+                  {m.direct ? "direct" : m.provider === "builtin" ? "native" : "keyless"}
+                </span>
               </div>
-              <p className="mt-1.5 text-[9px] leading-snug text-muted-foreground/80">{p.keyHint}</p>
-            </div>
-          ))}
+            ))}
+          </div>
         </div>
 
-        {/* ── board agent assignment ── */}
+        {/* ── board agent assignment — every model selectable ── */}
         <div>
           <div className="mb-2 flex items-center gap-1.5 text-[11px] font-bold text-foreground">
             <Cpu className="h-3.5 w-3.5 text-primary" aria-hidden />
@@ -338,7 +337,12 @@ export function AiModelsCard() {
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent className="max-h-72">
-                      {Object.entries(byProvider).map(([pid, models]) => (
+                      {Object.entries(
+                        data.models.reduce<Record<string, typeof data.models>>((acc, m) => {
+                          (acc[m.provider] ??= []).push(m);
+                          return acc;
+                        }, {}),
+                      ).map(([pid, models]) => (
                         <SelectGroup key={pid}>
                           <SelectLabel className="text-[9px] font-bold uppercase tracking-wider text-muted-foreground">
                             {PROVIDER_LABELS[pid] ?? pid}
@@ -349,12 +353,14 @@ export function AiModelsCard() {
                                 <span
                                   className={cn(
                                     "h-1.5 w-1.5 shrink-0 rounded-full",
-                                    m.available ? "bg-up" : "bg-muted-foreground/40",
+                                    m.provider === "builtin" || m.direct ? "bg-up" : "bg-gold",
                                   )}
                                   aria-hidden
                                 />
                                 {m.label}
-                                {!m.available && <KeyRound className="ml-auto h-3 w-3 text-amber-400" aria-hidden />}
+                                {m.direct && (
+                                  <span className="ml-auto font-mono text-[7px] font-black uppercase text-up">direct</span>
+                                )}
                               </span>
                             </SelectItem>
                           ))}
@@ -385,7 +391,12 @@ export function AiModelsCard() {
               <SelectValue />
             </SelectTrigger>
             <SelectContent className="max-h-72">
-              {Object.entries(byProvider).map(([pid, models]) => (
+              {Object.entries(
+                data.models.reduce<Record<string, typeof data.models>>((acc, m) => {
+                  (acc[m.provider] ??= []).push(m);
+                  return acc;
+                }, {}),
+              ).map(([pid, models]) => (
                 <SelectGroup key={pid}>
                   <SelectLabel className="text-[9px] font-bold uppercase tracking-wider text-muted-foreground">
                     {PROVIDER_LABELS[pid] ?? pid}
@@ -396,12 +407,11 @@ export function AiModelsCard() {
                         <span
                           className={cn(
                             "h-1.5 w-1.5 shrink-0 rounded-full",
-                            m.available ? "bg-up" : "bg-muted-foreground/40",
+                            m.provider === "builtin" || m.direct ? "bg-up" : "bg-gold",
                           )}
                           aria-hidden
                         />
                         {m.label}
-                        {!m.available && <KeyRound className="ml-auto h-3 w-3 text-amber-400" aria-hidden />}
                       </span>
                     </SelectItem>
                   ))}
@@ -409,6 +419,104 @@ export function AiModelsCard() {
               ))}
             </SelectContent>
           </Select>
+        </div>
+
+        {/* ── optional keys (direct upgrade) ── */}
+        <div>
+          <div className="mb-2 flex items-center gap-1.5 text-[11px] font-bold text-foreground">
+            <KeyRound className="h-3.5 w-3.5 text-muted-foreground" aria-hidden />
+            {t("aiOptionalKeysTitle")}
+            {directCount > 0 && (
+              <span className="rounded border border-up/40 bg-up/10 px-1 py-px font-mono text-[7px] font-black uppercase text-up">
+                {directCount} direct
+              </span>
+            )}
+          </div>
+          <p className="mb-2 text-[9px] leading-snug text-muted-foreground/80">{t("aiOptionalKeysNote")}</p>
+          <div className="flex flex-col gap-3">
+            {data.providers.map((p) => (
+              <div key={p.id} className="rounded-lg border border-border bg-background p-2.5">
+                <div className="flex items-center gap-2">
+                  <span
+                    className={cn(
+                      "h-2 w-2 shrink-0 rounded-full",
+                      p.hasKey ? "bg-up" : "bg-muted-foreground/40",
+                    )}
+                    aria-hidden
+                  />
+                  <span className="text-[11px] font-bold text-foreground">{p.name}</span>
+                  {p.hasKey && p.keyMasked && (
+                    <span className="rounded border border-border bg-muted/50 px-1 py-px font-mono text-[8px] font-bold text-muted-foreground">
+                      {p.keyMasked}
+                    </span>
+                  )}
+                  <a
+                    href={p.keyUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="ml-auto flex items-center gap-1 text-[9px] font-semibold text-primary hover:underline"
+                  >
+                    {t("aiGetKey")}
+                    <ExternalLink className="h-3 w-3" aria-hidden />
+                  </a>
+                </div>
+
+                <div className="mt-2 flex items-center gap-1.5">
+                  <Input
+                    type="password"
+                    autoComplete="off"
+                    placeholder={p.hasKey ? t("aiKeyReplace") : "sk-…"}
+                    aria-label={`${p.name} API key`}
+                    className="h-8 flex-1 text-[11px]"
+                    value={keyDrafts[p.id] ?? ""}
+                    onChange={(e) => setKeyDrafts((prev) => ({ ...prev, [p.id]: e.target.value }))}
+                    disabled={savingKey === p.id}
+                  />
+                  <Button
+                    size="sm"
+                    className="h-8 gap-1 px-2.5 text-[10px] font-bold"
+                    onClick={() => void saveKey(p.id)}
+                    disabled={savingKey === p.id || !(keyDrafts[p.id] ?? "").trim()}
+                  >
+                    {savingKey === p.id ? (
+                      <Loader2 className="h-3 w-3 animate-spin" aria-hidden />
+                    ) : (
+                      <KeyRound className="h-3 w-3" aria-hidden />
+                    )}
+                    {t("aiKeySave")}
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-8 gap-1 px-2.5 text-[10px] font-bold"
+                    onClick={() => void testKey(p.id)}
+                    disabled={testing === p.id}
+                  >
+                    {testing === p.id ? (
+                      <Loader2 className="h-3 w-3 animate-spin" aria-hidden />
+                    ) : (
+                      <Sparkles className="h-3 w-3" aria-hidden />
+                    )}
+                    {t("aiKeyTest")}
+                  </Button>
+                  {p.hasKey && (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="h-8 w-8 p-0 text-muted-foreground hover:text-down"
+                      onClick={() => void clearKey(p.id)}
+                      disabled={savingKey === p.id}
+                      aria-label={t("aiKeyClear")}
+                      title={t("aiKeyClear")}
+                    >
+                      <X className="h-3 w-3" aria-hidden />
+                    </Button>
+                  )}
+                </div>
+                <p className="mt-1.5 text-[9px] leading-snug text-muted-foreground/80">{p.keyHint}</p>
+              </div>
+            ))}
+          </div>
         </div>
 
         {/* status line */}

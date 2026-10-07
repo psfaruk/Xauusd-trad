@@ -146,7 +146,11 @@ export async function getNewsRadar(symbol: string, force = false): Promise<NewsR
         .filter((i) => i.title.length > 8);
     }
   } catch (e) {
-    error = e instanceof Error ? e.message : "news search unavailable";
+    const raw = e instanceof Error ? e.message : "news search unavailable";
+    // v23 — a rate-limited moment shouldn't scare the user with a raw stack
+    error = /status 429|too many requests/i.test(raw)
+      ? "news engine cooling down (rate limit) — headlines return automatically in a few minutes"
+      : raw;
   }
   newsCache = { at: Date.now(), items, error };
   return decorateNews(newsCache);
