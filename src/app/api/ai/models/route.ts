@@ -54,6 +54,7 @@ export async function GET() {
         provider: m.provider,
         label: m.label,
         note: m.note,
+        tier: m.tier,
         /** v23 — every model runs keyless; `direct` marks the optional key upgrade */
         available: modelAvailable(m.id, s),
         direct: m.provider !== "builtin" && Boolean(s.keys[m.provider]),

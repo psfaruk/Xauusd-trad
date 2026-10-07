@@ -64,14 +64,33 @@ export async function getAiSettings(force = false): Promise<AiSettings> {
     const raw = rows.find((r) => r.key === SETTING_BOARD_MODELS)?.value;
     if (raw) {
       const parsed = JSON.parse(raw) as Record<string, unknown>;
+      const saved: Record<string, string> = {};
       for (const [k, v] of Object.entries(parsed)) {
-        if (typeof v === "string" && modelById(v)) boardModels[k] = v;
+        if (typeof v === "string" && modelById(v)) saved[k] = v;
+      }
+      // v25 migration — if the saved committee is exactly the untouched v23
+      // default set, upgrade it to the new FLAGSHIP committee (the user never
+      // customized it). Anything else is a deliberate choice → keep it.
+      const V23_DEFAULTS: Record<string, string> = {
+        trend: "qwen-flash", smc: "kimi-k2", risk: "glm-4.6",
+        skeptic: "deepseek-reasoner", volatility: "qwen-turbo", cto: "glm-4.6",
+      };
+      const isUntouchedV23 =
+        Object.keys(saved).length === Object.keys(V23_DEFAULTS).length &&
+        Object.entries(V23_DEFAULTS).every(([k, v]) => saved[k] === v);
+      if (isUntouchedV23) {
+        boardModels = { ...DEFAULT_BOARD_MODELS };
+      } else {
+        boardModels = { ...boardModels, ...saved };
       }
     }
   } catch { /* defaults survive */ }
 
   const chatRaw = rows.find((r) => r.key === SETTING_CHAT_MODEL)?.value;
-  const chatModel = chatRaw && modelById(chatRaw) ? chatRaw : DEFAULT_CHAT_MODEL;
+  // v25 migration — a saved chat model survives UNLESS it is the untouched
+  // old default (glm-4.6), which upgrades to the new flagship default.
+  const chatModel =
+    chatRaw && modelById(chatRaw) && chatRaw !== "glm-4.6" ? chatRaw : DEFAULT_CHAT_MODEL;
 
   const value: AiSettings = { keys, boardModels, chatModel };
   settingsCache = { at: Date.now(), value };
@@ -170,12 +189,27 @@ async function keylessCall(
   const isBuiltin = model.provider === "builtin";
   const cache = ptCache();
 
-  // builtin GLM: no pass-through needed, serve directly
+  // builtin GLM: glm-4.6 rides the engine default; the flagship GLM 5.3 sends
+  // its own id as a pass-through (verified served), falling back to the
+  // engine default + persona if the id is ever rejected
   if (isBuiltin) {
-    const r = await sdkChatComplete({
-      messages, model: null, temperature, maxTokens, timeoutMs, kind,
-    });
-    return finish(r, model, "native");
+    if (model.apiModel) {
+      const r = await sdkChatComplete({
+        messages, model: model.apiModel, temperature, maxTokens, timeoutMs, kind,
+      });
+      if (r.ok) return finish(r, model, "native");
+      if (r.code === "PROVIDER_ERROR" || r.code === "EMPTY") {
+        // id not served → remember and fall through to the persona route
+        cache.set(model.id, false);
+      } else {
+        return finish(r, model, "glm-engine");
+      }
+    } else {
+      const r = await sdkChatComplete({
+        messages, model: null, temperature, maxTokens, timeoutMs, kind,
+      });
+      return finish(r, model, "native");
+    }
   }
 
   // other companies: try the model id pass-through once (unless known-bad)

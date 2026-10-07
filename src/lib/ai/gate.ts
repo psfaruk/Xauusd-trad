@@ -24,7 +24,7 @@
  * Singleton across HMR via globalThis.
  */
 
-import type { ChatMessage } from "./llm-types";
+import type { ChatMsg } from "./llm-types";
 
 // ── tunables ────────────────────────────────────────────────────────────────
 
@@ -178,7 +178,7 @@ export function gateHealth(): GateHealth {
 // ── shared engine plumbing ──────────────────────────────────────────────────
 
 export interface SdkChatOptions {
-  messages: ChatMessage[];
+  messages: ChatMsg[];
   /** model id pass-through — null = the endpoint's default GLM */
   model?: string | null;
   temperature?: number;
@@ -388,6 +388,7 @@ export function sdkVisionComplete(opts: SdkVisionOptions): Promise<SdkVisionResu
         const remaining = Math.max(4_000, deadline - Date.now());
         const completion = (await Promise.race([
           zai.chat.completions.createVision({
+            model: "glm-4.6v",
             messages: [
               {
                 role: "user",

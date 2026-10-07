@@ -38,7 +38,7 @@ import {
 } from "@/components/ui/select";
 import ReactMarkdown from "react-markdown";
 import {
-  MessageCircle, X, Send, Loader2, Trash2, Sparkles, Bot, Eye, EyeOff, ScanSearch,
+  MessageCircle, X, Send, Loader2, Trash2, Sparkles, Bot, Eye, EyeOff, ScanSearch, Star,
 } from "lucide-react";
 import type { BoardResponse } from "@/lib/market/types";
 
@@ -56,7 +56,7 @@ interface ChatMsgRow {
 
 interface ModelsPayload {
   providers: { id: string; name: string; keyUrl: string; keyHint: string; hasKey: boolean; keyMasked: string | null }[];
-  models: { id: string; provider: string; label: string; note: string; available: boolean; direct: boolean }[];
+  models: { id: string; provider: string; label: string; note: string; tier: "standard" | "special"; available: boolean; direct: boolean }[];
   chatModel: string;
   engine?: {
     coolingDown: boolean;
@@ -86,6 +86,10 @@ const PROVIDER_LABELS: Record<string, string> = {
   deepseek: "DeepSeek",
   qwen: "Alibaba Qwen",
   moonshot: "Moonshot Kimi",
+  anthropic: "Anthropic Claude",
+  openai: "OpenAI",
+  google: "Google Gemini",
+  xai: "xAI Grok",
 };
 
 // ── v24: chart screenshot capture ───────────────────────────────────────────
@@ -303,13 +307,18 @@ export function ChatDock() {
     }
   }, [symbol, t]);
 
-  const byProvider = (modelsQ.data?.models ?? []).reduce<Record<string, ModelsPayload["models"]>>(
-    (acc, m) => {
-      (acc[m.provider] ??= []).push(m);
-      return acc;
-    },
-    {},
-  );
+  // v25 — the flagship tier gets its own gold group FIRST; standard models
+  // stay grouped by company
+  const specialTier = (modelsQ.data?.models ?? []).filter((m) => m.tier === "special");
+  const byProvider = (modelsQ.data?.models ?? [])
+    .filter((m) => m.tier !== "special")
+    .reduce<Record<string, ModelsPayload["models"]>>(
+      (acc, m) => {
+        (acc[m.provider] ??= []).push(m);
+        return acc;
+      },
+      {},
+    );
 
   // is the chart visible right now? (vision only has eyes on the chart tab)
   const chartOnScreen = mainTab === "chart";
@@ -375,6 +384,30 @@ export function ChatDock() {
                 <SelectValue placeholder={t("chatModel")} />
               </SelectTrigger>
               <SelectContent className="max-h-80">
+                {/* ★ the flagship generation — gold, first in the list */}
+                {specialTier.length > 0 && (
+                  <SelectGroup>
+                    <SelectLabel className="text-[9px] font-black uppercase tracking-wider text-gold">
+                      ★ {t("chatSpecialTier")}
+                    </SelectLabel>
+                    {specialTier.map((m) => (
+                      <SelectItem
+                        key={m.id}
+                        value={m.id}
+                        className="text-[11px]"
+                        title={m.note}
+                      >
+                        <span className="flex w-full items-center gap-1.5">
+                          <Star className="h-2.5 w-2.5 shrink-0 fill-gold text-gold" aria-hidden />
+                          <span className="font-semibold">{m.label}</span>
+                          <span className="ml-auto font-mono text-[7px] font-black uppercase tracking-wider text-gold">
+                            flagship
+                          </span>
+                        </span>
+                      </SelectItem>
+                    ))}
+                  </SelectGroup>
+                )}
                 {Object.entries(byProvider).map(([pid, models]) => (
                   <SelectGroup key={pid}>
                     <SelectLabel className="text-[9px] font-bold uppercase tracking-wider text-muted-foreground">

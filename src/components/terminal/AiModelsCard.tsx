@@ -28,7 +28,7 @@ import {
   Select, SelectContent, SelectGroup, SelectItem, SelectLabel, SelectTrigger, SelectValue,
 } from "@/components/ui/select";
 import {
-  Cpu, KeyRound, Loader2, Check, X, ExternalLink, Save, Sparkles, Unlock, Zap, Gauge, Infinity as InfinityIcon,
+  Cpu, KeyRound, Loader2, Check, X, ExternalLink, Save, Sparkles, Unlock, Zap, Gauge, Infinity as InfinityIcon, Star,
 } from "lucide-react";
 
 interface ModelsPayload {
@@ -36,7 +36,7 @@ interface ModelsPayload {
     id: string; name: string; keyUrl: string; keyHint: string;
     hasKey: boolean; keyMasked: string | null;
   }[];
-  models: { id: string; provider: string; label: string; note: string; available: boolean; direct: boolean }[];
+  models: { id: string; provider: string; label: string; note: string; tier: "standard" | "special"; available: boolean; direct: boolean }[];
   boardAgents: string[];
   boardModels: Record<string, string>;
   chatModel: string;
@@ -65,6 +65,10 @@ const PROVIDER_LABELS: Record<string, string> = {
   deepseek: "DeepSeek",
   qwen: "Alibaba Qwen",
   moonshot: "Moonshot Kimi",
+  anthropic: "Anthropic Claude",
+  openai: "OpenAI",
+  google: "Google Gemini",
+  xai: "xAI Grok",
 };
 
 async function fetchModels(): Promise<ModelsPayload> {
@@ -214,6 +218,10 @@ export function AiModelsCard() {
 
   const engine = data.engine;
   const directCount = data.models.filter((m) => m.direct).length;
+  // v25 — the flagship generation: gold ★ tier, rendered first everywhere
+  const specialModels = data.models.filter((m) => m.tier === "special");
+  const standardModels = data.models.filter((m) => m.tier !== "special");
+  const catalog = [...specialModels, ...standardModels];
 
   return (
     <Card className="border-border bg-card">
@@ -238,6 +246,24 @@ export function AiModelsCard() {
           <p className="mt-1.5 text-[10px] leading-relaxed text-muted-foreground">
             {t("aiKeylessNote")}
           </p>
+
+          {/* v25 — the flagship strip: the special generation, gold and proud */}
+          {specialModels.length > 0 && (
+            <div className="mt-2 rounded-md border border-gold/40 bg-gold/5 px-2 py-1.5">
+              <div className="flex items-center gap-1.5">
+                <Star className="h-3 w-3 shrink-0 fill-gold text-gold" aria-hidden />
+                <span className="text-[10px] font-black uppercase tracking-wide text-gold">
+                  {t("aiSpecialTier")}
+                </span>
+                <span className="ml-auto rounded border border-gold/40 bg-gold/10 px-1 py-px font-mono text-[8px] font-black uppercase tracking-wider text-gold">
+                  {specialModels.length} flagship
+                </span>
+              </div>
+              <p className="mt-1 text-[9px] leading-relaxed text-muted-foreground">
+                {t("aiSpecialNote")}
+              </p>
+            </div>
+          )}
 
           {/* v24 — the unlimited promise: how the queue protects the user */}
           <div className="mt-2 flex items-start gap-1.5 rounded-md border border-primary/30 bg-primary/5 px-2 py-1.5">
@@ -286,15 +312,24 @@ export function AiModelsCard() {
             {t("aiCatalogTitle")}
           </div>
           <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-2">
-            {data.models.map((m) => (
+            {catalog.map((m) => (
               <div
                 key={m.id}
-                className="flex items-center gap-2 rounded-md border border-border bg-background px-2 py-1.5"
+                className={cn(
+                  "flex items-center gap-2 rounded-md border bg-background px-2 py-1.5",
+                  m.tier === "special" ? "border-gold/40 bg-gold/5" : "border-border",
+                )}
                 title={m.note}
               >
-                <span className="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-up" aria-hidden />
+                {m.tier === "special" ? (
+                  <Star className="h-2.5 w-2.5 shrink-0 fill-gold text-gold" aria-hidden />
+                ) : (
+                  <span className="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-up" aria-hidden />
+                )}
                 <span className="min-w-0 flex-1">
-                  <span className="block truncate text-[10px] font-bold text-foreground">{m.label}</span>
+                  <span className={cn("block truncate text-[10px] font-bold", m.tier === "special" ? "text-gold" : "text-foreground")}>
+                    {m.label}
+                  </span>
                   <span className="block truncate text-[8px] text-muted-foreground">
                     {PROVIDER_LABELS[m.provider] ?? m.provider}
                   </span>
@@ -304,10 +339,12 @@ export function AiModelsCard() {
                     "shrink-0 rounded border px-1 py-px font-mono text-[7px] font-black uppercase tracking-wider",
                     m.direct
                       ? "border-up/40 bg-up/10 text-up"
-                      : "border-gold/40 bg-gold/10 text-gold",
+                      : m.tier === "special"
+                        ? "border-gold/40 bg-gold/10 text-gold"
+                        : "border-gold/40 bg-gold/10 text-gold",
                   )}
                 >
-                  {m.direct ? "direct" : "live"}
+                  {m.direct ? "direct" : m.tier === "special" ? "flagship" : "live"}
                 </span>
               </div>
             ))}
@@ -347,8 +384,27 @@ export function AiModelsCard() {
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent className="max-h-72">
+                      {/* ★ flagship tier first */}
+                      {specialModels.length > 0 && (
+                        <SelectGroup>
+                          <SelectLabel className="text-[9px] font-black uppercase tracking-wider text-gold">
+                            ★ {t("aiSpecialTier")}
+                          </SelectLabel>
+                          {specialModels.map((m) => (
+                            <SelectItem key={m.id} value={m.id} className="text-[11px]" title={m.note}>
+                              <span className="flex w-full items-center gap-1.5">
+                                <Star className="h-2.5 w-2.5 shrink-0 fill-gold text-gold" aria-hidden />
+                                {m.label}
+                                {m.direct && (
+                                  <span className="ml-auto font-mono text-[7px] font-black uppercase text-up">direct</span>
+                                )}
+                              </span>
+                            </SelectItem>
+                          ))}
+                        </SelectGroup>
+                      )}
                       {Object.entries(
-                        data.models.reduce<Record<string, typeof data.models>>((acc, m) => {
+                        standardModels.reduce<Record<string, typeof data.models>>((acc, m) => {
                           (acc[m.provider] ??= []).push(m);
                           return acc;
                         }, {}),
@@ -401,8 +457,24 @@ export function AiModelsCard() {
               <SelectValue />
             </SelectTrigger>
             <SelectContent className="max-h-72">
+              {/* ★ flagship tier first */}
+              {specialModels.length > 0 && (
+                <SelectGroup>
+                  <SelectLabel className="text-[9px] font-black uppercase tracking-wider text-gold">
+                    ★ {t("aiSpecialTier")}
+                  </SelectLabel>
+                  {specialModels.map((m) => (
+                    <SelectItem key={m.id} value={m.id} className="text-[11px]" title={m.note}>
+                      <span className="flex w-full items-center gap-1.5">
+                        <Star className="h-2.5 w-2.5 shrink-0 fill-gold text-gold" aria-hidden />
+                        {m.label}
+                      </span>
+                    </SelectItem>
+                  ))}
+                </SelectGroup>
+              )}
               {Object.entries(
-                data.models.reduce<Record<string, typeof data.models>>((acc, m) => {
+                standardModels.reduce<Record<string, typeof data.models>>((acc, m) => {
                   (acc[m.provider] ??= []).push(m);
                   return acc;
                 }, {}),
