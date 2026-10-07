@@ -28,7 +28,7 @@ import {
   Select, SelectContent, SelectGroup, SelectItem, SelectLabel, SelectTrigger, SelectValue,
 } from "@/components/ui/select";
 import {
-  Cpu, KeyRound, Loader2, Check, X, ExternalLink, Save, Sparkles, Unlock, Zap, Gauge,
+  Cpu, KeyRound, Loader2, Check, X, ExternalLink, Save, Sparkles, Unlock, Zap, Gauge, Infinity as InfinityIcon,
 } from "lucide-react";
 
 interface ModelsPayload {
@@ -44,8 +44,10 @@ interface ModelsPayload {
     coolingDown: boolean;
     cooldownRemainingMs: number;
     queuedBehind: number;
+    queuedUser: number;
+    spacingMs: number;
     minSpacingMs: number;
-    stats: { totalCalls: number; total429: number; lastError: string | null; lastErrorAt: number | null; lastOkAt: number | null };
+    stats: { totalCalls: number; total429: number; servedChat: number; servedVision: number; servedBoard: number; lastError: string | null; lastErrorAt: number | null; lastOkAt: number | null };
   };
 }
 
@@ -230,22 +232,38 @@ export function AiModelsCard() {
             <Unlock className="h-4 w-4 shrink-0 text-up" aria-hidden />
             <span className="text-[11px] font-bold text-foreground">{t("aiKeylessTitle")}</span>
             <span className="ml-auto rounded border border-up/40 bg-up/10 px-1.5 py-px font-mono text-[8px] font-black uppercase tracking-wider text-up">
-              {data.models.length} models · 0 keys
+              {data.models.length} models · all live
             </span>
           </div>
           <p className="mt-1.5 text-[10px] leading-relaxed text-muted-foreground">
             {t("aiKeylessNote")}
           </p>
 
-          {/* engine stats strip */}
+          {/* v24 — the unlimited promise: how the queue protects the user */}
+          <div className="mt-2 flex items-start gap-1.5 rounded-md border border-primary/30 bg-primary/5 px-2 py-1.5">
+            <InfinityIcon className="mt-px h-3.5 w-3.5 shrink-0 text-primary" aria-hidden />
+            <p className="text-[9px] leading-relaxed text-muted-foreground">{t("aiUnlimitedNote")}</p>
+          </div>
+
+          {/* engine stats strip — served counts, not scary errors */}
           {engine && (
             <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 border-t border-up/20 pt-2 text-[9px] font-semibold text-muted-foreground">
               <span className="flex items-center gap-1">
                 <Gauge className="h-3 w-3 text-primary" aria-hidden />
                 {t("aiEngineHealth")}
               </span>
-              <span className="tnum font-mono">{engine.stats.totalCalls} calls</span>
-              <span className="tnum font-mono">{engine.stats.total429} rate-hits</span>
+              <span className="tnum font-mono" title={t("aiServedChatHint")}>
+                💬 {engine.stats.servedChat}
+              </span>
+              <span className="tnum font-mono" title={t("aiServedVisionHint")}>
+                👁 {engine.stats.servedVision}
+              </span>
+              <span className="tnum font-mono" title={t("aiServedBoardHint")}>
+                🏛 {engine.stats.servedBoard}
+              </span>
+              {engine.queuedBehind > 0 && (
+                <span className="tnum font-mono text-primary">⏳ {engine.queuedBehind}</span>
+              )}
               {engine.coolingDown ? (
                 <span className="flex items-center gap-1 rounded border border-amber-500/40 bg-amber-500/10 px-1.5 py-px font-mono text-[8px] font-bold uppercase text-amber-400">
                   <Zap className="h-2.5 w-2.5" aria-hidden />
@@ -274,13 +292,7 @@ export function AiModelsCard() {
                 className="flex items-center gap-2 rounded-md border border-border bg-background px-2 py-1.5"
                 title={m.note}
               >
-                <span
-                  className={cn(
-                    "h-1.5 w-1.5 shrink-0 rounded-full",
-                    m.provider === "builtin" || m.direct ? "bg-up" : "bg-gold",
-                  )}
-                  aria-hidden
-                />
+                <span className="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-up" aria-hidden />
                 <span className="min-w-0 flex-1">
                   <span className="block truncate text-[10px] font-bold text-foreground">{m.label}</span>
                   <span className="block truncate text-[8px] text-muted-foreground">
@@ -292,12 +304,10 @@ export function AiModelsCard() {
                     "shrink-0 rounded border px-1 py-px font-mono text-[7px] font-black uppercase tracking-wider",
                     m.direct
                       ? "border-up/40 bg-up/10 text-up"
-                      : m.provider === "builtin"
-                        ? "border-primary/40 bg-primary/10 text-primary"
-                        : "border-gold/40 bg-gold/10 text-gold",
+                      : "border-gold/40 bg-gold/10 text-gold",
                   )}
                 >
-                  {m.direct ? "direct" : m.provider === "builtin" ? "native" : "keyless"}
+                  {m.direct ? "direct" : "live"}
                 </span>
               </div>
             ))}

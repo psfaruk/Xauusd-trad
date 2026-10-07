@@ -391,6 +391,8 @@ async function llmJson(
   return { ok: res.ok, raw: res.ok ? res.content : "", usedModelId: useId };
 }
 
+/** parse one agent vote object — used by the committee's regex-salvage path
+ *  when the model answers with loose objects instead of a JSON array */
 function parseAgentJson(raw: string): { vote: "BUY" | "SELL" | "HOLD"; confidence: number; note: string } | null {
   const m = raw.match(/\{[\s\S]*\}/);
   if (!m) return null;
@@ -693,6 +695,87 @@ export function lotFor(
 
 // ── the meeting ─────────────────────────────────────────────────────────────
 
+/**
+ * v24 — the ONE-CALL committee prompt: all 5 analyst personas, each with its
+ * own specialty + voting rule + assigned brain, voting independently inside
+ * a single request. Replaces 5 separate engine calls (rate-limit relief).
+ */
+function buildCommitteeSystem(personas: AgentPersona[]): string {
+  const members = personas
+    .map((p, i) => {
+      // strip the trailing per-agent JSON rule — the committee has its own
+      const body = p.system.replace(JSON_RULE, "").trim();
+      return `AGENT ${i + 1} — id "${p.id}" · ${p.roleEn}\n${body}`;
+    })
+    .join("\n\n");
+
+  return (
+    "You are the ANALYST COMMITTEE of a 6-member AI trading board (XAUUSD, MetaTrader 5) — five specialists deliberating in ONE room. " +
+    "For EACH agent below: think STRICTLY inside that agent's own domain, then cast that agent's OWN vote. " +
+    "Agents must NOT converge or copy each other — Agent 1 sees ONLY indicators, Agent 2 ONLY smart-money structure, Agent 3 ONLY trade geometry, Agent 4 argues the BEAR case against the trade, Agent 5 ONLY the volatility/news regime. " +
+    "An agent with no edge in its own domain votes HOLD. Notes are in Bengali (trading terms in English).\n\n" +
+    members +
+    "\n\nDeliberate agent by agent (1→5), then answer. Respond ONLY with valid JSON, no markdown fences — an array of EXACTLY 5 objects in order: " +
+    '[{"id":"trend","vote":"BUY"|"SELL"|"HOLD","confidence":<0-100 integer>,"note":"<Bengali, ≤ 18 words>"},' +
+    '{"id":"smc",…},{"id":"risk",…},{"id":"skeptic",…},{"id":"volatility",…}]'
+  );
+}
+
+/** parse the committee's JSON array (fences tolerated, partial arrays kept) */
+function parseCommitteeVotes(
+  raw: string,
+): { id: string; vote: "BUY" | "SELL" | "HOLD"; confidence: number; note: string }[] | null {
+  const cleaned = raw.replace(/```(?:json)?/gi, "").trim();
+  const candidates: unknown[] = [];
+  // 1) a top-level array
+  const arrStart = cleaned.indexOf("[");
+  const arrEnd = cleaned.lastIndexOf("]");
+  if (arrStart !== -1 && arrEnd > arrStart) {
+    try {
+      const parsed = JSON.parse(cleaned.slice(arrStart, arrEnd + 1));
+      if (Array.isArray(parsed)) candidates.push(...parsed);
+    } catch { /* fall through */ }
+  }
+  // 2) {"votes": [...]} wrapper
+  if (!candidates.length) {
+    const objStart = cleaned.indexOf("{");
+    const objEnd = cleaned.lastIndexOf("}");
+    if (objStart !== -1 && objEnd > objStart) {
+      try {
+        const parsed = JSON.parse(cleaned.slice(objStart, objEnd + 1)) as { votes?: unknown[] };
+        if (Array.isArray(parsed?.votes)) candidates.push(...parsed.votes);
+      } catch { /* fall through */ }
+    }
+  }
+  // 3) regex salvage: individual vote objects, ids assigned by committee order
+  if (!candidates.length) {
+    const objs = (cleaned.match(/\{[^{}]*\}/g) ?? [])
+      .map((m) => parseAgentJson(m))
+      .filter((o): o is NonNullable<ReturnType<typeof parseAgentJson>> => o != null);
+    objs.forEach((o, i) => {
+      const persona = AGENT_PERSONAS[i];
+      if (persona) candidates.push({ id: persona.id, ...o });
+    });
+  }
+  const validIds = new Set(AGENT_PERSONAS.map((p) => p.id as string));
+  const out: { id: string; vote: "BUY" | "SELL" | "HOLD"; confidence: number; note: string }[] = [];
+  for (const c of candidates) {
+    if (!c || typeof c !== "object") continue;
+    const j = c as Record<string, unknown>;
+    const id = typeof j.id === "string" ? j.id : null;
+    const vote = j.vote === "BUY" || j.vote === "SELL" || j.vote === "HOLD" ? j.vote : null;
+    if (!id || !validIds.has(id) || !vote) continue;
+    if (out.some((o) => o.id === id)) continue; // first vote per agent wins
+    out.push({
+      id,
+      vote,
+      confidence: Math.max(0, Math.min(100, Math.round(Number(j.confidence) || 0))),
+      note: typeof j.note === "string" ? j.note.trim().slice(0, 220) : "",
+    });
+  }
+  return out.length ? out : null;
+}
+
 export interface MeetingResult {
   agents: BoardAgentOut[];
   decision: BoardDecision;
@@ -715,30 +798,32 @@ export async function runBoardMeeting(
       .map((a) => `- ${a.roleEn} [${a.model}]: ${a.vote} (${a.confidence}%) — ${a.note}`)
       .join("\n")}\n\nIssue the final decision now.`;
 
-  // ── agents 1–5 — SEQUENTIAL through the gate (v23). The gate serializes
-  //    every engine call, spaces them and retries 429s internally with real
-  //    backoff — so the meeting just takes its turns like a roundtable. A
-  //    call that still fails (breaker open / hard error) degrades THAT agent
-  //    to its deterministic local read — the board never stalls. ──
+  // ── v24 — agents 1–5 in ONE committee call (was 5 separate engine calls).
+  //    Backtest finding: 6 calls per meeting + auto-run starved the shared
+  //    engine and made the user's CHAT hit rate limits ("limit exhausted").
+  //    The committee keeps every agent's own specialty, rule, assigned brain
+  //    and Bengali voice — they just share one request now (6 → 2 calls per
+  //    meeting, −66% engine pressure). A short/failed batch degrades ONLY
+  //    the missing agents to their deterministic local reads. ──
   let degraded = false;
   const localFb = localAgents(ctx);
-  const analysts: BoardAgentOut[] = [];
-  for (let i = 0; i < AGENT_PERSONAS.length; i++) {
-    const persona = AGENT_PERSONAS[i];
-    const modelId = models?.[persona.id];
-    const res = await llmJson(persona.system, userMsg, 26_000, modelId);
-    const parsed = res.ok ? parseAgentJson(res.raw) : null;
-    if (parsed) {
-      analysts.push({
+  const committeeSystem = buildCommitteeSystem(AGENT_PERSONAS);
+  const batchRes = await llmJson(committeeSystem, userMsg, 34_000, "glm-4.6");
+  const batchVotes = batchRes.ok ? parseCommitteeVotes(batchRes.raw) : null;
+  if (!batchVotes) degraded = true;
+
+  const analysts: BoardAgentOut[] = AGENT_PERSONAS.map((persona, i) => {
+    const v = batchVotes?.find((x) => x.id === persona.id);
+    if (v) {
+      return {
         id: persona.id, roleEn: persona.roleEn, roleBn: persona.roleBn,
-        model: agentBadge(persona, res.usedModelId),
-        vote: parsed.vote, confidence: parsed.confidence, note: parsed.note,
-      });
-    } else {
-      degraded = true;
-      analysts.push({ ...localFb[i], model: agentBadge(persona, res.usedModelId) });
+        model: agentBadge(persona, models?.[persona.id]),
+        vote: v.vote, confidence: v.confidence, note: v.note,
+      };
     }
-  }
+    if (batchVotes) degraded = true; // batch answered but this agent is missing
+    return { ...localFb[i], model: agentBadge(persona, models?.[persona.id]) };
+  });
 
   // ── the CTO — the final word (gate retries inside its budget) ──
   const ctoModelId = models?.cto;

@@ -3,31 +3,37 @@ import { db } from "@/lib/db";
 import { MT5_URL, svcHeaders, spreadFor } from "@/lib/svc";
 import { buildBoardContext } from "@/lib/market/board";
 import { chatComplete, getAiSettings } from "@/lib/ai/llm";
+import { sdkVisionComplete, gateHealth } from "@/lib/ai/gate";
 import { modelById } from "@/lib/ai/registry";
 import { getNewsRadar } from "@/lib/ai/tower";
 import type { Candle } from "@/lib/market/types";
 
 /**
- * /api/ai/chat — the AI CHAT BOX backend (v22.0).
+ * /api/ai/chat — the AI CHAT BOX backend (v24.0 · VISION + FULL APP STATE).
  *
  *   GET    ?thread                → message history (oldest → newest, last 60)
- *   POST   { thread, message, model? } → one assistant reply
+ *   POST   { thread, message, model?, image?, appState? } → one assistant reply
  *   DELETE ?thread                → clear the thread
  *
- * The chat is market-aware: every reply is grounded in the LIVE snapshot the
- * AI Board itself reads (price, ATR, trend, zones, patterns), the board's
- * latest decision and the news radar's headlines — so "এখন entry নেবো?" gets
- * a real answer with real levels, not a generic one.
- *
- * The model is the user's pick from the selector (GLM built-in / DeepSeek /
- * Qwen / Kimi) routed through the multi-provider gateway.
+ * v24 — the AI can now SEE:
+ *   · the client attaches a live SCREENSHOT of the chart (candles + drawings
+ *     composited) and a full APP-STATE snapshot (tab, symbol, tf, layers,
+ *     board decision, engine health) with every message;
+ *   · the screenshot is analyzed by the VLM first (priority queue, 429-safe),
+ *     and the description + app state + live market JSON all ground the
+ *     reply — so "চার্টটা দেখতে পারো?" gets "হ্যাঁ — এখন যা দেখছি: …" with
+ *     the actual visible structure;
+ *   · chat calls run with TOP priority through the gate — they jump ahead of
+ *     AI Board meetings, so the user's chat is effectively unlimited: worst
+ *     case it waits a few seconds in a visible queue.
  */
 
 export const runtime = "nodejs";
-export const maxDuration = 60;
+export const maxDuration = 90;
 
 const HISTORY_LIMIT = 60;
 const CONTEXT_MESSAGES = 14;
+const MAX_IMAGE_BYTES = 1_400_000; // ~1.4MB data-URL guard
 
 function cleanThread(v: string | undefined | null): string {
   return (v ?? "XAUUSDm").trim().slice(0, 24) || "XAUUSDm";
@@ -92,7 +98,24 @@ export async function DELETE(req: Request) {
   return NextResponse.json({ ok: true });
 }
 
-// ── POST: one grounded reply ──
+/** what the VLM looks for when it reads the chart screenshot */
+function visionPrompt(symbol: string, tf: string): string {
+  return (
+    `You are the EYES of AURUM AI, attached to a live MetaTrader 5 terminal. ` +
+    `This is a real screenshot of the ${symbol} ${tf} candlestick chart the user is looking at RIGHT NOW ` +
+    `(green/red candles = up/down, gold dashed lines = EMA, colored zones/rectangles = supply/demand or order blocks, ` +
+    `lines and markers = the user's drawings and AI signal markers, the right scale shows prices). ` +
+    `Read it like a senior chart analyst and report ONLY what you actually see, concretely: ` +
+    `(1) overall trend direction and maturity, (2) the most recent 5-10 candles' behavior (momentum, wicks, consolidation), ` +
+    `(3) any visible structure: swing highs/lows, ranges, channels, patterns (double top/bottom, head & shoulders, flags), ` +
+    `(4) visible zones/levels and where price sits relative to them, (5) indicator reads (EMA position/crossovers), ` +
+    `(6) anything unusual (gaps, spikes, long wicks, marking clusters). ` +
+    `Quote approximate visible price levels from the right-hand scale when relevant. ` +
+    `Be factual — do NOT invent things that are not on the chart. Tight bullet list, max 160 words.`
+  );
+}
+
+// ── POST: one grounded, SEEING reply ──
 
 export async function POST(req: Request) {
   const body = await req.json().catch(() => null);
@@ -104,6 +127,10 @@ export async function POST(req: Request) {
 
   const settings = await getAiSettings();
   const modelId = typeof body?.model === "string" && modelById(body.model) ? body.model : settings.chatModel;
+
+  // v24 — optional chart screenshot + app-state snapshot from the client
+  const image = typeof body?.image === "string" && body.image.startsWith("data:image/") ? body.image : null;
+  const appStateRaw = body?.appState && typeof body?.appState === "object" ? body.appState : null;
 
   // ── live market context (the same read the board gets) ──
   const [bars, digits, spread, newsRadar, latestBoard] = await Promise.all([
@@ -140,13 +167,66 @@ export async function POST(req: Request) {
     /* keep the unavailable block */
   }
 
+  // ── VISION: let the AI actually SEE the chart (priority call, 429-safe) ──
+  let visionBlock = "";
+  let sawChart = false;
+  if (image && image.length <= MAX_IMAGE_BYTES) {
+    const v = await sdkVisionComplete({
+      imageDataUrl: image,
+      prompt: visionPrompt(thread, typeof appStateRaw?.timeframe === "string" ? appStateRaw.timeframe : "M15"),
+      timeoutMs: 40_000,
+    });
+    if (v.ok && v.content.trim()) {
+      sawChart = true;
+      visionBlock =
+        `\n\nWHAT YOU SEE ON THE USER'S CHART RIGHT NOW (your own vision read of the live screenshot):\n${v.content.trim()}\n` +
+        `→ When the user asks whether you can see the chart, the answer is YES — describe what is above as your own observation.`;
+    }
+    // vision failing NEVER blocks the chat — text context still grounds it
+  }
+
+  // ── APP STATE: what the whole app is doing right now ──
+  let appStateBlock = "";
+  if (appStateRaw) {
+    const slim = {
+      activeTab: appStateRaw.activeTab ?? null,
+      chartView: appStateRaw.chartView ?? null,
+      symbol: appStateRaw.symbol ?? thread,
+      timeframe: appStateRaw.timeframe ?? "M15",
+      layersOn: Array.isArray(appStateRaw.layersOn) ? appStateRaw.layersOn : [],
+      drawingsCount: typeof appStateRaw.drawingsCount === "number" ? appStateRaw.drawingsCount : 0,
+      autoBoard: typeof appStateRaw.autoBoard === "boolean" ? appStateRaw.autoBoard : null,
+      boardStats: appStateRaw.boardStats ?? null,
+      openSignals: typeof appStateRaw.openSignals === "number" ? appStateRaw.openSignals : null,
+      engine: (() => {
+        const h = gateHealth();
+        return {
+          status: h.coolingDown ? "cooling" : "live",
+          queueWaiting: h.queuedBehind,
+          servedChat: h.stats.servedChat,
+          servedVision: h.stats.servedVision,
+          servedBoard: h.stats.servedBoard,
+        };
+      })(),
+    };
+    appStateBlock =
+      `\n\nTHE APP'S OWN STATE RIGHT NOW (the terminal the user is looking at):\n${JSON.stringify(slim)}\n` +
+      `→ Use this to answer questions about the app itself ("অ্যাপে কোথায় সমস্যা?", "board কি চলছে?") — you know the active tab, layers, board stats and engine health.`;
+  }
+
   const system =
     "You are AURUM AI — the assistant of the AURUM Terminal, a live XAUUSD/forex trading terminal on MetaTrader 5. " +
-    "You are talking to the terminal's owner. You have the LIVE market context below — USE IT: quote exact prices, zones, patterns and board decisions from it instead of generic advice. " +
+    "You are talking to the terminal's owner. " +
+    (sawChart
+      ? "You CAN see the user's live chart — a screenshot was just captured and your vision read of it is included below. "
+      : "No chart screenshot is attached this time (say so plainly if asked whether you can see the chart). ") +
+    "You also receive a LIVE market snapshot and the app's own state — USE THEM: quote exact prices, zones, patterns and board decisions instead of generic advice. " +
     "Rules: (1) Reply in the SAME language the user writes in — if they write বাংলা, reply in বাংলা with trading terms in English. " +
     "(2) Be concrete and brief: levels, distances in ATR, RR — no fluff. " +
     "(3) You are an analyst, not a guarantee: when suggesting entries, always include the invalidation (SL) and a one-line risk note. " +
-    "(4) Markdown allowed (bold, lists), keep it tight for a chat box.\n\n" + marketBlock;
+    "(4) When describing the chart, blend what you SEE with the live data — visible structure + exact numbers. " +
+    "(5) Markdown allowed (bold, lists), keep it tight for a chat box.\n\n" +
+    marketBlock + visionBlock + appStateBlock;
 
   // ── history (last N turns) + the new message ──
   const historyRows = await db.chatMessage.findMany({
@@ -173,18 +253,18 @@ export async function POST(req: Request) {
       ...history,
       { role: "user", content: message },
     ],
-    // v23 — generous budget: the gate serializes + retries 429s inside it,
-    // so a rate-limited moment becomes a slightly longer "thinking…" instead
-    // of an instant "API problem".
-    timeoutMs: 42_000,
+    // v24 — generous budget + TOP priority: the gate serializes, spaces and
+    // 429-retries inside this budget, and chat jumps ahead of board meetings.
+    timeoutMs: 70_000,
     temperature: 0.5,
     maxTokens: 1100,
+    kind: "chat",
   });
 
   if (!reply.ok) {
     const friendly =
       reply.code === "RATE_LIMITED"
-        ? "ইঞ্জিন একটু ব্যস্ত (rate limit) — ২০-৩০ সেকেন্ড পর আবার পাঠান, ততক্ষণে ঠিক হয়ে যাবে।"
+        ? "ইঞ্জিন একটু ব্যস্ত — মেসেজটি সারিতে আছে, ২০-৩০ সেকেন্ড পর আবার পাঠালেই উত্তর পাবেন।"
         : reply.code === "TIMEOUT"
           ? "মডেলটি উত্তর দিতে বেশি সময় নিচ্ছে — একটু পর আবার চেষ্টা করুন।"
           : reply.error;
@@ -204,6 +284,8 @@ export async function POST(req: Request) {
     modelLabel: reply.modelLabel,
     engine: reply.engine ?? "glm-engine",
     engineLabel: reply.engineLabel ?? reply.modelLabel,
+    /** v24 — did the AI actually SEE the chart this turn? */
+    vision: sawChart,
     userMessage: userRow
       ? { id: userRow.id, role: "user", content: userRow.content, model: modelId, createdAt: userRow.createdAt.toISOString() }
       : null,

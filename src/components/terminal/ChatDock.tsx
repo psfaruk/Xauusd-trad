@@ -1,24 +1,32 @@
 "use client";
 
 /**
- * ChatDock — THE AI CHAT BOX (v23.0 · KEYLESS).
+ * ChatDock — THE AI CHAT BOX (v24.0 · SEES YOUR CHART).
  *
  * অ্যাপের ভেতরে একটি AI চ্যাট বক্স, নির্দিষ্ট মডেল সিলেক্ট করে চ্যাট করার
  * সুবিধা সহ — a floating chat available on EVERY tab (bottom-right FAB):
  *
- *   · model picker — ALL models work WITHOUT any API key (v23): GLM native
- *     + DeepSeek / Alibaba Qwen / Moonshot Kimi through the built-in engine,
- *     each with its own persona; the badge on every reply shows which engine
- *     actually answered (native / GLM-engine / direct)
- *   · market-aware answers — every reply is grounded in the same live
- *     snapshot the AI Board reads (price, zones, patterns, board decision,
- *     news headlines); ask "এখন entry নেবো?" and get real levels
+ *   · VISION (v24) — every message carries a live SCREENSHOT of the chart
+ *     (candles + drawings + AI ink, composited) and a full APP-STATE snapshot
+ *     (tab, symbol, tf, layers, board stats, engine health). The backend runs
+ *     the screenshot through a VLM first, so asking "চার্টটা দেখতে পারো?"
+ *     now returns "হ্যাঁ" + what is actually on the screen. The 👁 toggle in
+ *     the composer turns this on/off (on by default).
+ *   · model picker — ALL models run WITHOUT any API key: GLM native +
+ *     DeepSeek / Alibaba Qwen / Moonshot Kimi through the built-in engine,
+ *     each with its own persona; every model shows a LIVE badge and every
+ *     reply shows which engine answered.
+ *   · effectively UNLIMITED — chat calls jump the engine queue (priority over
+ *     AI Board meetings) and wait out cooldowns; the worst case is a few
+ *     seconds of "queued…" instead of an error.
+ *   · market-aware answers — grounded in the same live snapshot the AI Board
+ *     reads (price, zones, patterns, board decision, news headlines).
  *   · history persisted per symbol (survives reloads), markdown rendering,
- *     typing indicator, clear-thread, rate-limit-aware errors
+ *     typing indicator with elapsed time, clear-thread.
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useTerminal } from "@/hooks/useTerminal";
 import { useI18n } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
@@ -30,8 +38,9 @@ import {
 } from "@/components/ui/select";
 import ReactMarkdown from "react-markdown";
 import {
-  MessageCircle, X, Send, Loader2, Trash2, Sparkles, Bot, Unlock,
+  MessageCircle, X, Send, Loader2, Trash2, Sparkles, Bot, Eye, EyeOff, ScanSearch,
 } from "lucide-react";
+import type { BoardResponse } from "@/lib/market/types";
 
 interface ChatMsgRow {
   id: string;
@@ -39,8 +48,10 @@ interface ChatMsgRow {
   content: string;
   model: string;
   createdAt: string;
-  /** v23 — "DeepSeek V3 · GLM-engine" style badge (fresh replies only) */
+  /** "DeepSeek V3 · GLM-engine" style badge (fresh replies) */
   engineLabel?: string;
+  /** v24 — this reply was grounded in an actual chart screenshot */
+  vision?: boolean;
 }
 
 interface ModelsPayload {
@@ -50,7 +61,10 @@ interface ModelsPayload {
   engine?: {
     coolingDown: boolean;
     cooldownRemainingMs: number;
-    stats: { totalCalls: number; total429: number; lastError: string | null; lastOkAt: number | null };
+    queuedBehind: number;
+    queuedUser: number;
+    spacingMs: number;
+    stats: { totalCalls: number; total429: number; servedChat: number; servedVision: number; servedBoard: number; lastError: string | null; lastOkAt: number | null };
   };
 }
 
@@ -74,17 +88,76 @@ const PROVIDER_LABELS: Record<string, string> = {
   moonshot: "Moonshot Kimi",
 };
 
+// ── v24: chart screenshot capture ───────────────────────────────────────────
+
+/**
+ * Composite every canvas inside the live chart container (lightweight-charts
+ * candles + the overlay with drawings/AI ink) into one downscaled JPEG
+ * data-URL the backend can feed to the VLM. Returns null when the chart tab
+ * isn't mounted — the chat still works, just without eyes.
+ */
+function captureChartImage(): string | null {
+  try {
+    const host = document.querySelector<HTMLElement>("[data-chart-capture]");
+    if (!host) return null;
+    const rect = host.getBoundingClientRect();
+    const w = Math.round(rect.width);
+    const h = Math.round(rect.height);
+    if (w < 80 || h < 80) return null;
+
+    const scale = Math.min(1, 1100 / w);
+    const out = document.createElement("canvas");
+    out.width = Math.round(w * scale);
+    out.height = Math.round(h * scale);
+    const ctx = out.getContext("2d");
+    if (!ctx) return null;
+
+    // solid dark background (JPEG has no alpha; keeps the chart's dark look)
+    ctx.fillStyle = "#0a0f0d";
+    ctx.fillRect(0, 0, out.width, out.height);
+
+    // composite all canvases in DOM (stacking) order — candles first, then
+    // the crosshair, then the overlay with drawings + AI ink
+    host.querySelectorAll("canvas").forEach((c) => {
+      try {
+        ctx.drawImage(c, 0, 0, c.width, c.height, 0, 0, out.width, out.height);
+      } catch {
+        /* a tainted/odd canvas never blocks the rest */
+      }
+    });
+
+    return out.toDataURL("image/jpeg", 0.72);
+  } catch {
+    return null;
+  }
+}
+
 export function ChatDock() {
-  const { symbol } = useTerminal();
+  const { symbol, timeframe, mainTab, chartView, autoView, layers } = useTerminal();
   const { t } = useI18n();
+  const qc = useQueryClient();
   const [open, setOpen] = useState(false);
   const [messages, setMessages] = useState<ChatMsgRow[]>([]);
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
+  const [sendStartedAt, setSendStartedAt] = useState<number | null>(null);
   const [modelId, setModelId] = useState<string>("");
+  const [vision, setVision] = useState(true);
   const [loadedThread, setLoadedThread] = useState<string | null>(null);
   const listRef = useRef<HTMLDivElement>(null);
   const taRef = useRef<HTMLTextAreaElement>(null);
+
+  // vision preference persists
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem("aurum-chat-vision");
+      if (saved === "0") setVision(false);
+    } catch {}
+  }, []);
+  const toggleVision = (v: boolean) => {
+    setVision(v);
+    try { localStorage.setItem("aurum-chat-vision", v ? "1" : "0"); } catch {}
+  };
 
   // model catalog (once per mount + on window focus when open)
   const modelsQ = useQuery({
@@ -128,11 +201,43 @@ export function ChatDock() {
     if (el) el.scrollTop = el.scrollHeight;
   }, [messages, sending, open]);
 
+  // elapsed seconds while the engine works (visible patience, not dead air)
+  const [elapsed, setElapsed] = useState(0);
+  useEffect(() => {
+    if (!sending) { setElapsed(0); return; }
+    const started = sendStartedAt ?? Date.now();
+    const iv = setInterval(() => setElapsed(Math.round((Date.now() - started) / 1000)), 1000);
+    return () => clearInterval(iv);
+  }, [sending, sendStartedAt]);
+
   const send = useCallback(async () => {
     const text = input.trim();
     if (!text || sending) return;
     setInput("");
     setSending(true);
+    setSendStartedAt(Date.now());
+
+    // v24 — the AI's eyes: live chart screenshot (when the chart is on
+    // screen and vision is toggled on) + the app's own state
+    let image: string | null = null;
+    if (vision) image = captureChartImage();
+
+    const boardData = qc.getQueryData<BoardResponse>(["board", symbol, timeframe]);
+    const layersOn = Object.entries(layers).filter(([, v]) => v).map(([k]) => k);
+    const appState = {
+      activeTab: mainTab,
+      chartView,
+      autoView,
+      symbol,
+      timeframe,
+      layersOn,
+      drawingsCount: (qc.getQueryData<unknown[]>(["drawings", symbol, timeframe]) ?? []).length,
+      autoBoard: (() => { try { return localStorage.getItem("aurum-board-auto") === "1"; } catch { return null; } })(),
+      boardStats: boardData?.stats ?? null,
+      lastBoardAction: boardData?.latest?.decision.action ?? null,
+      openSignals: boardData?.stats.open ?? null,
+    };
+
     const optimistic: ChatMsgRow = {
       id: `tmp-${Date.now()}`,
       role: "user",
@@ -145,7 +250,13 @@ export function ChatDock() {
       const res = await fetch("/api/ai/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ thread: symbol, message: text, model: modelId }),
+        body: JSON.stringify({
+          thread: symbol,
+          message: text,
+          model: modelId,
+          image: image ?? undefined,
+          appState,
+        }),
       });
       const data = await res.json().catch(() => null);
       if (!res.ok) {
@@ -162,7 +273,10 @@ export function ChatDock() {
         setMessages((prev) => prev.map((m) => (m.id === optimistic.id ? data.userMessage : m)));
       }
       if (data.assistantMessage) {
-        setMessages((prev) => [...prev, { ...data.assistantMessage, engineLabel: data.engineLabel }]);
+        setMessages((prev) => [
+          ...prev,
+          { ...data.assistantMessage, engineLabel: data.engineLabel, vision: data.vision === true },
+        ]);
       }
     } catch (e) {
       setMessages((prev) => prev.filter((m) => m.id !== optimistic.id));
@@ -174,9 +288,10 @@ export function ChatDock() {
       setInput(text);
     } finally {
       setSending(false);
+      setSendStartedAt(null);
       taRef.current?.focus();
     }
-  }, [input, sending, modelId, symbol, t]);
+  }, [input, sending, modelId, symbol, t, vision, mainTab, chartView, autoView, layers, timeframe, qc]);
 
   const clearThread = useCallback(async () => {
     try {
@@ -195,6 +310,10 @@ export function ChatDock() {
     },
     {},
   );
+
+  // is the chart visible right now? (vision only has eyes on the chart tab)
+  const chartOnScreen = mainTab === "chart";
+  const visionActive = vision && chartOnScreen;
 
   return (
     <>
@@ -236,12 +355,18 @@ export function ChatDock() {
               <div className="truncate text-xs font-black uppercase tracking-wider text-foreground">
                 {t("chatTitle")}
               </div>
-              <div className="truncate font-mono text-[8px] font-bold uppercase tracking-wider text-muted-foreground/70">
-                {symbol} · {t("chatMarketAware")}
+              <div className="flex items-center gap-1 truncate font-mono text-[8px] font-bold uppercase tracking-wider text-muted-foreground/70">
+                <span>{symbol} · {t("chatMarketAware")}</span>
+                {visionActive && (
+                  <span className="flex items-center gap-0.5 rounded border border-up/40 bg-up/10 px-1 py-px text-[7px] font-black uppercase tracking-wider text-up">
+                    <ScanSearch className="h-2.5 w-2.5" aria-hidden />
+                    {t("chatSeesChart")}
+                  </span>
+                )}
               </div>
             </div>
 
-            {/* model picker — every model keyless (v23) */}
+            {/* model picker — every model keyless + live */}
             <Select value={modelId} onValueChange={pickModel}>
               <SelectTrigger
                 className="h-7 w-[150px] shrink-0 gap-1 border-border bg-background px-2 text-[10px] font-bold"
@@ -263,17 +388,11 @@ export function ChatDock() {
                         title={m.note}
                       >
                         <span className="flex w-full items-center gap-1.5">
-                          <span
-                            className={cn(
-                              "h-1.5 w-1.5 shrink-0 rounded-full",
-                              m.provider === "builtin" || m.direct ? "bg-up" : "bg-gold",
-                            )}
-                            aria-hidden
-                          />
+                          <span className="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-up" aria-hidden />
                           <span className="font-semibold">{m.label}</span>
-                          {m.provider !== "builtin" && !m.direct && (
-                            <Unlock className="ml-auto h-3 w-3 text-gold/80" aria-hidden />
-                          )}
+                          <span className="ml-auto font-mono text-[7px] font-black uppercase tracking-wider text-up/80">
+                            live
+                          </span>
                         </span>
                       </SelectItem>
                     ))}
@@ -324,6 +443,15 @@ export function ChatDock() {
                       <span className="rounded border border-gold/40 bg-gold/10 px-1 py-px font-mono text-[7px] font-black uppercase tracking-wider text-gold">
                         {m.engineLabel ?? activeModelLabel(messages, m, modelsQ.data)}
                       </span>
+                      {m.vision && (
+                        <span
+                          className="flex items-center gap-0.5 rounded border border-up/40 bg-up/10 px-1 py-px font-mono text-[7px] font-black uppercase tracking-wider text-up"
+                          title={t("chatVisionBadgeHint")}
+                        >
+                          <ScanSearch className="h-2.5 w-2.5" aria-hidden />
+                          {t("chatVisionBadge")}
+                        </span>
+                      )}
                     </div>
                     <div className="prose-chat text-[12px] leading-relaxed text-foreground/95 [&_p]:mb-1.5 [&_p:last-child]:mb-0 [&_ul]:mb-1.5 [&_ul]:list-disc [&_ul]:pl-4 [&_ol]:mb-1.5 [&_ol]:list-decimal [&_ol]:pl-4 [&_li]:mb-0.5 [&_strong]:font-bold [&_code]:rounded [&_code]:bg-muted [&_code]:px-1 [&_code]:font-mono [&_code]:text-[10px]">
                       <ReactMarkdown>{m.content}</ReactMarkdown>
@@ -343,16 +471,40 @@ export function ChatDock() {
                   <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-muted-foreground/60 [animation-delay:120ms]" />
                   <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-muted-foreground/60 [animation-delay:240ms]" />
                 </span>
-                <span className="text-[10px] font-semibold text-muted-foreground">{t("chatThinking")}</span>
+                <span className="text-[10px] font-semibold text-muted-foreground">
+                  {elapsed >= 8
+                    ? t("chatQueued").replace("{s}", String(elapsed))
+                    : t("chatThinking")}
+                </span>
               </div>
             )}
           </div>
 
           {/* composer */}
           <div className="shrink-0 border-t border-border bg-card/60 p-2">
-            <div className="mb-1.5 flex items-center gap-1.5 rounded-md border border-up/30 bg-up/5 px-2 py-1 text-[10px] font-semibold text-up">
-              <Unlock className="h-3 w-3 shrink-0" aria-hidden />
-              {t("chatKeylessNote")}
+            <div className="mb-1.5 flex items-center gap-1.5">
+              {/* the eye — vision on/off */}
+              <button
+                type="button"
+                onClick={() => toggleVision(!vision)}
+                className={cn(
+                  "flex h-6 items-center gap-1 rounded-md border px-2 text-[10px] font-bold transition-colors",
+                  visionActive
+                    ? "border-up/40 bg-up/10 text-up"
+                    : "border-border bg-background text-muted-foreground hover:text-foreground",
+                )}
+                aria-pressed={vision}
+                aria-label={t("chatVisionToggle")}
+                title={vision ? t("chatVisionOnHint") : t("chatVisionOffHint")}
+              >
+                {vision ? <Eye className="h-3 w-3" aria-hidden /> : <EyeOff className="h-3 w-3" aria-hidden />}
+                {t("chatVisionToggle")}
+              </button>
+              {vision && !chartOnScreen && (
+                <span className="truncate text-[9px] font-semibold text-muted-foreground/80">
+                  {t("chatVisionNeedsChart")}
+                </span>
+              )}
             </div>
             <div className="flex items-end gap-2">
               <Textarea

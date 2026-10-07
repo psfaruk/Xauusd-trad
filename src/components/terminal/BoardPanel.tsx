@@ -279,7 +279,7 @@ export function BoardPanel({ board }: { board: BoardSessionPayload | null }) {
                 <div className="min-w-0 flex-1">
                   <div className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground">
                     {t("boardCtoVerdict")} · {timeAgo(board.createdAt)} {t("ago")} ·{" "}
-                    {board.degraded ? t("boardDegraded") : "6 × LLM"}
+                    {board.degraded ? t("boardDegraded") : t("boardAICall")}
                   </div>
                   <p className="text-xs leading-relaxed text-foreground">
                     {dec?.reasoning || cto?.note || "—"}

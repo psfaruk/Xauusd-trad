@@ -1238,7 +1238,7 @@ export default function TradingChart(props: Props) {
   }, [tool]);
 
   return (
-    <div ref={containerRef} className="relative h-full w-full no-select">
+    <div ref={containerRef} data-chart-capture className="relative h-full w-full no-select">
       <div ref={chartHostRef} className="absolute inset-0" />
       <canvas
         ref={canvasRef}
