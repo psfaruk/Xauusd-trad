@@ -5,6 +5,9 @@
  *
  *    Board    — the 6-agent AI Board (v21 hero: analysts vote, the CTO
  *               issues ONE decision that draws on the chart) [BoardPanel]
+ *    Tower    — the Control Tower (v22): real-time follow-ups of every
+ *               open decision, MTF confluence, news radar, agent feed
+ *               [TowerPanel]
  *    Brain    — the cockpit (arm switch, risk, per-pair rules, live
  *               positions, journal, AI verdicts, feelings)  [AutoTradePanel]
  *    Signals  — the live signal engine list for the active chart [SignalsPanel]
@@ -16,13 +19,15 @@ import { useTerminal, type AutoView } from "@/hooks/useTerminal";
 import { useI18n } from "@/lib/i18n";
 import { cn } from "@/lib/utils";
 import { BoardPanel } from "./BoardPanel";
+import { TowerPanel } from "./TowerPanel";
 import { AutoTradePanel } from "./AutoTradePanel";
 import { SignalsPanel } from "./SignalsPanel";
 import { BacktestPanel } from "./BacktestPanel";
-import { Crown, BrainCircuit, Zap, FlaskConical } from "lucide-react";
+import { Crown, Radar, BrainCircuit, Zap, FlaskConical } from "lucide-react";
 
 const VIEWS: { id: AutoView; icon: any; key: string }[] = [
   { id: "board", icon: Crown, key: "viewBoard" },
+  { id: "tower", icon: Radar, key: "viewTower" },
   { id: "brain", icon: BrainCircuit, key: "viewBrain" },
   { id: "signals", icon: Zap, key: "viewSignals" },
   { id: "backtest", icon: FlaskConical, key: "viewBacktest" },
@@ -66,6 +71,7 @@ export function AutoSignalsView({
       {/* folder body */}
       <div className="min-h-0 flex-1">
         {autoView === "board" && <BoardPanel board={board} />}
+        {autoView === "tower" && <TowerPanel />}
         {autoView === "brain" && <AutoTradePanel />}
         {autoView === "signals" && <SignalsPanel analysis={analysis} />}
         {autoView === "backtest" && <BacktestPanel analysis={analysis} />}

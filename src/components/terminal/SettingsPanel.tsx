@@ -19,6 +19,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { AiModelsCard } from "./AiModelsCard";
 import {
   Sun, Moon, MonitorSmartphone, Languages, Database, Info, RefreshCw, LogOut, Loader2,
   Cable, ShieldCheck, ShieldAlert, Unlink, Trash2, AlertTriangle,
@@ -392,6 +393,9 @@ export function SettingsPanel() {
             </CardContent>
           )}
         </Card>
+
+        {/* ── AI models & keys (v22) ── */}
+        <AiModelsCard />
 
         {/* ── appearance ── */}
         <Card className="border-border bg-card">

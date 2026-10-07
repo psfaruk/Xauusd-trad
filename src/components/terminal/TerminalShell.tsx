@@ -26,6 +26,7 @@ import { AutoSignalsView } from "./AutoSignalsView";
 import { SettingsPanel } from "./SettingsPanel";
 import { StatusBar } from "./StatusBar";
 import { LoginGate } from "./LoginGate";
+import { ChatDock } from "./ChatDock";
 
 interface Props {
   analysis: AnalysisResponse | null;
@@ -108,6 +109,8 @@ export default function TerminalShell({
           <TabBody {...chartProps} />
         </main>
         {isDesktop ? <StatusBar /> : <MobileNav />}
+        {/* v22 — the AI chat box rides above every tab */}
+        <ChatDock />
       </div>
     </>
   );

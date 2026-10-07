@@ -23,7 +23,7 @@ export type ToolId =
 
 export type MainTab = "home" | "chart" | "auto" | "settings";
 export type ChartView = "price" | "flow" | "xray";
-export type AutoView = "board" | "brain" | "signals" | "backtest";
+export type AutoView = "board" | "tower" | "brain" | "signals" | "backtest";
 /** v21.0 — the CLEAN layer set. The old set (zones / momentum / narrative /
  *  ai levels) fed the 19-kind auto-ink pipeline the user called
  * "এলোমেলো" — that pipeline is deleted; what remains is exactly what a
@@ -99,7 +99,7 @@ const savedAutoView = (): AutoView => {
   if (typeof window === "undefined") return "board";
   try {
     const v = localStorage.getItem("aurum-auto-view") as AutoView | null;
-    if (v === "board" || v === "brain" || v === "signals" || v === "backtest") return v;
+    if (v === "board" || v === "tower" || v === "brain" || v === "signals" || v === "backtest") return v;
   } catch {}
   return "board";
 };

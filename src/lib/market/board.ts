@@ -33,6 +33,9 @@ import {
   detectStructure, detectOrderBlocks, detectFvg, detectSupplyDemand,
   premiumDiscount, type Zone, type StructureRead,
 } from "./smc";
+import { detectPatterns } from "./patterns";
+import { modelById } from "@/lib/ai/registry";
+import { chatComplete, getAiSettings } from "@/lib/ai/llm";
 
 // ── helpers ────────────────────────────────────────────────────────────────
 
@@ -76,6 +79,8 @@ export function buildBoardContext(
     balance: number | null;
     engineSignal: { direction: string; trigger: string; entry: number; sl: number; tp: number } | null;
     recentBoard: string[]; // last outcomes, e.g. "won +0.8%"
+    /** v22 — live web headlines from the Control Tower's news radar */
+    newsHeadlines?: string[];
   },
 ): BoardContext {
   const bars = (barsByTf[tf] ?? []).filter((b) => !b.f);
@@ -150,6 +155,21 @@ export function buildBoardContext(
     [b.o, b.h, b.l, b.c].map((v) => Number(v.toFixed(Math.min(3, digits + 1)))),
   );
 
+  // v22 — classic chart patterns (double top/bottom, H&S, flags, triangles…)
+  // on the active window: the deterministic pattern engine's best 2 reads.
+  const pats = win.length >= 60 ? detectPatterns(win.slice(-160)) : [];
+  const scored = [...pats].sort((a, b) => {
+    const confirmed = (p: typeof a) => (p.state === "confirmed" ? 1 : 0);
+    return confirmed(b) - confirmed(a);
+  }).slice(0, 2);
+  const chartPatterns = scored.map((p) => ({
+    name: p.name, state: p.state, dir: p.dir,
+    entry: Number(p.entry.price.toFixed(digits)),
+    sl: Number(p.sl.toFixed(digits)),
+    target: Number(p.target.toFixed(digits)),
+    rr: p.rr == null ? null : Number(p.rr.toFixed(2)),
+  }));
+
   const lastEvent = structure?.events?.[structure.events.length - 1] ?? null;
   const session = lastBar ? sessionOf(lastBar.t + tfSec / 2) : "off";
 
@@ -200,6 +220,8 @@ export function buildBoardContext(
       ? { state: pd.state, equilibrium: Number(pd.eq.toFixed(digits)) }
       : null,
     recentBarsOHLC: recentBars,
+    chartPatterns: chartPatterns.length ? chartPatterns : "none active",
+    newsHeadlines: extras.newsHeadlines?.length ? extras.newsHeadlines.slice(0, 6) : "no live headlines",
     engineSignal: extras.engineSignal,
     recentBoardResults: extras.recentBoard,
     account: extras.balance != null ? { balance: Number(extras.balance.toFixed(2)) } : null,
@@ -239,18 +261,27 @@ interface AgentPersona {
   roleEn: string;
   roleBn: string;
   model: string;
+  /** badge suffix, e.g. "MTF" — the runtime model label prefixes it */
+  suffix: string;
   system: string;
 }
 
 const JSON_RULE =
   'Respond ONLY with valid JSON, no markdown fences: {"vote":"BUY"|"SELL"|"HOLD","confidence":<0-100 integer>,"note":"<Bengali, ≤ 18 words, trading terms in English>"}';
 
+/** v22 — badge for the model actually answering this agent's call. */
+function agentBadge(persona: AgentPersona, modelId: string | undefined): string {
+  const m = modelId ? modelById(modelId) : null;
+  return `${m ? m.label : "GLM-4.6"} · ${persona.suffix}`;
+}
+
 export const AGENT_PERSONAS: AgentPersona[] = [
   {
     id: "trend",
     roleEn: "Trend & Indicators Analyst",
     roleBn: "ট্রেন্ড ও ইন্ডিকেটর বিশ্লেষক",
-    model: "GLM-4 · MTF",
+    model: "GLM-4.6 · MTF",
+    suffix: "MTF",
     system:
       "You are AGENT 1 — Trend & Indicators Analyst on a 6-member AI trading board (XAUUSD, MetaTrader 5). " +
       "Your ONLY job: read the MULTI-TIMEFRAME trend and momentum — EMA20 vs EMA50, RSI14, MACD histogram, ADX strength, and the active/H1/H4 structure trend. " +
@@ -262,7 +293,8 @@ export const AGENT_PERSONAS: AgentPersona[] = [
     id: "smc",
     roleEn: "SMC & Price Action Specialist",
     roleBn: "SMC ও প্রাইস অ্যাকশন বিশেষজ্ঞ",
-    model: "GLM-4 · SMC",
+    model: "GLM-4.6 · SMC",
+    suffix: "SMC",
     system:
       "You are AGENT 2 — Smart Money Concepts & Price Action Specialist on a 6-member AI trading board (XAUUSD). " +
       "Your ONLY job: read the institutional map — Order Blocks, Fair Value Gaps, fresh supply/demand zones, premium vs discount, liquidity (swing pools), and the last BOS/CHoCH. " +
@@ -273,7 +305,8 @@ export const AGENT_PERSONAS: AgentPersona[] = [
     id: "risk",
     roleEn: "Risk & Money Manager",
     roleBn: "রিস্ক ও মানি ম্যানেজার",
-    model: "GLM-4 · Math",
+    model: "GLM-4.6 · Math",
+    suffix: "Math",
     system:
       "You are AGENT 3 — Risk & Money Manager on a 6-member AI trading board (XAUUSD). " +
       "Your ONLY job: decide whether a TRADEABLE GEOMETRY exists right now. Using the zones, levels, ATR and spread in the context: a valid long = entry at/near a demand zone or support, SL below the zone low (not inside it), TP at the next resistance with reward ≥ 2× risk; a valid short is the mirror. " +
@@ -284,7 +317,8 @@ export const AGENT_PERSONAS: AgentPersona[] = [
     id: "skeptic",
     roleEn: "Risk Auditor (The Skeptic)",
     roleBn: "রিস্ক অডিটর (সংশয়বাদী)",
-    model: "GLM-4 · Devil's Advocate",
+    model: "GLM-4.6 · Devil's Advocate",
+    suffix: "Devil's Advocate",
     system:
       "You are AGENT 4 — Risk Auditor, THE SKEPTIC on a 6-member AI trading board (XAUUSD). " +
       "Your job: argue AGAINST the trade the other agents will want. Look for: liquidity traps and fakeouts (a sweep right before the current price), ranging markets disguised as trends, zones already half-mitigated, sessions where stops get hunted, and overextended moves far from EMA20 likely to mean-revert. " +
@@ -295,10 +329,11 @@ export const AGENT_PERSONAS: AgentPersona[] = [
     id: "volatility",
     roleEn: "Volatility & News Filter",
     roleBn: "ভোলাটিলিটি ও নিউজ ফিল্টার",
-    model: "GLM-4 · Regime",
+    model: "GLM-4.6 · Regime",
+    suffix: "Regime",
     system:
       "You are AGENT 5 — Volatility & News Filter on a 6-member AI trading board (XAUUSD). " +
-      "Your ONLY job: is NOW safe to trade? Check: ATR vs recent bars (volatility explosion?), spread vs the ATR (cost regime), the session (London/NY killzones are tradeable; dead Tokyo/off hours are not), and known high-impact news windows around this time (CPI, NFP, FOMC — XAUUSD reacts violently). " +
+      "Your ONLY job: is NOW safe to trade? Check: ATR vs recent bars (volatility explosion?), spread vs the ATR (cost regime), the session (London/NY killzones are tradeable; dead Tokyo/off hours are not), and the LIVE news headlines provided in the context (newsHeadlines — real web results; look for CPI, NFP, FOMC, Fed, rates, geopolitical flashes). " +
       "Dangerous regime (news window, extreme volatility, wide spread, dead session) → HOLD regardless of direction. Safe regime → vote with the session's typical behavior. " +
       JSON_RULE,
   },
@@ -308,7 +343,8 @@ const CTO_PERSONA: AgentPersona = {
   id: "cto",
   roleEn: "Chief Trading Officer",
   roleBn: "চিফ ট্রেডিং অফিসার",
-  model: "GLM-4 · Consensus",
+  model: "GLM-4.6 · Consensus",
+  suffix: "Consensus",
   system:
     "You are AGENT 6 — the CHIEF TRADING OFFICER, final authority of a 6-member AI trading board (XAUUSD, MetaTrader 5). " +
     "Five agents voted with reasons. Weigh them: trend+SMC alignment matters most; the Skeptic's warning can veto a marginal setup; the Volatility filter can veto ANY entry; the Risk manager's geometry is mandatory. " +
@@ -333,26 +369,30 @@ async function llmJson(
   system: string,
   user: string,
   timeoutMs: number,
-): Promise<LlmResult> {
-  try {
-    const ZAI = (await import("z-ai-web-dev-sdk")).default;
-    const zai = await ZAI.create();
-    const call = zai.chat.completions.create({
-      messages: [
-        { role: "system", content: system },
-        { role: "user", content: user },
-      ],
-      thinking: { type: "disabled" },
-    });
-    const completion = (await Promise.race([
-      call,
-      new Promise<never>((_, rej) => setTimeout(() => rej(new Error("agent timeout")), timeoutMs)),
-    ])) as { choices?: { message?: { content?: string } }[] };
-    const raw = completion.choices?.[0]?.message?.content ?? "";
-    return { ok: raw.trim().length > 0, raw };
-  } catch {
-    return { ok: false, raw: "" };
+  modelId?: string,
+): Promise<LlmResult & { usedModelId: string }> {
+  // v22 — routed through the multi-provider gateway (GLM / DeepSeek /
+  // Qwen / Kimi). When the assigned model's provider key is missing, the
+  // call silently falls back to the ALWAYS-ON built-in GLM — an agent
+  // never goes LOCAL just because a key was removed; only a real provider
+  // failure does that.
+  let useId = modelId ?? "glm-4.6";
+  const assigned = modelById(useId);
+  if (assigned && assigned.provider !== "builtin") {
+    const s = await getAiSettings();
+    if (!s.keys[assigned.provider]) useId = "glm-4.6";
   }
+  const res = await chatComplete({
+    modelId: useId,
+    messages: [
+      { role: "system", content: system },
+      { role: "user", content: user },
+    ],
+    timeoutMs,
+    temperature: 0.3,
+    maxTokens: 700,
+  });
+  return { ok: res.ok, raw: res.ok ? res.content : "", usedModelId: useId };
 }
 
 function parseAgentJson(raw: string): { vote: "BUY" | "SELL" | "HOLD"; confidence: number; note: string } | null {
@@ -664,7 +704,13 @@ export interface MeetingResult {
   context: BoardContext;
 }
 
-export async function runBoardMeeting(ctx: BoardContext, symbol: string, balance: number | null): Promise<MeetingResult> {
+export async function runBoardMeeting(
+  ctx: BoardContext,
+  symbol: string,
+  balance: number | null,
+  /** v22 — per-agent model ids from Settings → AI Models (defaults to GLM) */
+  models?: Record<string, string>,
+): Promise<MeetingResult> {
   const contextJson = JSON.stringify(ctx.json);
   const userMsg = `Live market snapshot (JSON):\n${contextJson}\n\nCast your vote now.`;
   const ctoUser = (agents: BoardAgentOut[]) =>
@@ -683,29 +729,36 @@ export async function runBoardMeeting(ctx: BoardContext, symbol: string, balance
   const analysts: BoardAgentOut[] = [];
   for (let i = 0; i < AGENT_PERSONAS.length; i++) {
     const persona = AGENT_PERSONAS[i];
+    const modelId = models?.[persona.id];
+    let usedModelId = modelId;
     let parsed: ReturnType<typeof parseAgentJson> = null;
     for (let attempt = 0; attempt < 2 && !parsed; attempt++) {
       // 429 backoff — the provider's quota needs a real pause, not a blink
       if (attempt > 0) await new Promise((r) => setTimeout(r, 1_800));
-      const res = await llmJson(persona.system, userMsg, 25_000);
+      const res = await llmJson(persona.system, userMsg, 25_000, modelId);
+      usedModelId = res.usedModelId;
       parsed = res.ok ? parseAgentJson(res.raw) : null;
     }
     if (parsed) {
       analysts.push({
-        id: persona.id, roleEn: persona.roleEn, roleBn: persona.roleBn, model: persona.model,
+        id: persona.id, roleEn: persona.roleEn, roleBn: persona.roleBn,
+        model: agentBadge(persona, usedModelId),
         vote: parsed.vote, confidence: parsed.confidence, note: parsed.note,
       });
     } else {
       degraded = true;
-      analysts.push(localFb[i]);
+      analysts.push({ ...localFb[i], model: agentBadge(persona, usedModelId) });
     }
   }
 
   // ── the CTO (one retry — the final word deserves it) ──
+  const ctoModelId = models?.cto;
+  let ctoUsedModelId = ctoModelId;
   let ctoParsed: ReturnType<typeof parseCto> = null;
   for (let attempt = 0; attempt < 2 && !ctoParsed; attempt++) {
     if (attempt > 0) await new Promise((r) => setTimeout(r, 1_800));
-    const ctoRes = await llmJson(CTO_PERSONA.system, ctoUser(analysts), 30_000);
+    const ctoRes = await llmJson(CTO_PERSONA.system, ctoUser(analysts), 30_000, ctoModelId);
+    ctoUsedModelId = ctoRes.usedModelId;
     ctoParsed = ctoRes.ok ? parseCto(ctoRes.raw) : null;
   }
   let action: "BUY" | "SELL" | "HOLD" = "HOLD";
@@ -736,7 +789,8 @@ export async function runBoardMeeting(ctx: BoardContext, symbol: string, balance
   }
 
   const ctoAgent: BoardAgentOut = {
-    id: "cto", roleEn: CTO_PERSONA.roleEn, roleBn: CTO_PERSONA.roleBn, model: CTO_PERSONA.model,
+    id: "cto", roleEn: CTO_PERSONA.roleEn, roleBn: CTO_PERSONA.roleBn,
+    model: agentBadge(CTO_PERSONA, ctoUsedModelId),
     vote: action,
     confidence: consensus,
     note: reasoning || (action === "HOLD" ? "কনসেনসাস অনুপস্থিত — HOLD।" : "চূড়ান্ত সিদ্ধান্ত জারি হলো।"),
@@ -760,6 +814,19 @@ export async function runBoardMeeting(ctx: BoardContext, symbol: string, balance
   };
 
   return { agents: [...analysts, ctoAgent], decision, degraded, context: ctx };
+}
+
+// ── deterministic local read (exported for the Control Tower's MTF grid) ─────
+
+/** the board's local brain, no LLM: weighted analyst votes + zone geometry.
+ *  The Tower uses it to keep every timeframe's bias fresh between meetings. */
+export function localBoardRead(ctx: BoardContext): {
+  bias: "BUY" | "SELL" | "HOLD";
+  consensus: number;
+} {
+  const votes = localAgents(ctx);
+  const fb = localCtoDecision(ctx, votes);
+  return { bias: fb.cto.action, consensus: fb.cto.consensus };
 }
 
 // ── outcome tracking (the board's own win/loss record) ─────────────────────

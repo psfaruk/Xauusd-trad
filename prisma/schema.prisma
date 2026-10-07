@@ -67,6 +67,20 @@ model AppSetting {
   value String
 }
 
+/// v22.0 — AI Chat messages (one thread per symbol). The assistant replies
+/// through the multi-provider gateway (GLM / DeepSeek / Qwen / Kimi) with the
+/// live market context injected; history survives reloads.
+model ChatMessage {
+  id        String   @id @default(uuid())
+  threadId  String // symbol-based thread, e.g. "XAUUSDm"
+  role      String // user | assistant
+  content   String
+  model     String // model id that produced/received this message
+  createdAt DateTime @default(now())
+
+  @@index([threadId, createdAt])
+}
+
 /// v21.0 — one row per AI Board meeting (6-agent roundtable decision).
 model BoardSession {
   id        String   @id @default(uuid())

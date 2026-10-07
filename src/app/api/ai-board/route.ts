@@ -4,6 +4,8 @@ import { svcHeaders, spreadFor, MT5_URL } from "@/lib/svc";
 import {
   buildBoardContext, runBoardMeeting, resolveOutcome, type OpenLike,
 } from "@/lib/market/board";
+import { getAiSettings } from "@/lib/ai/llm";
+import { getNewsRadar } from "@/lib/ai/tower";
 import type { BoardResponse, BoardSessionPayload, Candle } from "@/lib/market/types";
 
 /**
@@ -244,15 +246,23 @@ export async function POST(req: Request) {
         (r) => `${r.status} ${r.resultPct != null ? `${r.resultPct >= 0 ? "+" : ""}${r.resultPct.toFixed(2)}%` : ""}`.trim(),
       );
 
+      // v22 — the models each agent runs on (Settings → AI Models) + the
+      // news radar's live headlines (the Volatility agent's context)
+      const [aiSettings, newsRadar] = await Promise.all([
+        getAiSettings(),
+        getNewsRadar(symbol).catch(() => null),
+      ]);
+
       const ctx = buildBoardContext(symbol, tf, barsByTf, spread, digits, {
         balance,
         engineSignal: lastSig
           ? { direction: lastSig.direction, trigger: lastSig.trigger, entry: lastSig.entry, sl: lastSig.sl, tp: lastSig.tp }
           : null,
         recentBoard,
+        newsHeadlines: newsRadar?.headlines ?? [],
       });
 
-      const result = await runBoardMeeting(ctx, symbol, balance);
+      const result = await runBoardMeeting(ctx, symbol, balance, aiSettings.boardModels);
       lastMeetingAt = Date.now();
 
       const row = await db.boardSession.create({
