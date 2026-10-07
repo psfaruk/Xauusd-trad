@@ -66,3 +66,29 @@ model AppSetting {
   key   String @id
   value String
 }
+
+/// v21.0 — one row per AI Board meeting (6-agent roundtable decision).
+model BoardSession {
+  id        String   @id @default(uuid())
+  symbol    String
+  timeframe String
+  action    String // BUY | SELL | HOLD
+  entry     Float?
+  sl        Float?
+  tp        Float?
+  tp2       Float?
+  rr        Float?
+  lot       Float?
+  consensus Int      @default(0) // 0..100
+  agents    String // JSON: the 6 agent outputs (votes, notes, confidence)
+  drawings  String // JSON: deterministic chart geometry (OB box, trendline)
+  context   String // JSON: the market snapshot the board saw
+  barTime   Int
+  status    String   @default("open") // open | won | lost | expired
+  resultPct Float? // close-to-close outcome %, set when resolved
+  degraded  Boolean  @default(false) // LLM unavailable → local fallback
+  createdAt DateTime @default(now())
+  closedAt  DateTime?
+
+  @@index([symbol, timeframe, createdAt])
+}

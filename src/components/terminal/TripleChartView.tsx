@@ -35,8 +35,8 @@ import { X } from "lucide-react";
 
 /** every ink layer OFF — only candles + ghost volume remain */
 const BARE_LAYERS: Layers = {
-  ema: false, killzones: false, zones: false, levels: false,
-  structure: false, momentum: false, volume: true, setup: false, signals: false, ai: false,
+  ema: false, killzones: false, structure: false, levels: false,
+  volume: true, setup: false, signals: false,
 };
 
 function fmtCompact(v: number) {
@@ -165,7 +165,7 @@ export default function TripleChartView({ onExit, headerRight }: Props) {
             layers={BARE_LAYERS}
             tool="cursor"
             onToolDone={() => {}}
-            autoDrawings={[]}
+            board={null}
             signals={[]}
             selectedSignalId={null}
             userDrawings={[]}

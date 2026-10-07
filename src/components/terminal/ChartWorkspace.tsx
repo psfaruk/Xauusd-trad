@@ -2,17 +2,17 @@
 
 /** ChartWorkspace — the CHART tab: three chart folders in one place.
  *
- *    Price — full candlestick chart + drawing tools + layers + AI read
+ *    Price — full candlestick chart + drawing tools + layers + AI Board ink
  *    Flow  — the combined trio view (area 30% · Micro Δ 30% · candles 40%)
  *    X-Ray — the running-candle order-flow panel (full)
  *
- *  One header strip (view toggle · timeframe · layers · drawings · AI read),
+ *  One header strip (view toggle · timeframe · layers · drawings),
  *  identical on mobile and desktop — nothing hidden, nothing duplicated.
  */
 
 import { useState } from "react";
-import type { AnalysisResponse, UserDrawing } from "@/lib/market/types";
-import type { Layers, ToolId } from "@/hooks/useTerminal";
+import type { AnalysisResponse, BoardSessionPayload, UserDrawing } from "@/lib/market/types";
+import type { ToolId } from "@/hooks/useTerminal";
 import { useTerminal } from "@/hooks/useTerminal";
 import { useStatus, useSymbolList } from "@/hooks/useFeed";
 import { useI18n } from "@/lib/i18n";
@@ -22,7 +22,7 @@ import TripleChartView from "./TripleChartView";
 import { DrawingToolbar } from "./DrawingToolbar";
 import { TimeframeBar, ChartViewToggle } from "./TimeframeBar";
 import { FlowPanel } from "./FlowPanel";
-import { LayersPopover, InkFiltersPopover } from "./TopBar";
+import { LayersPopover } from "./TopBar";
 import { Button } from "@/components/ui/button";
 import {
   Sheet,
@@ -41,6 +41,8 @@ import { PencilRuler, X, Sparkles, Unplug, Settings } from "lucide-react";
 
 interface Props {
   analysis: AnalysisResponse | null;
+  /** the AI Board's latest decision for the active symbol+tf — the hero ink */
+  board: BoardSessionPayload | null;
   userDrawings: UserDrawing[];
   onCreateDrawing: (d: Omit<UserDrawing, "id" | "createdAt">) => void;
   onUpdateDrawing: (id: string, points: UserDrawing["points"], style: UserDrawing["style"]) => void;
@@ -51,6 +53,7 @@ interface Props {
 
 export function ChartWorkspace({
   analysis,
+  board,
   userDrawings,
   onCreateDrawing,
   onUpdateDrawing,
@@ -58,7 +61,7 @@ export function ChartWorkspace({
   onClearDrawings,
   mobile = false,
 }: Props) {
-  const { symbol, timeframe, chartView, tool, setTool, setMainTab, layers, ink, selectedSignalId } = useTerminal();
+  const { symbol, timeframe, chartView, tool, setTool, setMainTab, layers, selectedSignalId } = useTerminal();
   const symbols = useSymbolList();
   const status = useStatus();
   const { t } = useI18n();
@@ -89,10 +92,9 @@ export function ChartWorkspace({
       timeframe={timeframe}
       digits={digits}
       layers={layers}
-      inkFilters={ink}
       tool={tool}
       onToolDone={() => setTool("cursor")}
-      autoDrawings={analysis?.drawings ?? []}
+      board={board}
       signals={signals}
       selectedSignalId={selectedSignalId}
       userDrawings={userDrawings}
@@ -131,7 +133,6 @@ export function ChartWorkspace({
         {/* layers & drawings belong to the price chart only — the trio and
             X-ray views render their charts BARE (no drawing overlays) */}
         {isPrice && <LayersPopover />}
-        {isPrice && <InkFiltersPopover />}
         {isPrice && (
           <Sheet open={sheetOpen} onOpenChange={setSheetOpen}>
             <SheetTrigger asChild>

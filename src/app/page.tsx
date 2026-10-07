@@ -14,7 +14,7 @@ import { toast } from "@/hooks/use-toast";
 import TerminalShell from "@/components/terminal/TerminalShell";
 import { useTerminal } from "@/hooks/useTerminal";
 import { useBars, useQuote, useFeedAnalysisResync } from "@/hooks/useFeed";
-import type { AnalysisResponse, UserDrawing } from "@/lib/market/types";
+import type { AnalysisResponse, BoardResponse, UserDrawing } from "@/lib/market/types";
 
 async function fetchAnalysis(symbol: string, tf: string): Promise<AnalysisResponse> {
   const res = await fetch(`/api/analysis?symbol=${encodeURIComponent(symbol)}&tf=${tf}`);
@@ -27,6 +27,15 @@ async function fetchDrawings(symbol: string, tf: string): Promise<UserDrawing[]>
   if (!res.ok) return [];
   const data = await res.json();
   return data.drawings ?? [];
+}
+
+/** v21 — the AI Board's latest decision (drives the chart's hero ink and
+ *  the Board panel). The BoardPanel's “run meeting” POST invalidates this
+ *  same key, so every consumer updates together. */
+async function fetchBoard(symbol: string, tf: string): Promise<BoardResponse> {
+  const res = await fetch(`/api/ai-board?symbol=${encodeURIComponent(symbol)}&tf=${tf}`);
+  if (!res.ok) throw new Error(`board ${res.status}`);
+  return res.json();
 }
 
 export default function Home() {
@@ -64,6 +73,17 @@ export default function Home() {
     void qc.invalidateQueries({ queryKey: ["analysis", symbol, timeframe] });
   }, [bid, qc, symbol, timeframe]);
 
+  // v21 — the AI Board decision for the hero chart ink + the Board panel.
+  // Light 25s poll; a new bar close (below) and every run-meeting POST
+  // invalidate it immediately.
+  const boardQ = useQuery({
+    queryKey: ["board", symbol, timeframe],
+    queryFn: () => fetchBoard(symbol, timeframe),
+    refetchInterval: 25_000,
+    retry: 1,
+    staleTime: 10_000,
+  });
+
   // ── real-time per-timeframe analysis: every time a bar of the ACTIVE
   // symbol+tf closes (a new bar opens), refetch the engine immediately so
   // signals/roadmap/drawings follow the market, not the 15s poll.
@@ -80,6 +100,7 @@ export default function Home() {
     if (Date.now() - lastFetchRef.current < 5_000) return;
     lastFetchRef.current = Date.now();
     void qc.invalidateQueries({ queryKey: ["analysis", symbol, timeframe] });
+    void qc.invalidateQueries({ queryKey: ["board", symbol, timeframe] });
   }, [bars, qc, symbol, timeframe]);
 
   // user drawings for this symbol|tf
@@ -159,6 +180,7 @@ export default function Home() {
     <TerminalShell
       analysis={analysisQ.data ?? null}
       analysisError={analysisQ.isError}
+      board={boardQ.data?.latest ?? null}
       userDrawings={userDrawings}
       onCreateDrawing={onCreateDrawing}
       onUpdateDrawing={onUpdateDrawing}

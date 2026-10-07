@@ -4,13 +4,9 @@ import { evaluate } from "@/lib/market/engine";
 import { expiryBarsFor } from "@/lib/market/engine";
 import { seedSignals } from "@/lib/market/seed";
 import { atr } from "@/lib/market/indicators";
-import { buildDrawings, magnetsToDrawings, projectSetup, localBias, buildPhaseDrawings, buildMtfStructureDrawings, buildForecastDrawing, buildMomentumDrawing } from "@/lib/market/drawings";
-import { clusterLevels } from "@/lib/market/cluster";
-import { detectKeyLevels } from "@/lib/market/levels";
+import { projectSetup, localBias } from "@/lib/market/projection";
 import { buildRoadmap } from "@/lib/market/roadmap";
 import { detectStructure, detectSupplyDemand, detectOrderBlocks, detectFvg, detectLiquidity } from "@/lib/market/smc";
-import { detectConsolidations, detectAmdPhases, detectInstitutionalActivity } from "@/lib/market/phases";
-import { detectPatterns } from "@/lib/market/patterns";
 import { detectCandlePatterns, backtestCandles } from "@/lib/market/candlesticks";
 import type { AnalysisResponse, Candle, SignalPayload, TfSetup } from "@/lib/market/types";
 import { svcHeaders, getBrokerOffsetSec, spreadFor, MT5_URL } from "@/lib/svc";
@@ -506,26 +502,6 @@ export async function GET(req: Request) {
   const activeSignal = signals.find((s) => s.status === "active" || s.status === "pending") ?? null;
   const liveSignal = activeSignal ?? result.signal;
 
-  // ── v16.5 market phases: consolidation ranges / AMD sequences /
-  //    institutional footprints — on the ACTIVE tf's closed bars (walk-forward
-  //    safe, no look-ahead; refreshes on every poll/bar close = real-time) ──
-  const ranges = detectConsolidations(closedBars);
-  const amd = detectAmdPhases(closedBars, ranges);
-  const { marks, volSpikes } = detectInstitutionalActivity(closedBars);
-
-  // ── HTF context (H1 + H4): zones, structure events and the freshest
-  //    consolidation range per tf — every drawing source-labeled (§2.6) ──
-  const h1Closed = bars.H1?.length ? bars.H1.filter((b) => !b.f).slice(-240) : [];
-  const h4Closed = bars.H4?.length ? bars.H4.filter((b) => !b.f).slice(-240) : [];
-  const htfZoneGroups = [
-    { tf: "H1", zones: h1Closed.length ? detectSupplyDemand(h1Closed) : [] },
-    { tf: "H4", zones: h4Closed.length ? detectSupplyDemand(h4Closed) : [] },
-  ];
-  const h1Read = h1Closed.length >= 30 ? detectStructure(bars.H1!.filter((b) => !b.f).slice(-300)) : null;
-  const h4Read = h4Closed.length >= 30 ? detectStructure(bars.H4!.filter((b) => !b.f).slice(-300)) : null;
-  const h1Ranges = h1Closed.length ? detectConsolidations(h1Closed) : [];
-  const h4Ranges = h4Closed.length ? detectConsolidations(h4Closed) : [];
-
   // no live signal → the planned NEXT entry (entry/SL/TP projection) so the
   // chart always answers: কোন প্রাইসে এন্ট্রি / SL / TARGET
   const projection = !liveSignal
@@ -635,119 +611,15 @@ export async function GET(req: Request) {
       });
     }
   }
-  const drawings = [
-    ...buildDrawings(
-      closedBars,
-      tf,
-      {
-        structure: result.context.structure,
-        pools: result.context.pools,
-        zones: result.context.zones,
-        signal: liveSignal,
-        projection,
-      },
-      htfZoneGroups,
-      volSpikes,
-    ),
-    ...buildPhaseDrawings(
-      tf,
-      { ranges, amd, instit: marks },
-      [
-        { tf: "H1", range: h1Ranges[h1Ranges.length - 1] ?? null },
-        { tf: "H4", range: h4Ranges[h4Ranges.length - 1] ?? null },
-      ],
-    ),
-    ...buildMtfStructureDrawings({ h1: h1Read, h4: h4Read }),
-    ...magnetsToDrawings(roadmap.magnets),
-  ];
-  // ── v16.6 — the classic chart-pattern layer (ref-repo D-072 recipe):
-  //    triangles / wedges / flags / H&S / double-triple tops with the full
-  //    measured-move trade plan (ENTRY/SL/TARGET + RR) — the chart's answer
-  //    to "reversal হলে কত দূর যাবে / continue করলে কত দূর যাবে". Active TF
-  //    always; H1 joins as source-labeled MTF context when it isn't the
-  //    active tf (audit §2.6: every drawing says where it came from). ──
-  for (const p of detectPatterns(closedBars)) {
-    drawings.push({ ...p, source_tf: tf });
-  }
-  if (tf !== "H1" && h1Closed.length >= 60) {
-    for (const p of detectPatterns(h1Closed).slice(0, 1)) {
-      drawings.push({ ...p, source_tf: "H1" });
-    }
-  }
-  // v19.0 — the CANDLESTICK STRATEGY layer (user spec: any timeframe, any
-  //    candle count 1–5, any market position — what's the logic, which way
-  //    does the market go): the full 34-setup engine runs on the active
-  //    tf's closed bars. Every detection carries its market context
-  //    (approach leg, S/R, structure, RSI, volume), bilingual WHY logic,
-  //    a priced entry/SL/TP plan and a status resolved against the bars
-  //    that followed — and the same window runs the walk-forward backtest
-  //    so the panel badges quote the symbol's OWN history, not theory.
+  // v21.0 — the auto-drawing pipeline is DELETED (the chart's ink is now
+  // the AI Board decision + client-side structure: see board.ts, ink.ts,
+  // overlay-clean.ts). The payload keeps signals/roadmap/setups/candles.
+  //
+  // v19.0 — the CANDLESTICK STRATEGY read still runs (the Signals panel and
+  // the live-signal confluence quote it); only its chart boxes are gone.
   const candleRead = detectCandlePatterns(closedBars, tf);
-  for (const c of candleRead.drawings) {
-    drawings.push(c);
-  }
   const candleStats = backtestCandles(closedBars);
-  // v16.5: the forward map — projected legs to the roadmap's real targets
-  // (supersedes the old single-arrow path drawing)
-  const forecast = buildForecastDrawing(roadmap, price, digits);
-  if (forecast) drawings.push(forecast);
-  // v16.7: every OTHER timeframe's price-anchored setup rides along as thin
-  // TF-tagged rails (the active tf keeps its hero setup box — no duplicate)
-  for (const s of tfSetups) {
-    if (s.tf === tf) continue;
-    drawings.push({
-      kind: "tf_setup", tf: s.tf, dir: s.dir,
-      entry: s.entry, sl: s.sl, tp: s.tp, rr: s.rr,
-      status: s.kind, source: s.source, reason: s.reason,
-      price: s.price, distAtr: s.distAtr, entryType: s.entryType,
-    });
-  }
-  // v17.1 — MTF S/R KEY LEVELS (user report: "সকল টাইম ফ্রেমে সাপোর্ট এন্ড
-  //    রেসিসটেন্স লেভেল ড্রয়িং হচ্ছে না"): EVERY fed timeframe answers with
-  //    its OWN live swing levels — unbroken swing highs = resistance,
-  //    unbroken swing lows = support, hit-counted, source-tf tagged. H1/H4
-  //    keep 3 per side (the key HTF levels), the fast tfs 2. The clustering
-  //    pass then merges duplicates at the same price into ONE line (×N
-  //    badge) and the ink budget caps how many show — nearest to price first.
-  for (const t of sourceTimeframes) {
-    const closedT = (bars[t] ?? []).filter((b) => !b.f).slice(-260);
-    if (closedT.length < 40) continue;
-    const perSide = t === "H1" || t === "H4" ? 3 : 2;
-    for (const lv of detectKeyLevels(closedT, perSide)) {
-      drawings.push({
-        kind: "hline",
-        price: lv.price,
-        label: "S/R",
-        tone: lv.side === "resistance" ? "bear" : "bull",
-        style: lv.hits >= 2 ? "solid" : "dash",
-        source_tf: t,
-        side: lv.side,
-        hits: lv.hits,
-        t: lv.t,
-      });
-    }
-  }
-  // v17.1 — the momentum + structure ribbon (per-bar velocity strip + the
-  //    two state pills) — the active tf's own read
-  const momentumInk = buildMomentumDrawing(closedBars, tf, result.context.structure.trend);
-  if (momentumInk) drawings.push(momentumInk);
-  // v16.4 (audit §4/§10): data identity + freshness on every payload
   const tfSecMap: Record<string, number> = { M1: 60, M5: 300, M15: 900, M30: 1800, H1: 3600, H4: 14400 };
-  // v17.0 (audit §dedup) — CROSS-SOURCE LEVEL CLUSTERING: all the level
-  // ink (HTF zones, local zones/OB/FVG, liquidity pools, magnets, EQ)
-  // passes through one price/ATR clustering + priority pass. Levels that
-  // agree within 0.22 ATR collapse into their best-tier representative
-  // (HTF key level > fresh OB/FVG > local S/R; pattern confluence credited
-  // in the merge rationale), every drawing gains a stable id, and level
-  // winners gain a distance rank the chart's ink filter caps. The
-  // renderer shows the merge story as an ×N badge + hover tooltip.
-  clusterLevels(drawings, {
-    atr: atrNow,
-    price,
-    activeTf: tf,
-    lastBarT: lastClosedT,
-    tfSec: tfSecMap[tf] ?? 900,
-  });
   const lastCandleTime = lastClosedT;
   const ageSec = Math.max(0, Math.round(Date.now() / 1000 - lastCandleTime) - (tfSecMap[tf] ?? 900));
   const dataFreshness = {
@@ -797,7 +669,6 @@ export async function GET(req: Request) {
     nextSetup: projection,
     tfSetups,
     nearMiss: result.nearMiss,
-    drawings,
     candles: candleRead.patterns,
     candleBacktest: candleStats,
     roadmap,

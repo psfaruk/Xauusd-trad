@@ -1,24 +1,23 @@
-"use client";
-
 /**
  * TradingChart — MT5-style candlestick chart.
  *
  * Engine: lightweight-charts v4 (candles + ghosted volume) with a custom
- * canvas overlay. v20.0 REWRITES the drawing layer completely:
+ * canvas overlay. v21.0 REWRITES the drawing layer from scratch:
  *
- *   · inkSelect.ts  — THE BRAIN: every auto-drawing candidate earns its ink
- *     through a context relevance score (proximity to price in ATR, recency,
- *     active state) and competes for a strict per-slot budget. Only what the
- *     chart NEEDS survives ("যখন যেই ড্রয়িং টি chart এ দরকার সেই ড্রয়িং টি
- *     থাকবে") — the old renderer drew up to ~96 candidates across 19 kinds
- *     and the chart read as messy, overlapping, overwritten.
- *   · overlay-render.ts — THE HAND: draws the plan with one label column at
- *     the right edge (vertically nudged — labels can never stack or overlap)
- *     and a consistent line grammar (spine 1.0px · levels 0.9px · trendlines
- *     1.05px + dashed projection · zone borders 0.6px).
+ *   · ink.ts         — the clean ink builder: the chart needs ONLY the
+ *     swing structure (HH/HL/LH/LL + one zigzag), the two key levels
+ *     (nearest R above + S below) and — when one exists — the AI Board's
+ *     fresh decision (entry/SL/TP + OB box + trendline). Nothing else.
+ *     ("যখন যেই ড্রয়িং টি chart এ দরকার সেই ড্রয়িং টি থাকবে")
+ *   · overlay-clean.ts — THE HAND: bold clear lines (ENTRY 2px gold, SL/
+ *     TP colored with risk/reward zone fills), ONE right-edge label
+ *     column that nudges labels apart — nothing overlaps, ever.
  *
- * This file now owns only the CHART plumbing: lifecycle, data, the rAF
- * easing loop, kill-zone bands, the EMA ribbon, user drawings with
+ * The old 19-kind auto-ink pipeline (drawings.ts → inkSelect →
+ * overlay-render) is DELETED — it was the "এলোমেলো / ওভার রাইট" complaint.
+ *
+ * This file owns the CHART plumbing: lifecycle, data, the rAF easing
+ * loop, kill-zone bands, the EMA ribbon, user drawings with
  * hit-test/drag/persist, free zoom, and the crosshair legend.
  */
 
@@ -42,18 +41,17 @@ import {
   type UTCTimestamp,
 } from "lightweight-charts";
 import { useTheme } from "next-themes";
-import { feed, useBars, restUrl } from "@/hooks/useFeed";
+import { feed, useBars } from "@/hooks/useFeed";
 import { useI18n } from "@/lib/i18n";
-import { selectInk } from "@/lib/market/inkSelect";
-import { atr as atrSeries } from "@/lib/market/indicators";
-import { renderInk, type LevelTipBand } from "./overlay-render";
+import { buildCleanInk } from "@/lib/market/ink";
+import { renderClean } from "./overlay-clean";
 import type {
-  AutoDrawing,
+  BoardSessionPayload,
   Candle,
   SignalPayload,
   UserDrawing,
 } from "@/lib/market/types";
-import type { Layers, ToolId, InkFilters } from "@/hooks/useTerminal";
+import type { Layers, ToolId } from "@/hooks/useTerminal";
 import {
   hardText,
   clamp,
@@ -66,34 +64,6 @@ const EASE = 0.22;
 const FOLLOW_SLACK_BARS = 2;
 const RIGHT_PAD = 5;
 
-const DEFAULT_INK: InkFilters = { maxLevels: 4, htf: true, faded: true, merged: false };
-
-/** /api/ai-chart response → AutoDrawing[] — what the AI brain "sees" on
- *  the chart. v20.1: the AI read is a SECOND OPINION — its S/R lines carry
- *  side + source "AI" + touch-counts so they compete in the SAME level
- *  slots as engine levels but are demoted by inkSelect (the engine's own
- *  multi-timeframe structure leads); the value area contributes only the
- *  POC magnet (VAH/VAL were two extra lines saying the same thing). */
-function aiDrawingsFrom(j: {
-  symbol?: string;
-  tf?: string;
-  supports?: { price: number; touches: number }[];
-  resistances?: { price: number; touches: number }[];
-  valueArea?: { poc: number; vah: number; val: number } | null;
-  trade?: { side: string; entry: number; sl: number; tp: number } | null;
-}, digits: number): AutoDrawing[] {
-  const out: AutoDrawing[] = [];
-  for (const s of j.supports ?? []) {
-    out.push({ kind: "hline", price: s.price, tone: "bull", style: "dash", label: "AI S", side: "support", source_tf: "AI", hits: Math.max(1, s.touches) });
-  }
-  for (const r of j.resistances ?? []) {
-    out.push({ kind: "hline", price: r.price, tone: "bear", style: "dash", label: "AI R", side: "resistance", source_tf: "AI", hits: Math.max(1, r.touches) });
-  }
-  if (j.valueArea) {
-    out.push({ kind: "magnet", price: j.valueArea.poc, source: "POC", dist_atr: 0 });
-  }
-  return out;
-}
 
 const TF_SEC: Record<string, number> = {
   M1: 60, M5: 300, M15: 900, M30: 1800,
@@ -120,12 +90,11 @@ interface Props {
   timeframe: string;
   digits: number;
   layers: Layers;
-  /** the ink filters (level budget / HTF / faded / merged) — optional
-   *  so the bare trio charts keep working without them */
-  inkFilters?: InkFilters;
   tool: ToolId;
   onToolDone: () => void;
-  autoDrawings: AutoDrawing[];
+  /** the AI Board's latest decision for this symbol+tf (drives the hero ink:
+   * entry/SL/TP lines + OB box + trendline). Null → structure-only chart. */
+  board: BoardSessionPayload | null;
   signals: SignalPayload[];
   selectedSignalId: string | null;
   userDrawings: UserDrawing[];
@@ -133,7 +102,7 @@ interface Props {
   onUpdateDrawing: (id: string, points: UserDrawing["points"], style: UserDrawing["style"]) => void;
   onDeleteDrawing: (id: string) => void;
   /** BARE mode (the trio's candle section): no on-canvas legend / badges —
-   *  the OHLC legend lives in a strip OUTSIDE the chart (user request) */
+   * the OHLC legend lives in a strip OUTSIDE the chart (user request) */
   bare?: boolean;
 }
 
@@ -148,9 +117,8 @@ interface PendingCreate {
 export default function TradingChart(props: Props) {
   const {
     symbol, timeframe, digits, layers, tool, onToolDone,
-    autoDrawings, signals, selectedSignalId,
+    board, signals, selectedSignalId,
     userDrawings, onCreateDrawing, onUpdateDrawing, onDeleteDrawing,
-    inkFilters,
     bare = false,
   } = props;
 
@@ -165,18 +133,14 @@ export default function TradingChart(props: Props) {
   const volRef = useRef<ISeriesApi<"Histogram"> | null>(null);
 
   const barsRef = useRef<Candle[]>(bars);
-  const autoRef = useRef(autoDrawings);
   const userRef = useRef(userDrawings);
   const layersRef = useRef(layers);
-  const inkRef = useRef<InkFilters>(inkFilters ?? DEFAULT_INK);
   const signalsRef = useRef(signals);
   const toolRef = useRef(tool);
   const bareRef = useRef(bare);
   useEffect(() => { bareRef.current = bare; }, [bare]);
   // AI live chart-read (S/R + value area magnets from the trading brain) —
   // v20: reactive state so the ink plan recomputes when the read lands
-  const [aiDrawings, setAiDrawings] = useState<AutoDrawing[]>([]);
-  const aiRef = useRef<AutoDrawing[]>([]);
 
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const selectedRef = useRef<string | null>(null);
@@ -192,13 +156,6 @@ export default function TradingChart(props: Props) {
   const [textValue, setTextValue] = useState("");
   const hitRef = useRef<Map<string, { pts: { x: number; y: number }[]; rects: { x1: number; y1: number; x2: number; y2: number }[] }>>(new Map());
   const drawOverlayRef = useRef<() => void>(() => {});
-  // merge-rationale tooltip: hover bands registered by the level renderer
-  const tipRef = useRef<LevelTipBand[]>([]);
-  const [tip, setTip] = useState<{
-    key: string; x: number; y: number; vw: number; vh: number;
-    title: string; price: string;
-    sourceTf?: string; mergedFrom?: string[];
-  } | null>(null);
   // free-zoom follow mode (auto-follow the live right edge)
   const [follow, setFollow] = useState(true);
   const followRef = useRef(true);
@@ -209,52 +166,16 @@ export default function TradingChart(props: Props) {
     requestAnimationFrame(() => drawOverlayRef.current());
   }, []);
 
-  // ═══════════════ 0. THE INK PLAN (v20: the context gate) ═══════════════
-  // Every auto-drawing candidate (engine + AI read) earns its ink through
-  // selectInk's relevance scoring; the renderer never decides on its own.
-  const inkPlan = useMemo(() => {
-    const atrVals = atrSeries(bars, 14);
-    const atrNow = atrVals.length ? (atrVals[atrVals.length - 1] ?? 1) : 1;
-    return selectInk({
-      drawings: autoDrawings,
-      aiDrawings: layers.ai ? aiDrawings : [],
-      bars,
-      timeframe,
-      atr: atrNow && Number.isFinite(atrNow) ? atrNow : 1,
-      filters: inkFilters ?? DEFAULT_INK,
-    });
-  }, [autoDrawings, aiDrawings, bars, timeframe, inkFilters, layers.ai]);
-  const planRef = useRef(inkPlan);
-
-  // ── AI live chart read (what the trading brain sees) — refresh every 10s ──
-  // (the chart is keyed by symbol|timeframe upstream — a switch REMOUNTS this
-  // component, so aiDrawings state resets without a sync clear)
-  useEffect(() => {
-    let stop = false;
-    let timer: ReturnType<typeof setTimeout>;
-    const load = async () => {
-      try {
-        const res = await fetch(restUrl(`/api/ai-chart?symbol=${encodeURIComponent(symbol)}&tf=${timeframe}`));
-        if (res.ok) {
-          const j = await res.json();
-          // TWO stale guards: the stop flag kills responses after THIS effect
-          // was torn down (tf switched), and the identity echo catches an
-          // out-of-order landing that survived teardown. A stale read must
-          // never ink the new chart.
-          const isCurrent =
-            (j.symbol === undefined || j.symbol === symbol) &&
-            (j.tf === undefined || j.tf === timeframe);
-          if (!stop && j && !j.error && isCurrent) {
-            setAiDrawings(aiDrawingsFrom(j, digits));
-            scheduleRedraw();
-          }
-        }
-      } catch { /* service briefly away — retry below */ }
-      if (!stop) timer = setTimeout(load, 10_000);
-    };
-    load();
-    return () => { stop = true; clearTimeout(timer); };
-  }, [symbol, timeframe, digits, scheduleRedraw]);
+  // ═══════════════ 0. THE CLEAN INK (v21: less ink, more meaning) ═══════════════
+  // Swing structure + the 2 key levels are computed client-side from the
+  // bars on the chart; the decision ink comes from the AI Board. Nothing
+  // else draws — the chart stays readable at a glance.
+  const cleanInk = useMemo(
+    () => buildCleanInk(bars, timeframe, board),
+    [bars, timeframe, board],
+  );
+  const cleanRef = useRef(cleanInk);
+  const boardRef = useRef(board);
 
   // ═══════════════ 1. chart lifecycle ═══════════════
   useEffect(() => {
@@ -535,22 +456,21 @@ export default function TradingChart(props: Props) {
       ];
       return;
     }
-    // the LIVE setup's numbers on the price scale itself (axis tags,
-    // TradingView-style) — entry / SL / TP always readable
+    // the AI Board decision's numbers on the price scale itself (axis
+    // tags, TradingView-style) — entry / SL / TP always readable
     if (!layers.setup) return;
-    const setup = inkPlan.setup;
-    if (!setup) return;
+    const d = board?.decision;
+    if (!d || d.action === "HOLD" || d.entry == null) return;
     const mk = (price: number, color: string, title: string, dash: LineStyle) =>
       series.createPriceLine({
         price, color, lineWidth: 1, lineStyle: dash,
         axisLabelVisible: true, lineVisible: false, title,
       });
-    priceLinesRef.current = [
-      mk(setup.entry, "#d4af37", `${setup.dir} ${setup.status === "projected" ? "PLAN" : "ENTRY"}`, LineStyle.Dotted),
-      mk(setup.sl, "#f87171", "SL", LineStyle.Dashed),
-      mk(setup.tp, "#34d399", "TP", LineStyle.Dashed),
-    ];
-  }, [selectedSignalId, signals, inkPlan, layers.setup]);
+    const lines: any[] = [mk(d.entry, "#d4af37", `${d.action} ENTRY`, LineStyle.Dotted)];
+    if (d.sl != null) lines.push(mk(d.sl, "#f87171", "SL", LineStyle.Dashed));
+    if (d.tp != null) lines.push(mk(d.tp, "#34d399", "TP", LineStyle.Dashed));
+    priceLinesRef.current = lines;
+  }, [selectedSignalId, signals, board, layers.setup]);
 
   // ═══════════════ 6. EMA ribbon (computed on bars) ═══════════════
   const emaArrays = useMemo(() => {
@@ -566,16 +486,14 @@ export default function TradingChart(props: Props) {
   // post-render ref sync (compiler-safe: refs updated only in effects)
   useEffect(() => {
     barsRef.current = bars;
-    autoRef.current = autoDrawings;
     userRef.current = userDrawings;
     layersRef.current = layers;
-    inkRef.current = inkFilters ?? DEFAULT_INK;
     signalsRef.current = signals;
     toolRef.current = tool;
     selectedRef.current = selectedId;
     emaRef.current = emaArrays;
-    planRef.current = inkPlan;
-    aiRef.current = aiDrawings;
+    cleanRef.current = cleanInk;
+    boardRef.current = board;
   });
 
   // volume layer visibility (histogram series toggle)
@@ -613,9 +531,6 @@ export default function TradingChart(props: Props) {
     const tf = tfSec;
     const axisW = chart.priceScale("right").width() ?? 56;
     const rightEdge = Math.max(60, w - axisW - 2);
-    // narrow-chart ink discipline — on a phone the secondary labels yield so
-    // the primary contracts stay readable
-    const narrow = rightEdge < 520;
     const lastTime = bs[bs.length - 1].t;
     const barSpacing = ts.options().barSpacing ?? 6.5;
 
@@ -685,21 +600,17 @@ export default function TradingChart(props: Props) {
         }
       }
 
-      // ── THE INK PLAN — one draw call, the whole analysis layer ──
-      const out = renderInk(
-        planRef.current,
+      // ── THE CLEAN INK — one draw call: decision + structure + 2 levels ──
+      renderClean(
+        cleanRef.current,
         {
-          ctx, w, h, rightEdge, barSpacing,
-          digits, isDark, narrow,
-          timeframe, tfSec: tf,
-          lastBarT: lastTime,
-          lastPrice: bs[bs.length - 1].c,
+          ctx, w, h, rightEdge,
+          digits, isDark,
           xOfTime, yOfPrice,
           chart,
         },
         layersRef.current,
       );
-      tipRef.current = out.tips;
 
       // ── EMA ribbon ──
       if (layersRef.current.ema) {
@@ -997,7 +908,7 @@ export default function TradingChart(props: Props) {
     scheduleRedraw();
     // ink plan / filter changes re-render the same plumbing — an immediate
     // repaint, no data refetch
-  }, [bars, autoDrawings, aiDrawings, userDrawings, layers, inkFilters, inkPlan, selectedId, signals, emaArrays, symbol, timeframe, drawOverlay, scheduleRedraw]);
+  }, [bars, userDrawings, layers, cleanInk, board, selectedId, signals, emaArrays, symbol, timeframe, drawOverlay, scheduleRedraw]);
 
   // crosshair tracking (for legend) — via ref, no re-render
   const crosshairRef = useRef<{ t: number | null }>({ t: null });
@@ -1278,49 +1189,19 @@ export default function TradingChart(props: Props) {
       if (!tp) return;
       const hit = hitTestUser(tp.x, tp.y);
       setPe(hit ? "auto" : "none");
-      // merge-rationale tooltip: the topmost clustered level band under the
-      // cursor carries the story (what was merged into it)
-      const rect = canvas.getBoundingClientRect();
-      const mx = e.clientX - rect.left;
-      const my = e.clientY - rect.top;
-      let found: LevelTipBand | null = null;
-      const bands = tipRef.current;
-      for (let i = bands.length - 1; i >= 0; i--) {
-        const b = bands[i];
-        if (mx >= b.x1 && mx <= b.x2 && my >= b.y1 && my <= b.y2) {
-          found = b;
-          break;
-        }
-      }
-      if (found) {
-        const f = found;
-        const key = `${f.title}|${f.price}`;
-        const vw = rect.width;
-        const vh = rect.height;
-        setTip((prev) =>
-          prev && prev.key === key
-            ? prev
-            : { key, x: mx, y: my, vw, vh, title: f.title, price: f.price, sourceTf: f.sourceTf, mergedFrom: f.mergedFrom },
-        );
-      } else {
-        setTip((prev) => (prev ? null : prev));
-      }
     };
-    const onHostLeave = () => setTip(null);
 
     canvas.addEventListener("pointerdown", onDown);
     canvas.addEventListener("pointermove", onMove);
     canvas.addEventListener("pointerup", onUp);
     canvas.addEventListener("pointerleave", onLeave);
     host.addEventListener("mousemove", onContainerMove);
-    host.addEventListener("mouseleave", onHostLeave);
     return () => {
       canvas.removeEventListener("pointerdown", onDown);
       canvas.removeEventListener("pointermove", onMove);
       canvas.removeEventListener("pointerup", onUp);
       canvas.removeEventListener("pointerleave", onLeave);
       host.removeEventListener("mousemove", onContainerMove);
-      host.removeEventListener("mouseleave", onHostLeave);
     };
   }, [tool, symbol, timeframe, digits, toTimePrice, hitTestUser, onCreateDrawing, onUpdateDrawing, onToolDone]);
 
@@ -1364,44 +1245,6 @@ export default function TradingChart(props: Props) {
         className="pointer-events-none absolute inset-0 z-10 h-full w-full"
         style={{ touchAction: "none" }}
       />
-
-      {/* MERGE-RATIONALE TOOLTIP: hover a clustered level (×N badge) to see
-          exactly which sources agreed on that price and which one won */}
-      {tip && (
-        <div
-          className="pointer-events-none absolute z-30 w-52 rounded-md border border-border bg-popover/95 p-2 shadow-lg backdrop-blur-sm"
-          style={{
-            left: Math.min(Math.max(tip.x - 216, 4), Math.max(4, tip.vw - 216)),
-            top: Math.min(Math.max(tip.y + 12, 4), Math.max(4, tip.vh - 110)),
-          }}
-          role="tooltip"
-        >
-          <div className="flex items-baseline justify-between gap-2">
-            <span className="truncate text-[10px] font-bold uppercase tracking-wider text-foreground">{tip.title}</span>
-            <span className="tnum shrink-0 font-mono text-[10px] font-bold text-gold">{tip.price}</span>
-          </div>
-          {tip.sourceTf && (
-            <div className="mt-0.5 text-[9px] uppercase tracking-wider text-muted-foreground">
-              source TF · {tip.sourceTf}
-            </div>
-          )}
-          {tip.mergedFrom?.length ? (
-            <div className="mt-1.5 border-t border-border pt-1.5">
-              <div className="text-[8px] font-bold uppercase tracking-wider text-muted-foreground/70">
-                {t("mergedLevels")}
-              </div>
-              <ul className="mt-0.5 space-y-px">
-                {tip.mergedFrom.map((m, i) => (
-                  <li key={i} className="flex items-start gap-1 text-[9px] leading-snug text-muted-foreground">
-                    <span className="mt-px shrink-0 text-gold/80">≡</span>
-                    <span className="truncate">{m}</span>
-                  </li>
-                ))}
-              </ul>
-            </div>
-          ) : null}
-        </div>
-      )}
 
       {/* candle-loading state — shown until the first bars arrive */}
       {!bars.length && (

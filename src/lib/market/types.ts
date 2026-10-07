@@ -688,7 +688,6 @@ export interface AnalysisResponse {
    *  plan. Every entry is price-anchored (≤0.6 ATR from that TF's price). */
   tfSetups: TfSetup[];
   nearMiss: string[];
-  drawings: AutoDrawing[];
   /** v19.0 — the candlestick strategy read for this symbol+tf: every
    *  detected 1–5 candle setup with its WHY logic, direction and priced
    *  plan (newest first). The chart boxes are these same patterns. */
@@ -725,4 +724,87 @@ export interface AnalysisResponse {
    *  stale-but-honest snapshot, not a live read. */
   degraded?: boolean;
   generatedAt: number;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// v21.0 — THE AI BOARD (৬-এজেন্ট রাউন্ডটেবিল)
+// One meeting per candle close: 5 analysts vote in parallel, the Chief
+// Trading Officer synthesizes ONE decision with chart drawing coordinates.
+// ═══════════════════════════════════════════════════════════════════════════
+
+export type BoardAgentId =
+  | "trend" // Agent 1 — Trend & Indicators Analyst
+  | "smc" // Agent 2 — SMC & Price Action Specialist
+  | "risk" // Agent 3 — Risk & Money Manager
+  | "skeptic" // Agent 4 — Risk Auditor (the Skeptic)
+  | "volatility" // Agent 5 — Volatility & News Filter
+  | "cto"; // Agent 6 — Chief Trading Officer (final say)
+
+export interface BoardAgentOut {
+  id: BoardAgentId;
+  roleEn: string;
+  roleBn: string;
+  model: string; // badge shown on the card
+  vote: "BUY" | "SELL" | "HOLD";
+  confidence: number; // 0..100
+  note: string; // বাংলা — one-liner the user actually reads
+  degraded?: boolean; // local fallback answered instead of the LLM
+}
+
+/** deterministic chart geometry for the decision — the LLM decides, the
+ *  code draws (validated coordinates only, never raw model output). */
+export interface BoardDrawings {
+  ob?: { t: number; hi: number; lo: number; side: "bull" | "bear"; label: string };
+  trendline?: { t1: number; p1: number; t2: number; p2: number };
+}
+
+export interface BoardDecision {
+  action: "BUY" | "SELL" | "HOLD";
+  entry: number | null;
+  sl: number | null;
+  tp: number | null;
+  tp2: number | null;
+  rr: number | null;
+  lot: number | null;
+  consensus: number; // 0..100 — how united the board is
+  reasoning: string; // বাংলা — the CTO's verdict, ≤ 40 words
+  drawings: BoardDrawings;
+}
+
+/** the compact market snapshot the board saw (shown on the panel) */
+export interface BoardContextSummary {
+  price: number;
+  atr: number;
+  rsi: number | null;
+  emaFast: number | null;
+  emaSlow: number | null;
+  macdHist: number | null;
+  adx: number | null;
+  trend: string; // up | down | range (active tf structure read)
+  h1Trend: string;
+  h4Trend: string;
+  spread: number;
+  session: string; // tokyo | london | overlap | newyork | off
+  structureEvent: string | null; // last BOS/CHoCH label
+  lastZone: string | null; // nearest fresh zone description
+}
+
+export interface BoardSessionPayload {
+  id: string;
+  symbol: string;
+  timeframe: string;
+  barTime: number;
+  createdAt: string;
+  agents: BoardAgentOut[];
+  decision: BoardDecision;
+  context: BoardContextSummary | null;
+  status: "open" | "won" | "lost" | "expired";
+  resultPct: number | null;
+  degraded: boolean;
+}
+
+export interface BoardResponse {
+  latest: BoardSessionPayload | null;
+  history: BoardSessionPayload[];
+  stats: { total: number; won: number; lost: number; open: number; winPct: number };
 }

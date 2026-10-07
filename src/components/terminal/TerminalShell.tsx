@@ -14,7 +14,7 @@
  */
 
 import { useEffect, useState } from "react";
-import type { AnalysisResponse, UserDrawing } from "@/lib/market/types";
+import type { AnalysisResponse, BoardSessionPayload, UserDrawing } from "@/lib/market/types";
 import { useFeedBoot } from "@/hooks/useFeed";
 import { useTerminal } from "@/hooks/useTerminal";
 import { useI18n } from "@/lib/i18n";
@@ -29,6 +29,8 @@ import { LoginGate } from "./LoginGate";
 
 interface Props {
   analysis: AnalysisResponse | null;
+  /** v21 — the AI Board's latest decision (hero chart ink + Board panel) */
+  board: BoardSessionPayload | null;
   /** v16.4 (audit §13): true when the /api/analysis fetch is failing — the
    *  UI must show a DATA outage banner, not a silent "no signal" state. */
   analysisError?: boolean;
@@ -53,6 +55,7 @@ function useIsDesktop() {
 
 export default function TerminalShell({
   analysis,
+  board,
   analysisError = false,
   userDrawings,
   onCreateDrawing,
@@ -75,6 +78,7 @@ export default function TerminalShell({
 
   const chartProps = {
     analysis,
+    board,
     userDrawings,
     onCreateDrawing,
     onUpdateDrawing,
@@ -117,7 +121,7 @@ function TabBody(props: Props & { mobile: boolean }) {
     case "chart":
       return <ChartWorkspace {...props} />;
     case "auto":
-      return <AutoSignalsView analysis={props.analysis} />;
+      return <AutoSignalsView analysis={props.analysis} board={props.board} />;
     case "settings":
       return <SettingsPanel />;
   }
